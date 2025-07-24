@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Literal
 
 import zipfile
 import hashlib
@@ -14,12 +15,37 @@ Id = str
 @dataclass
 class ScratchContext:
   vars: dict[str, tuple[Id, KnownValue]] = field(default_factory=dict)
-  lists: dict[str, tuple[Id, list[KnownValue]]] = field(default_factory=dict)
+  # TODO lists: dict[str, tuple[Id, list[KnownValue]]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
 
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
     metaless, self = block.getRaw(self)
     self.blocks[id] = meta.addRawMeta(metaless)
+  
+  def addOrGetVar(self, var_name: str) -> Id:
+    if not var_name in self.vars:
+      id = genId()
+      self.vars.update({var_name: (id, KnownValue("0"))})
+    else:
+      id = self.vars[var_name][0]
+    return id
+  
+  def getRaw(self) -> dict:
+    """Returns json for blocks and vars defined"""
+    raw_vars = {}
+    for name, (id, value) in self.vars.items():
+      raw_vars.update({
+        id: [name, int(value.known)] # TODO: serialise value correctly
+      })
+    
+    raw_blocks = {}
+    for id, block in self.blocks.items():
+      raw_blocks.update({id: block})
+
+    return {
+      "variables": raw_vars,
+      "blocks": raw_blocks,
+    }
 
 @dataclass
 class Block:
@@ -27,13 +53,18 @@ class Block:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
 @dataclass
-class SetVariable(Block):
+class ModifyVariable(Block):
+  op: Literal["set", "change"]
   var_name: str
   value: Value
+
   def getRaw(self, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    id = ctx.addOrGetVar(self.var_name)
+    raw_val, ctx = self.value.getRawValue(ctx)
     return ({
-      "opcode": "data_setvariableto",
-      "fields": {"VARIABLE": [self.var_name, ctx.vars[self.var_name][0]]}
+      "opcode": "data_setvariableto" if self.op == "set" else "data_changevariableby",
+      "inputs": {"VALUE": raw_val},
+      "fields": {"VARIABLE": [self.var_name, id]}
     }, ctx)
 
 @dataclass
@@ -73,12 +104,20 @@ class BlockList:
       nextId = genId()
     
     return ctx
-      
-class Value:
-  pass
 
+@dataclass
+class Value:
+  def getRawValue(self, _: ScratchContext) -> tuple[list, ScratchContext]:
+    """Gets the json that can be put in the "inputs" field of a block"""
+    raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
+
+@dataclass
 class KnownValue(Value):
-  pass
+  """Something that can be typed in a block input e.g. x in Say(x)"""
+  known: str
+
+  def getRawValue(self, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+    return ([1, [10, self.known]], ctx)
 
 class ScratchCompException(Exception):
   """Exception when compiling to scratch"""
@@ -87,8 +126,8 @@ class ScratchCompException(Exception):
 def genId() -> Id:
   return uuid.uuid4().hex
 
-def exportSpriteData() -> str:
-  return json.dumps({
+def exportSpriteData(ctx: ScratchContext) -> str:
+  res = {
     "isStage": False,
     "name": "",
     "variables": {},
@@ -117,15 +156,26 @@ def exportSpriteData() -> str:
     "direction": 90,
     "draggable": False,
     "rotationStyle": "all around"
-  })
+  }
 
-def exportSpriteFile(file: zipfile.ZipFile) -> None:
-  file.writestr("Sprite/sprite.json", exportSpriteData())
+  res.update(ctx.getRaw())
+
+  print(res)
+
+  return json.dumps(res)
+
+def exportSpriteFile(ctx: ScratchContext, file: zipfile.ZipFile) -> None:
+  file.writestr("Sprite/sprite.json", exportSpriteData(ctx))
   file.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)
 
 def main():
-  with zipfile.ZipFile("lol.sprite3", "w") as zipf:
-    exportSpriteFile(zipf)
+  ctx = ScratchContext()
+  BlockList([
+    ModifyVariable("set", "hello", KnownValue("10")),
+    ModifyVariable("set", "hello2", KnownValue("10"))
+  ]).export(ctx)
+  with zipfile.ZipFile("out.sprite3", "w") as zipf:
+    exportSpriteFile(ctx, zipf)
 
 if __name__ == "__main__":
   main()
