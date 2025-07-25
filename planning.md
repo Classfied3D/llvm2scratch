@@ -28,3 +28,38 @@ Set `@a` to `stack size`
 ```
 
 * Optimisiation - different return value for different funcs
+
+* Opti - Variable re-use, also change by for "set a  (a + 1)" and change by self for "set a (a * 2)"
+
+From scratch VM
+```
+ getCounter () {
+        return this._counter;
+    }
+
+    clearCounter () {
+        this._counter = 0;
+    }
+
+    incrCounter () {
+        this._counter++;
+    }
+```
+
+```
+
+    forEach (args, util) {
+        const variable = util.target.lookupOrCreateVariable(
+            args.VARIABLE.id, args.VARIABLE.name);
+
+        if (typeof util.stackFrame.index === 'undefined') {
+            util.stackFrame.index = 0;
+        }
+
+        if (util.stackFrame.index < Number(args.VALUE)) {
+            util.stackFrame.index++;
+            variable.value = util.stackFrame.index;
+            util.startBranch(1, true);
+        }
+    }
+```
