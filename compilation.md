@@ -1,2 +1,0 @@
-* If on macos, would recommend running `sudo port install llvm-19` instead of `brew install llvm@19` because brew doesn't have precompiled stuff for older versions of macos, and llvm takes 4 hours to compile
-* Then `LLVM_DIR=/opt/local/libexec/llvm-19/lib/cmake/llvm/ LLVM_CONFIG=/opt/local/libexec/llvm-19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py` (`LLVM_CONFIG=/usr/local/opt/llvm@19/bin/llvm-config` for brew)

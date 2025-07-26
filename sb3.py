@@ -4,8 +4,8 @@ from typing import Literal
 
 import zipfile
 import hashlib
+import random
 import json
-import uuid
 
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
@@ -22,6 +22,8 @@ SHORT_OP_TO_OPCODE = {
   "insertat": "data_insertatlist",
   "deleteat": "data_deleteoflist",
   "deleteall": "data_deletealloflist",
+  "atindex": "data_itemoflist",
+  "indexof": "data_itemnumoflist",
   # Operators
   "add": "operator_add",
   "sub": "operator_subtract",
@@ -31,6 +33,13 @@ SHORT_OP_TO_OPCODE = {
   "rand_between": "operator_random",
   "join": "operator_join",
   "letter_n_of": "operator_letter_of",
+  "not": "operator_not",
+  "and": "operator_and",
+  "or": "operator_or",
+  "=": "operator_equals",
+  "<": "operator_lt",
+  ">": "operator_gt",
+  "contains": "operator_contains",
 }
 
 Id = str
@@ -78,18 +87,20 @@ class ScratchContext:
 
     return firstId
   
-  def addOrGetVar(self, var_name: str) -> Id:
+  def addOrGetVar(self, var_name: str, default_val: KnownValue | None = None) -> Id:
+    if default_val is None: default_val = KnownValue(0)
     if not var_name in self.vars:
       id = genId()
-      self.vars.update({var_name: (id, KnownValue(0))})
+      self.vars.update({var_name: (id, default_val)})
     else:
       id = self.vars[var_name][0]
     return id
   
-  def addOrGetList(self, list_name: str) -> Id:
+  def addOrGetList(self, list_name: str, default_val: list[KnownValue] | None = None) -> Id:
+    if default_val is None: default_val = []
     if not list_name in self.lists:
       id = genId()
-      self.lists.update({list_name: (id, [])})
+      self.lists.update({list_name: (id, default_val)})
     else:
       id = self.lists[list_name][0]
     return id
@@ -128,7 +139,6 @@ class ScratchContext:
       "blocks": raw_blocks,
     }
 
-@dataclass
 class Block:
   def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
@@ -139,12 +149,14 @@ class Block:
   def isEnd(self) -> bool:
     return False
 
-@dataclass
 class StartBlock(Block):
   def isStart(self) -> bool:
     return True
+  
+class EndBlock(Block):
+  def isEnd(self) -> bool:
+    return True
 
-@dataclass
 class LateBlock(Block):
   """A block which requires info about the whole program to be added e.g. the id of function parameters which might not yet be defined"""
   def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
@@ -169,9 +181,31 @@ class BlockMeta:
     })
     return metaless
 
-@dataclass
 class BlockList:
   blocks: list[Block]
+  end: bool
+
+  def __init__(self, blocks: list[Block] | None=None):
+    if blocks is None:
+      blocks = []
+    self.end = False
+    for block in blocks:
+      if self.end: raise ScratchCompException("List of blocks contains blocks after an ending block")
+      self.end |= block.isEnd()
+    self.blocks = blocks
+
+  def add(self, blocks: Block | BlockList):
+    if self.end:
+      if isinstance(blocks, Block):
+        raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks}")
+      elif len(blocks.blocks) > 0:
+        raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks.blocks[0]}")
+    
+    if isinstance(blocks, Block):
+      self.blocks.append(blocks)
+    else:
+      self.blocks += blocks.blocks.copy()
+      self.end |= blocks.end
 
 @dataclass
 class RawBlock(Block):
@@ -180,14 +214,12 @@ class RawBlock(Block):
   def getRaw(self, _: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return self.contents, ctx
 
-@dataclass
 class Value:
   """Something that can be in a blocks input e.g. x in Say(x)"""
   def getRawValue(self, _parent: Id, _ctx: ScratchContext) -> tuple[list, ScratchContext]:
     """Gets the json that can be put in the "inputs" field of a block"""
     raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
 
-@dataclass
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
 
@@ -206,14 +238,34 @@ class KnownValue(Value):
     except ValueError:
       return self.known
 
+# Looks
+@dataclass
+class Say(Block):
+  message: Value
+
+  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    raw_msg, ctx = self.message.getRawValue(my_id, ctx)
+    return {
+      "opcode": "looks_say",
+      "inputs": {
+        "MESSAGE": raw_msg
+      }
+    }, ctx
+
 # Control
+class OnStartFlag(StartBlock):
+  def getRaw(self, _my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    return {
+      "opcode": "event_whenflagclicked"
+    }, ctx
+
 @dataclass
 class Repeat(Block):
   op: Literal["reptimes", "until", "while"]
   value: Value
   to_repeat: BlockList
 
-  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raw_val, ctx = self.value.getRawValue(my_id, ctx)
     if self.op in ["until", "while"] and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
@@ -228,6 +280,16 @@ class Repeat(Block):
         input_name: raw_val,
         "SUBSTACK": [2, to_repeat_id]
       },
+    }, ctx
+
+@dataclass
+class StopScript(EndBlock):
+  op: Literal["stopthis", "stopall"]
+
+  def getRaw(self, _my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    return {
+      "opcode": "control_stop",
+      "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
     }, ctx
 
 # Variables
@@ -259,18 +321,51 @@ class ModifyList(Block):
   op: Literal["addto", "replaceat", "insertat", "deleteat", "deleteall"]
   list_name: str
   index: Value | None
-  value: Value | None
+  item: Value | None
 
-  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    id = ctx.addOrGetList(self.list_name)
-    raw_index = raw_val = None
-    if self.index is not None: raw_index, ctx = self.index.getRawValue(my_id, ctx)
-    if self.value is not None: raw_val, ctx = self.value.getRawValue(my_id, ctx)
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    list_id = ctx.addOrGetList(self.list_name)
+    inputs = {}
+
+    if self.index is not None:
+      if self.op in ["addto", "deleteall"]:
+        raise ScratchCompException(f"{self.op} does not support an index value")
+      raw_index, ctx = self.index.getRawValue(my_id, ctx)
+      inputs.update({"INDEX": raw_index})
+
+    if self.item is not None:
+      raw_item, ctx = self.item.getRawValue(my_id, ctx)
+      if self.op in ["deleteat", "deleteall"]:
+        raise ScratchCompException(f"{self.op} does not support an item")
+      inputs.update({"ITEM": raw_item})
+
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
-      "inputs": {"INDEX": raw_index, "ITEM": raw_val},
-      "fields": {"LIST": [self.list_name, id]},
+      "inputs": inputs,
+      "fields": {"LIST": [self.list_name, list_id]},
     }, ctx
+
+@dataclass
+class GetOfList(Value):
+  op: Literal["atindex", "indexof"]
+  list_name: str
+  value: Value
+
+  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+    id = genId()
+    list_id = ctx.addOrGetList(self.list_name)
+
+    raw_value, ctx = self.value.getRawValue(parent, ctx)
+
+    input_name = "INDEX" if self.op == "atindex" else "ITEM"
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": SHORT_OP_TO_OPCODE[self.op],
+      "inputs": {input_name: raw_value},
+      "fields": {"LIST": [self.list_name, list_id]},
+    }), BlockMeta(parent))
+
+    return [3, id, [10, ""]], ctx
 
 # Operators
 @dataclass
@@ -280,8 +375,10 @@ class TwoOp(Value): # TODO: make this be able to use one input
   right: Value
 
   def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
-    raw_left, ctx = self.left.getRawValue(parent, ctx)
-    raw_right, ctx = self.right.getRawValue(parent, ctx)
+    id = genId()
+
+    raw_left, ctx = self.left.getRawValue(id, ctx)
+    raw_right, ctx = self.right.getRawValue(id, ctx)
 
     match self.op:
       case "rand_between":
@@ -297,7 +394,6 @@ class TwoOp(Value): # TODO: make this be able to use one input
         lft_param = "NUM1"
         rgt_param = "NUM2"
 
-    id = genId()
     ctx.addBlock(id, RawBlock({
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": {
@@ -308,6 +404,46 @@ class TwoOp(Value): # TODO: make this be able to use one input
 
     return [3, id, [10, ""]], ctx
 
+@dataclass
+class BoolOp(BooleanValue):
+  op: Literal["not", "and", "or", "=", "<", ">", "contains"]
+  left: Value
+  right: Value | None
+
+  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+    if (not isinstance(self.left, BooleanValue) and self.op in ["not", "and", "or"]) or \
+       (not isinstance(self.right, BooleanValue) and self.op in ["and", "or"]):
+      raise ScratchCompException(f"BoolOp {self.op} only accepts booleans")
+    
+    id = genId()
+
+    raw_left, ctx = self.left.getRawValue(id, ctx)
+    if not self.right is None:
+      raw_right, ctx = self.right.getRawValue(id, ctx)
+    elif self.op != "not":
+      raise ScratchCompException(f"BoolOp {self.op} takes two parameters, only 1 specified")
+
+    match self.op:
+      case "not":
+        lft_param = "OPERAND"
+      case "contains":
+        lft_param = "STRING1"
+        rgt_param = "STRING2"
+      case _:
+        lft_param = "OPERAND1"
+        rgt_param = "OPERAND2"
+    
+    inputs = {lft_param: raw_left}
+    if self.op != "not":
+      inputs.update({rgt_param: raw_right})
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": SHORT_OP_TO_OPCODE[self.op],
+      "inputs": inputs,
+    }), BlockMeta(parent))
+
+    return [2, id], ctx
+
 # Procedures
 @dataclass
 class ProcedureDef(StartBlock):
@@ -315,7 +451,7 @@ class ProcedureDef(StartBlock):
   params: list[str]
   run_without_refresh: bool = True
 
-  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     proto_id = genId()
     param_ids = [genId() for _ in self.params]
 
@@ -393,7 +529,7 @@ class ScratchCompException(Exception):
   pass
 
 def genId() -> Id:
-  return uuid.uuid4().hex
+  return random.randbytes(16).hex()
 
 def exportSpriteData(ctx: ScratchContext) -> str:
   res = {
@@ -418,7 +554,7 @@ def exportSpriteData(ctx: ScratchContext) -> str:
     ],
     "sounds": [],
     "volume": 100,
-    "visible": False,
+    "visible": True,
     "x": 0,
     "y": 0,
     "size": 100,
@@ -429,27 +565,28 @@ def exportSpriteData(ctx: ScratchContext) -> str:
 
   res.update(ctx.getRaw())
 
-  print(res)
-
   return json.dumps(res)
 
-def exportSpriteFile(ctx: ScratchContext, file: zipfile.ZipFile) -> None:
-  file.writestr("Sprite/sprite.json", exportSpriteData(ctx))
-  file.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)
+def exportSpriteFile(ctx: ScratchContext, file: str) -> None:
+  with zipfile.ZipFile(file, "w") as zipf:
+    zipf.writestr("Sprite/sprite.json", exportSpriteData(ctx))
+    zipf.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)
 
 def main():
   ctx = ScratchContext()
   ctx.addBlockList(BlockList([
     ProcedureDef("main", ["%1", "%2"]),
+    ModifyList("deleteall", "hello2", None, None),
     ModifyList("insertat", "hello2", KnownValue(5), TwoOp("div", GetVariable("hello3"), KnownValue(30))),
     ModifyVariable("set", "hello2", KnownValue(10)),
-    Repeat("reptimes", TwoOp("div", GetVariable("hello3"), KnownValue(30)), BlockList([
+    Repeat("until", BoolOp("=", TwoOp("div", GetVariable("hello3"), KnownValue(30)), KnownValue(0)), BlockList([
       ModifyVariable("set", "hello2", KnownValue(10)),
     ])),
-    ProdcedureCall("main", [TwoOp("sub", GetVariable("hello3"), GetParameter("%1")), KnownValue(3)])
+    ProdcedureCall("main", [TwoOp("sub", GetOfList("atindex", "hello3", GetVariable("hello2")), GetParameter("%1")), KnownValue(3)]),
+    StopScript("stopall"),
   ]))
-  with zipfile.ZipFile("out.sprite3", "w") as zipf:
-    exportSpriteFile(ctx, zipf)
+
+  exportSpriteFile(ctx, "out.sprite3")
 
 if __name__ == "__main__":
   main()
