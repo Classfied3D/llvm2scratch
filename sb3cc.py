@@ -20,7 +20,12 @@ class Config:
   stack_list_var = "stack" # Name of the scratch list for the stack list
   stack_size_var = "stack size" # Name of the scratch variable for the stack size
 
-cfg = Config() # TODO maybe not a global lol
+cfg = Config() # TODO maybe not a global lol, add cfg: Config to Context
+
+@dataclass
+class Context:
+  """Global context access when translating instructions"""
+  globvar_to_ptr: dict[str, sb3.KnownValue] = field(default_factory=dict)
 
 @dataclass
 class BlocksAndValue:
@@ -49,25 +54,27 @@ class CompException(Exception):
   """Exception in the sb3cc compiler"""
   pass
 
-def getStackByteSize(ty: ir.Type) -> int:
+def getByteSize(ty: ir.Type) -> int:
   match ty:
     case ir.IntegerType():
       # Scratch's fp variables can store >48 bits per variable accurately
       return math.ceil(ty.num_bits / 48)
     case ir.ArrayType():
-      return ty.elem_count * getStackByteSize(ty.elem_ty)
+      return ty.elem_count * getByteSize(ty.elem_ty)
     case ir.PtrType():
       return 1
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(val: ir.value.Value) -> BlocksAndValue | BlocksAndIValue:
+def decodeValue(ctx: Context, val: ir.value.Value) -> BlocksAndValue | BlocksAndIValue:
   match val.val:
     case str(): # if a variable
       var = decodeVar(val)
       res = sb3.KnownValue("") # this means no value - nothing in the block
       if var is not None:
         res = sb3.GetVariable(var.name)
+        if cfg.opti and var.name in ctx.globvar_to_ptr:
+          res = ctx.globvar_to_ptr[var.name]
       return BlocksAndValue(res)
     case int():
       # TODO FIX: allow different sizes with val.ty
@@ -99,29 +106,19 @@ def decodeVarName(name: str) -> str:
 
 def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
   blocks = sb3.BlockList()
-  size = getStackByteSize(ty)
-
-  inc_size_block = sb3.ModifyVariable("change", cfg.stack_size_var, sb3.KnownValue(size))
+  size = getByteSize(ty)
 
   if var is not None:
-    if cfg.opti and size == 1:
-      # Optimisation if only allocating 1 byte
-      return sb3.BlockList([
-        inc_size_block,
-        sb3.ModifyVariable("set", var.name, sb3.GetVariable(cfg.stack_size_var))
-      ])
-    
-    blocks.add(sb3.ModifyVariable("set", var.name, 
-      sb3.TwoOp("add", sb3.GetVariable(cfg.stack_size_var), sb3.KnownValue(1))))
+    blocks.add(sb3.ModifyVariable("set", var.name, sb3.GetVariable(cfg.stack_size_var)))
     
   # TODO OPTI: can skip increasing the size if we know the function does not allocate or call another func
-  blocks.add(inc_size_block)
+  blocks.add(sb3.ModifyVariable("change", cfg.stack_size_var, sb3.KnownValue(size)))
   return blocks
 
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type) -> sb3.BlockList:
   match value:
     case sb3.Value():
-      if getStackByteSize(ty) > 1:
+      if getByteSize(ty) > 1:
         # TODO FIX: allow storing of larger values
         raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
       
@@ -130,7 +127,7 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       if not (isinstance(ty, ir.ArrayType) and isinstance(ty.elem_ty, ir.IntegerType)):
         raise CompException(f"Expected stored type {ty} to be [Y x iN]")
 
-      if getStackByteSize(ty.elem_ty) > 1:
+      if getByteSize(ty.elem_ty) > 1:
         raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
 
       blocks = sb3.BlockList()
@@ -141,14 +138,14 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       
       return blocks
 
-def transInstr(instr: ir.Instruction) -> sb3.BlockList:
+def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
   blocks = sb3.BlockList()
   match instr:
     case ir.instruction.Alloca(): # Allocate space on the stack
       blocks.add(transAlloca(decodeVar(instr.result), instr.allocated_ty))
 
     case ir.instruction.Load(): # Copy a value from an address on the stack
-      address = decodeValue(instr.address)
+      address = decodeValue(ctx, instr.address)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
@@ -160,10 +157,10 @@ def transInstr(instr: ir.Instruction) -> sb3.BlockList:
                                       sb3.GetOfList("atindex", cfg.stack_list_var, address.value)))
 
     case ir.instruction.Store(): # Copy a value to an address on the stack
-      value = decodeValue(instr.value)
+      value = decodeValue(ctx, instr.value)
       blocks.add(value.blocks)
 
-      address = decodeValue(instr.address)
+      address = decodeValue(ctx, instr.address)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
@@ -181,7 +178,7 @@ def transInstr(instr: ir.Instruction) -> sb3.BlockList:
       # TODO FIX: in llvm getElementPtr is used but ignored in this code
       values = []
       for arg in instr.args:
-        value = decodeValue(arg)
+        value = decodeValue(ctx, arg)
         blocks.add(value.blocks)
         values.append(value.value)
       
@@ -193,7 +190,7 @@ def transInstr(instr: ir.Instruction) -> sb3.BlockList:
     
     case ir.instruction.Ret():
       if instr.value is not None:
-        value = decodeValue(instr.value)
+        value = decodeValue(ctx, instr.value)
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
@@ -204,10 +201,10 @@ def transInstr(instr: ir.Instruction) -> sb3.BlockList:
       blocks.end = True
 
     case ir.instruction.BinOp(): # do something with two vars
-      first_val = decodeValue(instr.fst_operand)
+      first_val = decodeValue(ctx, instr.fst_operand)
       blocks.add(first_val.blocks)
 
-      second_val = decodeValue(instr.snd_operand)
+      second_val = decodeValue(ctx, instr.snd_operand)
       blocks.add(second_val.blocks)
 
       res_var = decodeVar(instr.result)
@@ -227,7 +224,7 @@ def transInstr(instr: ir.Instruction) -> sb3.BlockList:
             raise CompException(f"Add currently supports integers with <= 48 bits")
           
           if instr.is_nsw and instr.is_nuw and cfg.opti:
-            # If no wrapping behaviour is required then overflowing is ub so can be ignored
+            # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
             res_val = sb3.TwoOp("add", first_val.value, second_val.value)
           else:
             res_val = sb3.TwoOp("mod", sb3.TwoOp("add", first_val.value, second_val.value),
@@ -254,35 +251,67 @@ def main():
   
   mod: ir.Module = parse_assembly(ll)
 
+  ctx = Context()
+
   # Blocks that make up the code to setup the stack at the start of the program
   initsblocks = sb3.BlockList([
     sb3.OnStartFlag()
   ])
+
   funcs: dict[str, tuple[int, sb3.BlockList]] = {}
   lists: dict[str, list[sb3.KnownValue]] = {}
 
   # Set up stack
   # TODO: not necessary if done beforehand (only need to change stack size)
-  initsblocks.add(sb3.BlockList([
-    sb3.ModifyVariable("set", cfg.stack_size_var, sb3.KnownValue(0)),
-    sb3.ModifyList("deleteall", cfg.stack_list_var, None, None),
-    sb3.Repeat("reptimes", sb3.KnownValue(cfg.stack_size), sb3.BlockList([
-      sb3.ModifyList("addto", cfg.stack_list_var, None, sb3.KnownValue(0))
-    ])),
-  ]))
+  initsblocks.add(sb3.ModifyList("deleteall", cfg.stack_list_var, None, None))
+
+  ptr = 1
 
   # Set up static values
   for instr in mod.global_vars.values():
     # TODO OPTI: Don't use allocate and store and set to the var, instead just remember the
     # ptr value in the decoder and replace any uses of the variable with it (only when opti=true)
-    ptr = decodeVar(instr.value)
-    if ptr is None:
+    globvar = decodeVar(instr.value)
+    if globvar is None:
       raise CompException(f"Expected static var {instr} to be named")
-    value = decodeValue(instr.initializer)
-    initsblocks.add(value.blocks)
+    
+    blocks_and_value = decodeValue(ctx, instr.initializer)
+    unknown = len(blocks_and_value.blocks) > 0
+    value = blocks_and_value.value
 
-    initsblocks.add(transAlloca(ptr, instr.initializer.ty))
-    initsblocks.add(transStore(value.value, sb3.GetVariable(ptr.name), instr.initializer.ty))
+    if isinstance(value, IndexableValue):
+      unknown |= not all([isinstance(val, sb3.KnownValue) for val in value.vals])
+    else:
+      unknown |= not isinstance(value, sb3.KnownValue)
+
+    if unknown: raise CompException(f"Expected static value {instr} to have a compile time known value")
+
+    total_size = getByteSize(instr.initializer.ty)
+    values = []
+    match value:
+      case sb3.KnownValue():
+        size = total_size
+        values.append(value)
+      case IndexableValue():
+        assert isinstance(instr.initializer.ty, ir.ArrayType)
+        size = getByteSize(instr.initializer.ty.elem_ty)
+        values.extend(value.vals)
+    
+    if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
+
+    ctx.globvar_to_ptr[globvar.name] = sb3.KnownValue(ptr)
+    if not cfg.opti:
+      initsblocks.add(sb3.ModifyVariable("set", globvar.name, sb3.KnownValue(ptr)))
+    for value in values:
+      initsblocks.add(sb3.ModifyList("addto", cfg.stack_list_var, None, value))
+    ptr += total_size
+
+  initsblocks.add(sb3.BlockList([
+    sb3.ModifyVariable("set", cfg.stack_size_var, sb3.KnownValue(ptr)),
+    sb3.Repeat("reptimes", sb3.KnownValue(cfg.stack_size - (ptr - 1)), sb3.BlockList([
+      sb3.ModifyList("addto", cfg.stack_list_var, None, sb3.KnownValue(0))
+    ])),
+  ]))
 
   for func in mod.funcs.values():
     assert isinstance(func.value.ty, ir.FunctionType)
@@ -290,7 +319,7 @@ def main():
     assert isinstance(name, str)
 
     for param_ty in func.value.ty.param_tys:
-      if getStackByteSize(param_ty) > 1:
+      if getByteSize(param_ty) > 1:
         raise CompException("Parameters can only be one scratch byte in size") # TODO FIX
     
     param_names = []
@@ -306,7 +335,7 @@ def main():
     for block in func.blocks.values():
       print("LLVM BLOCK start")
       for instr in block.instrs:
-        funcblocks.add(transInstr(instr))
+        funcblocks.add(transInstr(ctx, instr))
     
     funcs[name] = (len(param_names), funcblocks)
 
@@ -317,7 +346,7 @@ def main():
       ascii_lookup.append(sb3.KnownValue(f"\\{x:02X}"))
     else:
       ascii_lookup.append(sb3.KnownValue(char))
-  lists["ASCII Lookup"] = ascii_lookup
+  lists["ASCII Lookup (0 Indexed)"] = ascii_lookup
 
   funcs["puts"] = (1, sb3.BlockList([
     sb3.ProcedureDef("puts", ["input"]),
@@ -326,7 +355,7 @@ def main():
     sb3.ModifyVariable("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVariable("ptr"))),
     sb3.Repeat("until", sb3.BoolOp("=", sb3.GetVariable("char"), sb3.KnownValue(0)), sb3.BlockList([
       sb3.ModifyVariable("set", "buffer",
-        sb3.TwoOp("join", sb3.GetVariable("buffer"), sb3.GetOfList("atindex", "ASCII Lookup", sb3.GetVariable("char")))),
+        sb3.TwoOp("join", sb3.GetVariable("buffer"), sb3.GetOfList("atindex", "ASCII Lookup (0 Indexed)", sb3.GetVariable("char")))),
       sb3.ModifyVariable("change", "ptr", sb3.KnownValue(1)),
       sb3.ModifyVariable("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVariable("ptr"))),
     ])),
@@ -338,13 +367,13 @@ def main():
     raise CompException("No main function") # TODO FIX: allow libs
   initsblocks.add(sb3.ProdcedureCall("main", [sb3.KnownValue("")] * funcs["main"][0]))
 
-  ctx = sb3.ScratchContext()
-  ctx.addBlockList(initsblocks)
+  sctx = sb3.ScratchContext()
+  sctx.addBlockList(initsblocks)
   for name, scratchlist in lists.items():
-    ctx.addOrGetList(name, scratchlist)
+    sctx.addOrGetList(name, scratchlist)
   for _, (_, func) in funcs.items():
-    ctx.addBlockList(func)
-  sb3.exportSpriteFile(ctx, "out.sprite3")
+    sctx.addBlockList(func)
+  sb3.exportSpriteFile(sctx, "out.sprite3")
 
 if __name__ == "__main__":
   main()

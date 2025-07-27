@@ -206,6 +206,9 @@ class BlockList:
     else:
       self.blocks += blocks.blocks.copy()
       self.end |= blocks.end
+  
+  def __len__(self):
+    return len(self.blocks)
 
 @dataclass
 class RawBlock(Block):
@@ -583,6 +586,7 @@ def main():
       ModifyVariable("set", "hello2", KnownValue(10)),
     ])),
     ProdcedureCall("main", [TwoOp("sub", GetOfList("atindex", "hello3", GetVariable("hello2")), GetParameter("%1")), KnownValue(3)]),
+    Say(TwoOp("mul", KnownValue(0.6931471805599453094), KnownValue(2))),
     StopScript("stopall"),
   ]))
 
