@@ -1,3 +1,5 @@
+"""Scratch file output for the LLVM -> Scratch compiler"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
@@ -33,6 +35,8 @@ SHORT_OP_TO_OPCODE = {
   "rand_between": "operator_random",
   "join": "operator_join",
   "letter_n_of": "operator_letter_of",
+  "length_of": "operator_length",
+  "round": "operator_round",
   "not": "operator_not",
   "and": "operator_and",
   "or": "operator_or",
@@ -262,16 +266,19 @@ class OnStartFlag(StartBlock):
       "opcode": "event_whenflagclicked"
     }, ctx
 
+RepeatOp = Literal["reptimes", "until", "while"]
 @dataclass
 class Repeat(Block):
-  op: Literal["reptimes", "until", "while"]
+  op: RepeatOp
   value: Value
   to_repeat: BlockList
 
-  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raw_val, ctx = self.value.getRawValue(my_id, ctx)
+  def __post_init__(self):
     if self.op in ["until", "while"] and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
+
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    raw_val, ctx = self.value.getRawValue(my_id, ctx)
     
     to_repeat_id = ctx.addBlockList(self.to_repeat, my_id)
     
@@ -371,17 +378,25 @@ class GetOfList(Value):
     return [3, id, [10, ""]], ctx
 
 # Operators
+OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round",
+                         "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
 @dataclass
-class TwoOp(Value): # TODO: make this be able to use one input
-  op: Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of"]
+class Op(Value): # TODO: make this be able to use one input
+  op: OperatorsCodes
   left: Value
-  right: Value
+  right: Value | None = None
+
+  def __post_init__(self):
+    takes_one_op = self.op in ["length_of", "round"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
+    given_one_op = self.right is None
+
+    if takes_one_op != given_one_op:
+      raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
   def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     id = genId()
 
-    raw_left, ctx = self.left.getRawValue(id, ctx)
-    raw_right, ctx = self.right.getRawValue(id, ctx)
+    takes_one_op = self.right is None
 
     match self.op:
       case "rand_between":
@@ -393,38 +408,57 @@ class TwoOp(Value): # TODO: make this be able to use one input
       case "letter_n_of":
         lft_param = "LETTER"
         rgt_param = "STRING"
+      case "length_of":
+        lft_param = "STRING"
       case _:
         lft_param = "NUM1"
         rgt_param = "NUM2"
+        if takes_one_op:
+          lft_param = "NUM"
+    
+    opcode = SHORT_OP_TO_OPCODE.setdefault(self.op, "operator_mathop")
+
+    raw_left, ctx = self.left.getRawValue(id, ctx)
+    inputs = {lft_param: raw_left}
+    if self.right is not None:
+      raw_right, ctx = self.right.getRawValue(id, ctx)
+      inputs.update({rgt_param: raw_right})
+
+    fields = {}
+    if opcode == "operator_mathop":
+      fields.update({"OPERATOR": [self.op, None]})
 
     ctx.addBlock(id, RawBlock({
-      "opcode": SHORT_OP_TO_OPCODE[self.op],
-      "inputs": {
-        lft_param: raw_left,
-        rgt_param: raw_right
-      }
+      "opcode": opcode,
+      "inputs": inputs,
+      "fields": fields
     }), BlockMeta(parent))
 
     return [3, id, [10, ""]], ctx
 
+BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
 @dataclass
 class BoolOp(BooleanValue):
-  op: Literal["not", "and", "or", "=", "<", ">", "contains"]
+  op: BoolOpCodes
   left: Value
-  right: Value | None
+  right: Value | None = None
 
-  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def __post_init__(self):
     if (not isinstance(self.left, BooleanValue) and self.op in ["not", "and", "or"]) or \
        (not isinstance(self.right, BooleanValue) and self.op in ["and", "or"]):
       raise ScratchCompException(f"BoolOp {self.op} only accepts booleans")
     
+    given_one_op = self.right is None
+    takes_one_op = self.op == "not"
+    if takes_one_op != given_one_op:
+      raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
+
+  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     id = genId()
 
     raw_left, ctx = self.left.getRawValue(id, ctx)
     if not self.right is None:
       raw_right, ctx = self.right.getRawValue(id, ctx)
-    elif self.op != "not":
-      raise ScratchCompException(f"BoolOp {self.op} takes two parameters, only 1 specified")
 
     match self.op:
       case "not":
@@ -580,13 +614,12 @@ def main():
   ctx.addBlockList(BlockList([
     ProcedureDef("main", ["%1", "%2"]),
     ModifyList("deleteall", "hello2", None, None),
-    ModifyList("insertat", "hello2", KnownValue(5), TwoOp("div", GetVariable("hello3"), KnownValue(30))),
+    ModifyList("insertat", "hello2", KnownValue(5), Op("div", GetVariable("hello3"), KnownValue(30))),
     ModifyVariable("set", "hello2", KnownValue(10)),
-    Repeat("until", BoolOp("=", TwoOp("div", GetVariable("hello3"), KnownValue(30)), KnownValue(0)), BlockList([
+    Repeat("until", BoolOp("=", Op("div", GetVariable("hello3"), KnownValue(30)), KnownValue(0)), BlockList([
       ModifyVariable("set", "hello2", KnownValue(10)),
     ])),
-    ProdcedureCall("main", [TwoOp("sub", GetOfList("atindex", "hello3", GetVariable("hello2")), GetParameter("%1")), KnownValue(3)]),
-    Say(TwoOp("mul", KnownValue(0.6931471805599453094), KnownValue(2))),
+    ProdcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), KnownValue(3)]),
     StopScript("stopall"),
   ]))
 
