@@ -13,6 +13,8 @@ EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
 SHORT_OP_TO_OPCODE = {
   # Control
+  "if": "control_if",
+  "if_else": "control_if_else",
   "reptimes": "control_repeat",
   "until": "control_repeat_until",
   "while": "control_while",
@@ -50,8 +52,8 @@ Id = str
 
 @dataclass
 class ScratchContext:
-  vars: dict[str, tuple[Id, KnownValue]] = field(default_factory=dict)
-  lists: dict[str, tuple[Id, list[KnownValue]]] = field(default_factory=dict)
+  vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
+  lists: dict[str, tuple[Id, list[Known]]] = field(default_factory=dict)
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
@@ -91,8 +93,8 @@ class ScratchContext:
 
     return firstId
   
-  def addOrGetVar(self, var_name: str, default_val: KnownValue | None = None) -> Id:
-    if default_val is None: default_val = KnownValue(0)
+  def addOrGetVar(self, var_name: str, default_val: Known | None = None) -> Id:
+    if default_val is None: default_val = Known(0)
     if not var_name in self.vars:
       id = genId()
       self.vars.update({var_name: (id, default_val)})
@@ -100,7 +102,7 @@ class ScratchContext:
       id = self.vars[var_name][0]
     return id
   
-  def addOrGetList(self, list_name: str, default_val: list[KnownValue] | None = None) -> Id:
+  def addOrGetList(self, list_name: str, default_val: list[Known] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
       id = genId()
@@ -198,7 +200,11 @@ class BlockList:
       self.end |= block.isEnd()
     self.blocks = blocks
 
-  def add(self, blocks: Block | BlockList):
+  def add(self, blocks: Block | BlockList | list[Block]) -> None:
+    if isinstance(blocks, list):
+      self.add(BlockList(blocks))
+      return
+
     if self.end:
       if isinstance(blocks, Block):
         raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks}")
@@ -231,7 +237,7 @@ class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
 
 @dataclass
-class KnownValue(Value):
+class Known(Value):
   """Something that can be typed in a block input e.g. x in Say(x)"""
   known: str | float
 
@@ -266,30 +272,41 @@ class OnStartFlag(StartBlock):
       "opcode": "event_whenflagclicked"
     }, ctx
 
-RepeatOp = Literal["reptimes", "until", "while"]
+FlowOp = Literal["if", "if_else", "reptimes", "until", "while"]
 @dataclass
-class Repeat(Block):
-  op: RepeatOp
+class ControlFlow(Block):
+  op: FlowOp
   value: Value
-  to_repeat: BlockList
+  blocks: BlockList
+  else_blocks: BlockList | None = None
 
   def __post_init__(self):
-    if self.op in ["until", "while"] and not isinstance(self.value, BooleanValue):
+    if self.op in ["if", "if_else", "until", "while"] and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
+    
+    if self.op == "if_else" and self.else_blocks is None:
+      raise ScratchCompException("An if-else statement must contain blocks in the else case")
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raw_val, ctx = self.value.getRawValue(my_id, ctx)
     
-    to_repeat_id = ctx.addBlockList(self.to_repeat, my_id)
+    blocks_id = ctx.addBlockList(self.blocks, my_id)
     
     input_name = "TIMES" if self.op == "reptimes" else "CONDITION"
 
+    inputs = {
+      input_name: raw_val,
+      "SUBSTACK": [2, blocks_id]
+    }
+
+    if self.op == "if_else":
+      assert self.else_blocks is not None
+      else_blocks_id = ctx.addBlockList(self.else_blocks, my_id)
+      inputs.update({"SUBSTACK2": [2, else_blocks_id]})
+
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
-      "inputs": {
-        input_name: raw_val,
-        "SUBSTACK": [2, to_repeat_id]
-      },
+      "inputs": inputs
     }, ctx
 
 @dataclass
@@ -304,7 +321,7 @@ class StopScript(EndBlock):
 
 # Variables
 @dataclass
-class GetVariable(Value):
+class GetVar(Value):
   var_name: str
 
   def getRawValue(self, _: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
@@ -312,7 +329,7 @@ class GetVariable(Value):
     return [3, [12, self.var_name, id], [10, ""]], ctx
 
 @dataclass
-class ModifyVariable(Block):
+class EditVar(Block):
   op: Literal["set", "change"]
   var_name: str
   value: Value
@@ -327,7 +344,7 @@ class ModifyVariable(Block):
     }, ctx
 
 @dataclass
-class ModifyList(Block):
+class EditList(Block):
   op: Literal["addto", "replaceat", "insertat", "deleteat", "deleteall"]
   list_name: str
   index: Value | None
@@ -613,13 +630,13 @@ def main():
   ctx = ScratchContext()
   ctx.addBlockList(BlockList([
     ProcedureDef("main", ["%1", "%2"]),
-    ModifyList("deleteall", "hello2", None, None),
-    ModifyList("insertat", "hello2", KnownValue(5), Op("div", GetVariable("hello3"), KnownValue(30))),
-    ModifyVariable("set", "hello2", KnownValue(10)),
-    Repeat("until", BoolOp("=", Op("div", GetVariable("hello3"), KnownValue(30)), KnownValue(0)), BlockList([
-      ModifyVariable("set", "hello2", KnownValue(10)),
+    EditList("deleteall", "hello2", None, None),
+    EditList("insertat", "hello2", Known(5), Op("div", GetVar("hello3"), Known(30))),
+    EditVar("set", "hello2", Known(10)),
+    ControlFlow("until", BoolOp("=", Op("div", GetVar("hello3"), Known(30)), Known(0)), BlockList([
+      EditVar("set", "hello2", Known(10)),
     ])),
-    ProdcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), KnownValue(3)]),
+    ProdcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
     StopScript("stopall"),
   ]))
 

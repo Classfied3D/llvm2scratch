@@ -1,7 +1,7 @@
 """The LLVM -> Scratch Compiler"""
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, is_dataclass, field, fields
 
 from llvm2py import parse_assembly
 from llvm2py import ir
@@ -29,10 +29,10 @@ highest_tmp = 0
 @dataclass
 class Context:
   """Global context access when translating instructions"""
-  globvar_to_ptr: dict[str, sb3.KnownValue] = field(default_factory=dict)
+  globvar_to_ptr: dict[str, sb3.Known] = field(default_factory=dict)
 
 @dataclass
-class BlocksAndValue:
+class ValueAndBlocks:
   """A value and any blocks that come before it needed to get that value"""
   value: sb3.Value
   blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
@@ -43,7 +43,7 @@ class IndexableValue:
   vals: list[sb3.Value]
 
 @dataclass
-class BlocksAndIValue:
+class IValueAndBlocks:
   """An indexable value and any blocks that come before it needed to get that value"""
   value: IndexableValue
   blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
@@ -54,13 +54,15 @@ class Variable:
   name: str
   ty: ir.Type
 
-# Written Value - The value should be assigned to a variable because it is
-# used multiple times and variable access would be faster
-WrittenValue = sb3.KnownValue | sb3.GetVariable | sb3.GetParameter
-
 class CompException(Exception):
   """Exception in the sb3cc compiler"""
   pass
+
+def astuple(obj):
+  """Same as dataclasses.astuple but not recursive because thats just annoying"""
+  if not is_dataclass(obj):
+    raise TypeError("Expected dataclass instance")
+  return tuple(getattr(obj, f.name) for f in fields(obj))
 
 def getByteSize(ty: ir.Type) -> int:
   match ty:
@@ -74,19 +76,19 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(ctx: Context, val: ir.value.Value) -> BlocksAndValue | BlocksAndIValue:
+def decodeValue(ctx: Context, val: ir.value.Value) -> ValueAndBlocks | IValueAndBlocks:
   match val.val:
     case str(): # if a variable
       var = decodeVar(val)
-      res = sb3.KnownValue("") # this means no value - nothing in the block
+      res = sb3.Known("") # this means no value - nothing in the block
       if var is not None:
-        res = sb3.GetVariable(var.name)
+        res = sb3.GetVar(var.name)
         if cfg.opti and var.name in ctx.globvar_to_ptr:
           res = ctx.globvar_to_ptr[var.name]
-      return BlocksAndValue(res)
+      return ValueAndBlocks(res)
     case int():
       # TODO FIX: allow different sizes with val.ty
-      return BlocksAndValue(sb3.KnownValue(val.val))
+      return ValueAndBlocks(sb3.Known(val.val))
     case bytes():
       if not (isinstance(val.ty, ir.ArrayType) and isinstance(val.ty.elem_ty, ir.IntegerType)):
         raise CompException(f"Expected bytes value {val} to be assigned to ty [N x i8], got, {type(val.ty)}")
@@ -94,8 +96,8 @@ def decodeValue(ctx: Context, val: ir.value.Value) -> BlocksAndValue | BlocksAnd
       if val.ty.elem_ty.num_bits != 8:
         raise CompException(f"Cannot assign bytes value {val} a non byte (i8)")
       
-      return BlocksAndIValue(
-        IndexableValue([sb3.KnownValue(str(int(byte))) for byte in val.val]))
+      return IValueAndBlocks(
+        IndexableValue([sb3.Known(str(int(byte))) for byte in val.val]))
     case _:
       raise CompException(f"Unknown Value: {val.val} (py type: {type(val.val)})")
 
@@ -117,6 +119,42 @@ def genTempVar() -> str:
   highest_tmp += 1
   return cfg.tmp_prefix + str(highest_tmp)
 
+def shouldOptimiseValueUse(val: sb3.Value) -> bool:
+  """Returns if a value that is used more than once should be stored"""
+  match val:
+    case sb3.Known() | sb3.GetVar() | sb3.GetParameter():
+      return False
+    case sb3.GetOfList(op="atindex"):
+      return not isinstance(val.value, sb3.Known)
+    case _:
+      return True
+
+def optimiseValueUse(val: sb3.Value) -> ValueAndBlocks:
+  if shouldOptimiseValueUse(val):
+    tmp = genTempVar()
+    return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
+  
+  return ValueAndBlocks(val)
+
+def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
+  return sb3.Op("mod", val, sb3.Known(2 ** width))
+
+def undoTwosComplement(width: int, val: sb3.Value, return_var: bool) -> ValueAndBlocks:
+  """Calculates two's compilment on a value. If the returned value is used multiple times, it is
+  prefered to be a var, which can be done with return_var=True"""
+  limit = int(((2 ** width) / 2) - 1)
+  decrease = 2 ** width
+  
+  if shouldOptimiseValueUse(val) or return_var:
+    tmp = genTempVar()
+    return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([
+      sb3.EditVar("set", tmp, val),
+      sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetVar(tmp), sb3.Known(limit)), sb3.BlockList([
+        sb3.EditVar("change", tmp, sb3.Known(-decrease)),
+      ])),
+    ]))
+  return ValueAndBlocks(sb3.Op("sub", val, sb3.Op("mul", sb3.Known(decrease), sb3.BoolOp(">", val, sb3.Known(limit)))))
+
 def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
   if width > 48:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
@@ -124,38 +162,44 @@ def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
   return sb3.Op("mul", left, right) # Overflow is UB - we don't care if
                                     # the number overflows and gets innacurate
 
-def multiplyWrap(width: int, left: WrittenValue, right: WrittenValue) -> BlocksAndValue:
+def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlocks:
   # TODO OPTI: if one value is a known value, wrapping behaviour could be simpilifed and
   # known info could be propagated
   if width <= 26: # Safe: (2**26) ** 2 < 9007199254740991
-    return BlocksAndValue(sb3.Op("mod", sb3.Op("mul", left, right), sb3.KnownValue(2 ** width)))
+    return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
   elif width <= 36: # Safe: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
+    blocks = sb3.BlockList()
+    left, lblocks = astuple(optimiseValueUse(left))
+    right, rblocks = astuple(optimiseValueUse(right))
+    blocks.add(lblocks)
+    blocks.add(rblocks)
+
     # Use some maths to do the calculation (see README for explaination)
     half_width = width // 2
     a0 = genTempVar()
     b0 = genTempVar()
-    blocks = sb3.BlockList([
-      sb3.ModifyVariable("set", a0, sb3.Op("mod", left, sb3.KnownValue(2 ** half_width))),
-      sb3.ModifyVariable("set", b0, sb3.Op("mod", right, sb3.KnownValue(2 ** half_width)))
+    blocks.add([
+      sb3.EditVar("set", a0, sb3.Op("mod", left, sb3.Known(2 ** half_width))),
+      sb3.EditVar("set", b0, sb3.Op("mod", right, sb3.Known(2 ** half_width)))
     ])
     value = sb3.Op("mod",
       sb3.Op("add",
         sb3.Op("mul",
           sb3.Op("add", # TODO FIX: modding this number by 2^(width/half_width) for width > 36
             sb3.Op("mul",
-              sb3.GetVariable(a0),
-              sb3.Op("floor", sb3.Op("div", right, sb3.KnownValue(2 ** half_width)))
+              sb3.GetVar(a0),
+              sb3.Op("floor", sb3.Op("div", right, sb3.Known(2 ** half_width)))
             ),
             sb3.Op("mul",
-              sb3.GetVariable(b0),
-              sb3.Op("floor", sb3.Op("div", left, sb3.KnownValue(2 ** half_width)))
+              sb3.GetVar(b0),
+              sb3.Op("floor", sb3.Op("div", left, sb3.Known(2 ** half_width)))
             ),
           ),
-          sb3.KnownValue(2 ** half_width)),
-        sb3.Op("mul", sb3.GetVariable(a0), sb3.GetVariable(b0))
+          sb3.Known(2 ** half_width)),
+        sb3.Op("mul", sb3.GetVar(a0), sb3.GetVar(b0))
       ),
-      sb3.KnownValue(2 ** width))
-    return BlocksAndValue(value, blocks)
+      sb3.Known(2 ** width))
+    return ValueAndBlocks(value, blocks)
   else:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
 
@@ -164,10 +208,10 @@ def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
   size = getByteSize(ty)
 
   if var is not None:
-    blocks.add(sb3.ModifyVariable("set", var.name, sb3.GetVariable(cfg.stack_size_var)))
+    blocks.add(sb3.EditVar("set", var.name, sb3.GetVar(cfg.stack_size_var)))
     
   # TODO OPTI: can skip increasing the size if we know the function does not allocate or call another func
-  blocks.add(sb3.ModifyVariable("change", cfg.stack_size_var, sb3.KnownValue(size)))
+  blocks.add(sb3.EditVar("change", cfg.stack_size_var, sb3.Known(size)))
   return blocks
 
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type) -> sb3.BlockList:
@@ -177,7 +221,7 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
         # TODO FIX: allow storing of larger values
         raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
       
-      return sb3.BlockList([sb3.ModifyList("replaceat", cfg.stack_list_var, address, value)])
+      return sb3.BlockList([sb3.EditList("replaceat", cfg.stack_list_var, address, value)])
     case IndexableValue():
       if not (isinstance(ty, ir.ArrayType) and isinstance(ty.elem_ty, ir.IntegerType)):
         raise CompException(f"Expected stored type {ty} to be [Y x iN]")
@@ -188,8 +232,8 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       blocks = sb3.BlockList()
       for (i, ival) in enumerate(value.vals):
         # TODO OPTI: when adding operator blocks, calc at compile time if values are known
-        blocks.add(sb3.ModifyList("replaceat", cfg.stack_list_var,
-                                  sb3.Op("add", address, sb3.KnownValue(i)), ival))
+        blocks.add(sb3.EditList("replaceat", cfg.stack_list_var,
+                                  sb3.Op("add", address, sb3.Known(i)), ival))
       
       return blocks
 
@@ -208,7 +252,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
 
       var = decodeVar(instr.result)
       if var is not None:
-        blocks.add(sb3.ModifyVariable("set", var.name, 
+        blocks.add(sb3.EditVar("set", var.name, 
                                       sb3.GetOfList("atindex", cfg.stack_list_var, address.value)))
 
     case ir.instruction.Store(): # Copy a value to an address on the stack
@@ -241,7 +285,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
       
       var = decodeVar(instr.result)
       if var is not None:
-        blocks.add(sb3.ModifyVariable("set", var.name, sb3.GetVariable(cfg.return_var)))
+        blocks.add(sb3.EditVar("set", var.name, sb3.GetVar(cfg.return_var)))
     
     case ir.instruction.Ret():
       if instr.value is not None:
@@ -249,7 +293,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
-        blocks.add(sb3.ModifyVariable("set", cfg.return_var, value.value))
+        blocks.add(sb3.EditVar("set", cfg.return_var, value.value))
       # TODO: OPTI: not needed if last instr
       blocks.add(sb3.StopScript("stopthis"))
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
@@ -275,52 +319,116 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
         case "add" | "sub": # add/sub two vars
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
-          
           width = instr.fst_operand.ty.num_bits
 
           # TODO FIX: support larger values by using multiple vars and carrying
           if width > 48:
-            raise CompException(f"Add currently supports integers with <= 48 bits")
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
           
           if instr.is_nsw and instr.is_nuw and cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
             res_val = sb3.Op(instr.opcode, first_val, second_val)
           else:
-            res_val = sb3.Op("mod", sb3.Op("add", first_val, second_val),
-                             sb3.KnownValue(2 ** width))
+            res_val = sb3.Op("mod", sb3.Op(instr.opcode, first_val, second_val),
+                             sb3.Known(2 ** width))
         
         case "mul":
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
-          
           width = instr.fst_operand.ty.num_bits
           
           if instr.is_nsw and instr.is_nuw and cfg.opti:
             res_val = multiplyNoWrap(width, first_val, second_val)
           else:
-            # TODO make a func for this to remove repeatition
-            if not isinstance(first_val, WrittenValue):
-              tmp = genTempVar()
-              blocks.add(sb3.ModifyVariable("set", tmp, first_val))
-              first_val = sb3.GetVariable(tmp)
-            
-            if not isinstance(second_val, WrittenValue):
-              tmp = genTempVar()
-              blocks.add(sb3.ModifyVariable("set", tmp, second_val))
-              second_val = sb3.GetVariable(tmp)
-            
             blocks_and_value = multiplyWrap(width, first_val, second_val)
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
+        
+        case "udiv":
+          # TODO OPTI: optimise for known values
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          width = instr.fst_operand.ty.num_bits
+
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          # Division by zero is UB
+          if not instr.is_exact:
+            res_val = sb3.Op("floor", sb3.Op("div", first_val, second_val))
+          else:
+            res_val = sb3.Op("div", first_val, second_val) # Value is poison if one is not a multiple of another
+
+        case "sdiv":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          width = instr.fst_operand.ty.num_bits
+
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          if instr.is_exact:
+            signed_left, lblocks = astuple(undoTwosComplement(width, first_val, False))
+            signed_right, rblocks = astuple(undoTwosComplement(width, second_val, False))
+            blocks.add(lblocks)
+            blocks.add(rblocks)
+
+            res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
+          else:
+            left, lblocks = astuple(optimiseValueUse(first_val))
+            right, rblocks = astuple(optimiseValueUse(second_val))
+            blocks.add(lblocks)
+            blocks.add(rblocks)
+
+            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+            change = 2 ** width
+
+            if res_var is not None:
+              blocks.add([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+                  sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                    # If left + right are pos
+                    sb3.EditVar("set", res_var.name, sb3.Op("floor", sb3.Op("div", left, right))),
+                  ]), sb3.BlockList([
+                    # If left is pos and right is neg
+                    sb3.EditVar("set", res_var.name, sb3.Op("add",
+                                                      sb3.Op("ceiling",
+                                                        sb3.Op("div",
+                                                          left,
+                                                          sb3.Op("sub", right, sb3.Known(change)))),
+                                                    sb3.Known(change))),
+                  ]))
+                ]), sb3.BlockList([
+                  sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                    # If left is neg and right is pos
+                    sb3.EditVar("set", res_var.name, sb3.Op("add", 
+                                                      sb3.Op("ceiling",
+                                                        sb3.Op("div",
+                                                          sb3.Op("sub", left, sb3.Known(change)),
+                                                          right)),
+                                                    sb3.Known(change))),
+                  ]), sb3.BlockList([
+                    # If left + right are neg
+                    sb3.EditVar("set", res_var.name, sb3.Op("floor",
+                                                      sb3.Op("div",
+                                                        sb3.Op("sub", left, sb3.Known(change)),
+                                                        sb3.Op("sub", right, sb3.Known(change))))),
+                  ]))
+                ]))
+              ])
+            res_val = False # We set res_var ourselves
 
         case _:
           raise CompException(f"Unknown BinOp Opcode: {instr.opcode} in {instr}")
-      
-      if res_var is not None:
-        blocks.add(sb3.ModifyVariable("set", res_var.name, res_val))
-      else:
-        if not cfg.opti: # Values have no effect on state in scratch, only state has effect on values
-          blocks.add(sb3.ModifyVariable("set", cfg.unused_var, res_val))
+
+      if res_val is not False: # If the binop sets res_var itself
+        if res_var is not None:
+          blocks.add(sb3.EditVar("set", res_var.name, res_val))
+        else:
+          if not cfg.opti: # Values have no effect on state in scratch, only state has effect on values
+            blocks.add(sb3.EditVar("set", cfg.unused_var, res_val))
 
     case _:
       raise CompException(f"Unknown instruction opcode {instr} (type {type(instr)})")
@@ -343,11 +451,11 @@ def main():
   ])
 
   funcs: dict[str, tuple[int, sb3.BlockList]] = {}
-  lists: dict[str, list[sb3.KnownValue]] = {}
+  lists: dict[str, list[sb3.Known]] = {}
 
   # Set up stack
   # TODO: not necessary if done beforehand (only need to change stack size)
-  initsblocks.add(sb3.ModifyList("deleteall", cfg.stack_list_var, None, None))
+  initsblocks.add(sb3.EditList("deleteall", cfg.stack_list_var, None, None))
 
   ptr = 1
 
@@ -364,16 +472,16 @@ def main():
     value = blocks_and_value.value
 
     if isinstance(value, IndexableValue):
-      unknown |= not all([isinstance(val, sb3.KnownValue) for val in value.vals])
+      unknown |= not all([isinstance(val, sb3.Known) for val in value.vals])
     else:
-      unknown |= not isinstance(value, sb3.KnownValue)
+      unknown |= not isinstance(value, sb3.Known)
 
     if unknown: raise CompException(f"Expected static value {instr} to have a compile time known value")
 
     total_size = getByteSize(instr.initializer.ty)
     values = []
     match value:
-      case sb3.KnownValue():
+      case sb3.Known():
         size = total_size
         values.append(value)
       case IndexableValue():
@@ -383,17 +491,17 @@ def main():
     
     if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
 
-    ctx.globvar_to_ptr[globvar.name] = sb3.KnownValue(ptr)
+    ctx.globvar_to_ptr[globvar.name] = sb3.Known(ptr)
     if not cfg.opti:
-      initsblocks.add(sb3.ModifyVariable("set", globvar.name, sb3.KnownValue(ptr)))
+      initsblocks.add(sb3.EditVar("set", globvar.name, sb3.Known(ptr)))
     for value in values:
-      initsblocks.add(sb3.ModifyList("addto", cfg.stack_list_var, None, value))
+      initsblocks.add(sb3.EditList("addto", cfg.stack_list_var, None, value))
     ptr += total_size
 
   initsblocks.add(sb3.BlockList([
-    sb3.ModifyVariable("set", cfg.stack_size_var, sb3.KnownValue(ptr)),
-    sb3.Repeat("reptimes", sb3.KnownValue(cfg.stack_size - (ptr - 1)), sb3.BlockList([
-      sb3.ModifyList("addto", cfg.stack_list_var, None, sb3.KnownValue(0))
+    sb3.EditVar("set", cfg.stack_size_var, sb3.Known(ptr)),
+    sb3.ControlFlow("reptimes", sb3.Known(cfg.stack_size - (ptr - 1)), sb3.BlockList([
+      sb3.EditList("addto", cfg.stack_list_var, None, sb3.Known(0))
     ])),
   ]))
 
@@ -427,29 +535,29 @@ def main():
   for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
     char = chr(x)
     if char.encode("unicode_escape").decode("ascii").startswith("\\") and char != "\\":
-      ascii_lookup.append(sb3.KnownValue(f"\\{x:02X}"))
+      ascii_lookup.append(sb3.Known(f"\\{x:02X}"))
     else:
-      ascii_lookup.append(sb3.KnownValue(char))
+      ascii_lookup.append(sb3.Known(char))
   lists["ASCII Lookup (0 Indexed)"] = ascii_lookup
 
   funcs["puts"] = (1, sb3.BlockList([
     sb3.ProcedureDef("puts", ["input"]),
-    sb3.ModifyVariable("set", "buffer", sb3.KnownValue("")),
-    sb3.ModifyVariable("set", "ptr", sb3.GetParameter("input")),
-    sb3.ModifyVariable("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVariable("ptr"))),
-    sb3.Repeat("until", sb3.BoolOp("=", sb3.GetVariable("char"), sb3.KnownValue(0)), sb3.BlockList([
-      sb3.ModifyVariable("set", "buffer",
-        sb3.Op("join", sb3.GetVariable("buffer"), sb3.GetOfList("atindex", "ASCII Lookup (0 Indexed)", sb3.GetVariable("char")))),
-      sb3.ModifyVariable("change", "ptr", sb3.KnownValue(1)),
-      sb3.ModifyVariable("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVariable("ptr"))),
+    sb3.EditVar("set", "buffer", sb3.Known("")),
+    sb3.EditVar("set", "ptr", sb3.GetParameter("input")),
+    sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
+    sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
+      sb3.EditVar("set", "buffer",
+        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", "ASCII Lookup (0 Indexed)", sb3.GetVar("char")))),
+      sb3.EditVar("change", "ptr", sb3.Known(1)),
+      sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     ])),
-    sb3.Say(sb3.GetVariable("buffer")),
-    sb3.ModifyVariable("set", cfg.return_var, sb3.KnownValue(0)),
+    sb3.Say(sb3.GetVar("buffer")),
+    sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]))
 
   if not "main" in funcs:
     raise CompException("No main function") # TODO FIX: allow libs
-  initsblocks.add(sb3.ProdcedureCall("main", [sb3.KnownValue("")] * funcs["main"][0]))
+  initsblocks.add(sb3.ProdcedureCall("main", [sb3.Known("")] * funcs["main"][0]))
 
   sctx = sb3.ScratchContext()
   sctx.addBlockList(initsblocks)
