@@ -87,8 +87,18 @@ def decodeValue(ctx: Context, val: ir.value.Value) -> ValueAndBlocks | IValueAnd
           res = ctx.globvar_to_ptr[var.name]
       return ValueAndBlocks(res)
     case int():
+      if not isinstance(val.ty, ir.IntegerType):
+        raise CompException(f"Expected {val} to be an integer, got type {type(val.ty)}")
+      
       # TODO FIX: allow different sizes with val.ty
-      return ValueAndBlocks(sb3.Known(val.val))
+      if val.ty.num_bits > 48: raise CompException(f">48 bits not yet supported, got {val.ty.num_bits}")
+
+      # Calculate the two's complement version of the number
+      num = val.val
+      width = val.ty.num_bits
+      if num < 0:
+        num = (2 ** width) + num
+      return ValueAndBlocks(sb3.Known(num))
     case bytes():
       if not (isinstance(val.ty, ir.ArrayType) and isinstance(val.ty.elem_ty, ir.IntegerType)):
         raise CompException(f"Expected bytes value {val} to be assigned to ty [N x i8], got, {type(val.ty)}")
@@ -294,25 +304,23 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
         blocks.add(sb3.EditVar("set", cfg.return_var, value.value))
-      # TODO: OPTI: not needed if last instr
-      blocks.add(sb3.StopScript("stopthis"))
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
 
     case ir.instruction.BinOp(): # do something with two vars
-      first_val = decodeValue(ctx, instr.fst_operand)
-      blocks.add(first_val.blocks)
-      first_val = first_val.value
+      left = decodeValue(ctx, instr.fst_operand)
+      blocks.add(left.blocks)
+      left = left.value
 
-      second_val = decodeValue(ctx, instr.snd_operand)
-      blocks.add(second_val.blocks)
-      second_val = second_val.value
+      right = decodeValue(ctx, instr.snd_operand)
+      blocks.add(right.blocks)
+      right = right.value
 
       res_var = decodeVar(instr.result)
       res_val = None
 
-      if isinstance(first_val, IndexableValue) or \
-         isinstance(second_val, IndexableValue):
+      if isinstance(left, IndexableValue) or \
+         isinstance(right, IndexableValue):
         raise CompException(f"Indexable value not supported in binop {instr}")
 
       match instr.opcode:
@@ -327,9 +335,9 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
           
           if instr.is_nsw and instr.is_nuw and cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
-            res_val = sb3.Op(instr.opcode, first_val, second_val)
+            res_val = sb3.Op(instr.opcode, left, right)
           else:
-            res_val = sb3.Op("mod", sb3.Op(instr.opcode, first_val, second_val),
+            res_val = sb3.Op("mod", sb3.Op(instr.opcode, left, right),
                              sb3.Known(2 ** width))
         
         case "mul":
@@ -338,9 +346,9 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
           width = instr.fst_operand.ty.num_bits
           
           if instr.is_nsw and instr.is_nuw and cfg.opti:
-            res_val = multiplyNoWrap(width, first_val, second_val)
+            res_val = multiplyNoWrap(width, left, right)
           else:
-            blocks_and_value = multiplyWrap(width, first_val, second_val)
+            blocks_and_value = multiplyWrap(width, left, right)
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
         
@@ -356,9 +364,9 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
           
           # Division by zero is UB
           if not instr.is_exact:
-            res_val = sb3.Op("floor", sb3.Op("div", first_val, second_val))
+            res_val = sb3.Op("floor", sb3.Op("div", left, right))
           else:
-            res_val = sb3.Op("div", first_val, second_val) # Value is poison if one is not a multiple of another
+            res_val = sb3.Op("div", left, right) # Value is poison if one is not a multiple of another
 
         case "sdiv":
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
@@ -370,22 +378,25 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
           
           if instr.is_exact:
-            signed_left, lblocks = astuple(undoTwosComplement(width, first_val, False))
-            signed_right, rblocks = astuple(undoTwosComplement(width, second_val, False))
+            signed_left, lblocks = astuple(undoTwosComplement(width, left, False))
+            signed_right, rblocks = astuple(undoTwosComplement(width, right, False))
             blocks.add(lblocks)
             blocks.add(rblocks)
 
             res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
           else:
-            left, lblocks = astuple(optimiseValueUse(first_val))
-            right, rblocks = astuple(optimiseValueUse(second_val))
-            blocks.add(lblocks)
-            blocks.add(rblocks)
-
-            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
-            change = 2 ** width
-
             if res_var is not None:
+              left, lblocks = astuple(optimiseValueUse(left))
+              right, rblocks = astuple(optimiseValueUse(right))
+              blocks.add(lblocks)
+              blocks.add(rblocks)
+
+              point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+              change = 2 ** width
+
+              # TODO: optimise for known values
+
+              # Undo two's complement, divide, round towards zero using floor or ceiling and calculate two's complement
               blocks.add([
                 sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
                   sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
@@ -398,7 +409,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
                                                         sb3.Op("div",
                                                           left,
                                                           sb3.Op("sub", right, sb3.Known(change)))),
-                                                    sb3.Known(change))),
+                                                      sb3.Known(change))),
                   ]))
                 ]), sb3.BlockList([
                   sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
@@ -408,7 +419,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
                                                         sb3.Op("div",
                                                           sb3.Op("sub", left, sb3.Known(change)),
                                                           right)),
-                                                    sb3.Known(change))),
+                                                      sb3.Known(change))),
                   ]), sb3.BlockList([
                     # If left + right are neg
                     sb3.EditVar("set", res_var.name, sb3.Op("floor",
@@ -419,6 +430,89 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
                 ]))
               ])
             res_val = False # We set res_var ourselves
+        
+        case "urem":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          # mod 0 is UB, can ignore
+          res_val = sb3.Op("mod", left, right)
+        
+        case "srem":
+          # TODO OPTI: optimise for known values
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          if res_var is not None:
+            # TODO: Reuse if statement to work out if a / b > 0
+            left, lblocks = astuple(optimiseValueUse(left))
+            right_is_temp = shouldOptimiseValueUse(right)
+            right, rblocks = astuple(optimiseValueUse(right))
+            if right_is_temp:
+              assert isinstance(right, sb3.GetVar)
+            blocks.add(lblocks)
+            blocks.add(rblocks)
+            
+            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+            change = 2 ** width
+
+            if not right_is_temp:
+              right_minus_change = genTempVar()
+            # Undo two's complement, calculate modulo, then adjust for differences with llvm's remainder operation
+            # (different when one side is negative)
+            blocks.add([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                  # Modulus and remainder operations do the same
+                  sb3.EditVar("set", res_var.name, sb3.Op("mod", left, right)),
+                ]), sb3.BlockList([
+                  # If left is pos and right is neg - remainder = (l mod r) - r
+                  sb3.EditVar("set", right_minus_change, sb3.Op("sub", right, sb3.Known(change))),
+                  sb3.EditVar("set", res_var.name, sb3.Op("sub",
+                                                    sb3.Op("mod",
+                                                      left,
+                                                      sb3.GetVar(right_minus_change)),
+                                                    sb3.GetVar(right_minus_change))),
+                ]) if not right_is_temp else sb3.BlockList([
+                  sb3.EditVar("change", right.var_name, sb3.Known(-change)),
+                  sb3.EditVar("set", res_var.name, sb3.Op("sub",
+                                                    sb3.Op("mod",
+                                                      left,
+                                                      right),
+                                                    right)),
+                ]))
+              ]), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                  # If left is neg and right is pos - remainder = (l mod r) - r
+                  sb3.EditVar("set", res_var.name, sb3.Op("add",
+                                                    sb3.Op("sub",
+                                                      sb3.Op("mod",
+                                                        sb3.Op("sub", left, sb3.Known(change)),
+                                                        right),
+                                                      right),
+                                                    sb3.Known(change))),
+                ]), sb3.BlockList([
+                  # If left + right are neg
+                  sb3.EditVar("set", res_var.name, sb3.Op("add",
+                                                    sb3.Op("mod",
+                                                      sb3.Op("sub", left, sb3.Known(change)),
+                                                      sb3.Op("sub", right, sb3.Known(change))),
+                                                    sb3.Known(change))),
+                ]))
+              ]))
+            ])
+
+          res_val = False # We set res_var ourselves
 
         case _:
           raise CompException(f"Unknown BinOp Opcode: {instr.opcode} in {instr}")
@@ -538,7 +632,7 @@ def main():
       ascii_lookup.append(sb3.Known(f"\\{x:02X}"))
     else:
       ascii_lookup.append(sb3.Known(char))
-  lists["ASCII Lookup (0 Indexed)"] = ascii_lookup
+  lists["!ASCII Lookup (0 Indexed)"] = ascii_lookup
 
   funcs["puts"] = (1, sb3.BlockList([
     sb3.ProcedureDef("puts", ["input"]),
@@ -547,7 +641,7 @@ def main():
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", "buffer",
-        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", "ASCII Lookup (0 Indexed)", sb3.GetVar("char")))),
+        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", "!ASCII Lookup (0 Indexed)", sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
       sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     ])),
