@@ -22,6 +22,10 @@ class Config:
   stack_list_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
   tmp_prefix = "!temp " # Name of temp variables before a number is added to them
+  ascii_lookup_var = "!ascii lookup"
+  pow2_lookup_var = "!pow2 lookup"
+  zero_indexed_suffix = " (0 indexed)"
+  one_indexed_suffix = " (1 indexed)"
 
 cfg = Config() # TODO maybe not a global lol, add cfg: Config to Context
 highest_tmp = 0
@@ -29,6 +33,8 @@ highest_tmp = 0
 @dataclass
 class Context:
   """Global context access when translating instructions"""
+  funcs: dict[str, tuple[int, sb3.BlockList]] = field(default_factory=dict)
+  lists: dict[str, list[sb3.Known]] = field(default_factory=dict)
   globvar_to_ptr: dict[str, sb3.Known] = field(default_factory=dict)
 
 @dataclass
@@ -76,7 +82,7 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(ctx: Context, val: ir.value.Value) -> ValueAndBlocks | IValueAndBlocks:
+def decodeValue(val: ir.value.Value, ctx: Context) -> ValueAndBlocks | IValueAndBlocks:
   match val.val:
     case str(): # if a variable
       var = decodeVar(val)
@@ -146,6 +152,15 @@ def optimiseValueUse(val: sb3.Value) -> ValueAndBlocks:
   
   return ValueAndBlocks(val)
 
+def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[str, Context]:
+  name = cfg.pow2_lookup_var + (cfg.one_indexed_suffix if is_one_indexed else cfg.zero_indexed_suffix)
+  if name not in ctx.lists or size > len(ctx.lists[name]):
+    pow2_lookup = []
+    for x in range(int(is_one_indexed) + size):
+      pow2_lookup.append(sb3.Known(2 ** x))
+    ctx.lists[name] = pow2_lookup
+  return name, ctx
+
 def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
@@ -165,6 +180,22 @@ def undoTwosComplement(width: int, val: sb3.Value, return_var: bool) -> ValueAnd
     ]))
   return ValueAndBlocks(sb3.Op("sub", val, sb3.Op("mul", sb3.Known(decrease), sb3.BoolOp(">", val, sb3.Known(limit)))))
 
+def leftShift(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) -> tuple[sb3.Value, Context]:
+  # Multipling by a power of two is safe because the internal double value scratch uses doesnt loose accuracy
+  # when only the exponent part changes
+  if isinstance(right, sb3.Known):
+    try:
+      right_mul = sb3.Known(2 ** int(right.known))
+    except ValueError:
+      raise CompException("leftShift called with a known right value which was not a valid int")
+      #right_mul = sb3.Known("NaN")
+  else:
+    lookup, ctx = makePow2LookupTable(width, True, ctx) # Any value above the width will be treated as a zero
+                                                        # which has no effect on the result
+    right_mul = sb3.GetOfList("atindex", lookup, sb3.Op("add", right, sb3.Known(1)))
+
+  return sb3.Op("mod", sb3.Op("mul", left, right_mul), sb3.Known(2 ** width)), ctx
+
 def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
   if width > 48:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
@@ -175,6 +206,8 @@ def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
 def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlocks:
   # TODO OPTI: if one value is a known value, wrapping behaviour could be simpilifed and
   # known info could be propagated
+  # TODO OPTI: if multipling by a power of 2, there is no risk that the mantissa cannot store
+  # enough to be accurate, since only the exponent changes
   if width <= 26: # Safe: (2**26) ** 2 < 9007199254740991
     return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
   elif width <= 36: # Safe: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
@@ -247,14 +280,14 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       
       return blocks
 
-def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
+def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
   match instr:
     case ir.instruction.Alloca(): # Allocate space on the stack
       blocks.add(transAlloca(decodeVar(instr.result), instr.allocated_ty))
 
     case ir.instruction.Load(): # Copy a value from an address on the stack
-      address = decodeValue(ctx, instr.address)
+      address = decodeValue(instr.address, ctx)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
@@ -266,10 +299,10 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
                                       sb3.GetOfList("atindex", cfg.stack_list_var, address.value)))
 
     case ir.instruction.Store(): # Copy a value to an address on the stack
-      value = decodeValue(ctx, instr.value)
+      value = decodeValue(instr.value, ctx)
       blocks.add(value.blocks)
 
-      address = decodeValue(ctx, instr.address)
+      address = decodeValue(instr.address, ctx)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
@@ -287,7 +320,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
       # TODO FIX: in llvm getElementPtr is used but ignored in this code
       values = []
       for arg in instr.args:
-        value = decodeValue(ctx, arg)
+        value = decodeValue(arg, ctx)
         blocks.add(value.blocks)
         values.append(value.value)
       
@@ -299,7 +332,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
     
     case ir.instruction.Ret():
       if instr.value is not None:
-        value = decodeValue(ctx, instr.value)
+        value = decodeValue(instr.value, ctx)
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
@@ -308,11 +341,11 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
       blocks.end = True
 
     case ir.instruction.BinOp(): # do something with two vars
-      left = decodeValue(ctx, instr.fst_operand)
+      left = decodeValue(instr.fst_operand, ctx)
       blocks.add(left.blocks)
       left = left.value
 
-      right = decodeValue(ctx, instr.snd_operand)
+      right = decodeValue(instr.snd_operand, ctx)
       blocks.add(right.blocks)
       right = right.value
 
@@ -327,8 +360,8 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
         case "add" | "sub": # add/sub two vars
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
           width = instr.fst_operand.ty.num_bits
-
           # TODO FIX: support larger values by using multiple vars and carrying
           if width > 48:
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
@@ -356,8 +389,8 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
           # TODO OPTI: optimise for known values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
           width = instr.fst_operand.ty.num_bits
-
           # TODO FIX: support larger values
           if width > 48:
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
@@ -513,6 +546,17 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
             ])
 
           res_val = False # We set res_var ourselves
+        
+        case "shl":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+
+          res_val, ctx = leftShift(width, left, right, ctx)
 
         case _:
           raise CompException(f"Unknown BinOp Opcode: {instr.opcode} in {instr}")
@@ -526,7 +570,7 @@ def transInstr(ctx: Context, instr: ir.Instruction) -> sb3.BlockList:
 
     case _:
       raise CompException(f"Unknown instruction opcode {instr} (type {type(instr)})")
-  return blocks
+  return blocks, ctx
 
 def main():
   # TODO SEC passing raw parmas kinda unsafe, use subprocess
@@ -544,9 +588,6 @@ def main():
     sb3.OnStartFlag()
   ])
 
-  funcs: dict[str, tuple[int, sb3.BlockList]] = {}
-  lists: dict[str, list[sb3.Known]] = {}
-
   # Set up stack
   # TODO: not necessary if done beforehand (only need to change stack size)
   initsblocks.add(sb3.EditList("deleteall", cfg.stack_list_var, None, None))
@@ -561,7 +602,7 @@ def main():
     if globvar is None:
       raise CompException(f"Expected static var {instr} to be named")
     
-    blocks_and_value = decodeValue(ctx, instr.initializer)
+    blocks_and_value = decodeValue(instr.initializer, ctx)
     unknown = len(blocks_and_value.blocks) > 0
     value = blocks_and_value.value
 
@@ -621,9 +662,10 @@ def main():
     for block in func.blocks.values():
       print("LLVM BLOCK start")
       for instr in block.instrs:
-        funcblocks.add(transInstr(ctx, instr))
+        blocks, ctx = transInstr(instr, ctx)
+        funcblocks.add(blocks)
     
-    funcs[name] = (len(param_names), funcblocks)
+    ctx.funcs[name] = (len(param_names), funcblocks)
 
   ascii_lookup = []
   for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
@@ -632,16 +674,16 @@ def main():
       ascii_lookup.append(sb3.Known(f"\\{x:02X}"))
     else:
       ascii_lookup.append(sb3.Known(char))
-  lists["!ASCII Lookup (0 Indexed)"] = ascii_lookup
+  ctx.lists[cfg.ascii_lookup_var + cfg.zero_indexed_suffix] = ascii_lookup
 
-  funcs["puts"] = (1, sb3.BlockList([
+  ctx.funcs["puts"] = (1, sb3.BlockList([
     sb3.ProcedureDef("puts", ["input"]),
     sb3.EditVar("set", "buffer", sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter("input")),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", "buffer",
-        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", "!ASCII Lookup (0 Indexed)", sb3.GetVar("char")))),
+        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
       sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     ])),
@@ -649,15 +691,15 @@ def main():
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]))
 
-  if not "main" in funcs:
+  if not "main" in ctx.funcs:
     raise CompException("No main function") # TODO FIX: allow libs
-  initsblocks.add(sb3.ProdcedureCall("main", [sb3.Known("")] * funcs["main"][0]))
+  initsblocks.add(sb3.ProdcedureCall("main", [sb3.Known("")] * ctx.funcs["main"][0]))
 
   sctx = sb3.ScratchContext()
   sctx.addBlockList(initsblocks)
-  for name, scratchlist in lists.items():
+  for name, scratchlist in ctx.lists.items():
     sctx.addOrGetList(name, scratchlist)
-  for _, (_, func) in funcs.items():
+  for _, (_, func) in ctx.funcs.items():
     sctx.addBlockList(func)
 
   sb3.exportSpriteFile(sctx, "out.sprite3")
