@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
+from typing import Literal
 
 from llvm2py import parse_assembly
 from llvm2py import ir
@@ -180,21 +181,31 @@ def undoTwosComplement(width: int, val: sb3.Value, return_var: bool) -> ValueAnd
     ]))
   return ValueAndBlocks(sb3.Op("sub", val, sb3.Op("mul", sb3.Known(decrease), sb3.BoolOp(">", val, sb3.Known(limit)))))
 
-def leftShift(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) -> tuple[sb3.Value, Context]:
-  # Multipling by a power of two is safe because the internal double value scratch uses doesnt loose accuracy
-  # when only the exponent part changes
-  if isinstance(right, sb3.Known):
+def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
+  if isinstance(val, sb3.Known):
     try:
-      right_mul = sb3.Known(2 ** int(right.known))
+      return sb3.Known(2 ** int(val.known)), ctx
     except ValueError:
-      raise CompException("leftShift called with a known right value which was not a valid int")
-      #right_mul = sb3.Known("NaN")
+      raise CompException("Cannot calculate pow2 of a known non-integer")
+      #return sb3.Known("NaN"), ctx
   else:
-    lookup, ctx = makePow2LookupTable(width, True, ctx) # Any value above the width will be treated as a zero
+    lookup, ctx = makePow2LookupTable(max_val, True, ctx) # Any value above the width will be treated as a zero
                                                         # which has no effect on the result
-    right_mul = sb3.GetOfList("atindex", lookup, sb3.Op("add", right, sb3.Known(1)))
+    return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(1))), ctx
 
-  return sb3.Op("mod", sb3.Op("mul", left, right_mul), sb3.Known(2 ** width)), ctx
+def bitShift(direction: Literal["left", "right"], width: int, left: sb3.Value, right: sb3.Value, ctx: Context, can_shift_out=True) -> tuple[sb3.Value, Context]:
+  right_mul, ctx = intPow2(right, width, ctx)
+
+  if direction == "left":
+    # Multipling by a power of two is safe because the internal double value scratch uses doesnt loose accuracy
+    # when only the exponent part changes
+    unwrapped = sb3.Op("mul", left, right_mul)
+    if not can_shift_out: return unwrapped, ctx
+    return sb3.Op("mod", unwrapped, sb3.Known(2 ** width)), ctx
+  else:
+    unwrapped = sb3.Op("div", left, right_mul)
+    if not can_shift_out: return unwrapped, ctx
+    return sb3.Op("floor", unwrapped), ctx
 
 def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
   if width > 48:
@@ -556,10 +567,54 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
           if width > 48:
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
 
-          res_val, ctx = leftShift(width, left, right, ctx)
+          can_shift_out = not (instr.is_nsw and instr.is_nuw)
+          res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
+        
+        case "lshr":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          can_shift_out = not instr.is_exact
+          res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
+        
+        case "ashr":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+          
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          
+          if res_var is not None:
+            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+            change = 2 ** width
+
+            right_mul, ctx = intPow2(right, width, ctx)
+
+            unwrapped_pos = sb3.Op("div", left, right_mul)
+            val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
+
+            unwrapped_neg = sb3.Op("div", sb3.Op("sub", left, sb3.Known(change)), right_mul)
+            val_neg = sb3.Op("add", unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg), sb3.Known(change))
+
+            blocks.add([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+                sb3.EditVar("set", res_var.name, val_pos),
+              ]), sb3.BlockList([
+                sb3.EditVar("set", res_var.name, val_neg),
+              ])),
+            ])
+
+          res_val = False # We set res_var ourselves
 
         case _:
-          raise CompException(f"Unknown BinOp Opcode: {instr.opcode} in {instr}")
+          raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")
 
       if res_val is not False: # If the binop sets res_var itself
         if res_var is not None:
