@@ -14,16 +14,21 @@ import sb3
 @dataclass
 class Config:
   """Config options to pass to the sb3cc compiler"""
-  c_opti: str = "0" # Level of optimisation to compile with, passes -O<value> to clang
-  opti: bool = True # If optimisations for scratch should be applied
-  stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
   file: str = "input/main.c" # C file to compile
+  c_opti: str = "0" # Level of optimisation to compile with, passes -O<value> to clang
+  
+  opti: bool = True # If optimisations for scratch should be applied
+  invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
+  stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
+  binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
+  
   unused_var = "!unused" # Name of the scratch variable for unused values
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_list_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
   tmp_prefix = "!temp " # Name of temp variables before a number is added to them
   ascii_lookup_var = "!ascii lookup"
+  binop_lookup_var = "!binop lookup"
   pow2_lookup_var = "!pow2 lookup"
   zero_indexed_suffix = " (0 indexed)"
   one_indexed_suffix = " (1 indexed)"
@@ -612,6 +617,58 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
             ])
 
           res_val = False # We set res_var ourselves
+        
+        case "and" | "or" | "xor":
+          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+
+          width = instr.fst_operand.ty.num_bits
+          # TODO FIX: support larger values
+          if width > 48:
+            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+
+          if instr.opcode == "or" and instr.is_disjoint:
+            # If there would be no carry
+            res_val = sb3.Op("add", left, right)
+          else:
+            # TODO OPTI: gen (11-bit) tables/use mod for known values
+
+            if width > cfg.binop_lookup_bits:
+              left, lblocks = astuple(optimiseValueUse(left))
+              right, rblocks = astuple(optimiseValueUse(right))
+              blocks.add(lblocks)
+              blocks.add(rblocks)
+
+            lookup_size = 2 ** cfg.binop_lookup_bits
+            name = f"{cfg.binop_lookup_var} {instr.opcode}{cfg.zero_indexed_suffix}"
+            lookup = []
+            for l in range(0, lookup_size):
+              for r in range(0, lookup_size):
+                lookup.append(sb3.Known({"and": l & r, "or": l | r, "xor": l ^ r}[instr.opcode]))
+            ctx.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
+
+            results = []
+            for offset in range(0, width, cfg.binop_lookup_bits):
+              left_index = left
+              right_index = right
+              if offset > 0:
+                left_index = sb3.Op("floor", sb3.Op("div", left_index, sb3.Known(2 ** offset)))
+                right_index = sb3.Op("floor", sb3.Op("div", right_index, sb3.Known(2 ** offset)))
+              if offset + cfg.binop_lookup_bits < width:
+                left_index = sb3.Op("mod", left_index, sb3.Known(lookup_size))
+                right_index = sb3.Op("mod", right_index, sb3.Known(lookup_size))
+              left_index = sb3.Op("mul", left_index, sb3.Known(lookup_size))
+
+              result = sb3.GetOfList("atindex", name, sb3.Op("add", left_index, right_index))
+              if offset > 0: result = sb3.Op("mul", result, sb3.Known(2 ** offset))
+              results.append(result)
+            
+            if len(results) > 1:
+              res_val = sb3.Op("add", results.pop(), results.pop())
+              while len(results) > 0:
+                res_val = sb3.Op("add", res_val, results.pop())
+            else:
+              res_val = results[0]
 
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")
@@ -750,7 +807,7 @@ def main():
     raise CompException("No main function") # TODO FIX: allow libs
   initsblocks.add(sb3.ProdcedureCall("main", [sb3.Known("")] * ctx.funcs["main"][0]))
 
-  sctx = sb3.ScratchContext()
+  sctx = sb3.ScratchContext(sb3.ScratchConfig(cfg.invis_blocks))
   sctx.addBlockList(initsblocks)
   for name, scratchlist in ctx.lists.items():
     sctx.addOrGetList(name, scratchlist)

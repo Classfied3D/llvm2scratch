@@ -51,7 +51,12 @@ SHORT_OP_TO_OPCODE = {
 Id = str
 
 @dataclass
+class ScratchConfig:
+  invis_blocks: bool = False # Prevent blocks from rendering; stops editor lag
+
+@dataclass
 class ScratchContext:
+  cfg: ScratchConfig = field(default_factory=ScratchConfig)
   vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
   lists: dict[str, tuple[Id, list[Known]]] = field(default_factory=dict)
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
@@ -61,6 +66,7 @@ class ScratchContext:
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
     if not isinstance(block, LateBlock):
       metaless, self = block.getRaw(id, self)
+      if self.cfg.invis_blocks: meta.shadow = True
       self.blocks[id] = meta.addRawMeta(metaless)
     else:
       self.late_blocks.append((id, block, meta))

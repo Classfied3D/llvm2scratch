@@ -13,8 +13,13 @@ int main(void) {
   a = 31;
   a <<= a;
   a >>= 3;
-  u_int32_t b = 3204;
-  b >>= 4;
+
+  unsigned int b = 3204;
+  b >>= 2;
+  b ^= 113;
+  b |= 1546;
+  b &= 393;
+
   /*for (a = 0; a < 5; a++) {
     printf("%d", a);
   }*/
