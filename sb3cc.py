@@ -71,7 +71,7 @@ class CompException(Exception):
   pass
 
 def astuple(obj):
-  """Same as dataclasses.astuple but not recursive because thats just annoying"""
+  """Same as dataclasses.astuple but not recursively with dataclasses in dataclasses"""
   if not is_dataclass(obj):
     raise TypeError("Expected dataclass instance")
   return tuple(getattr(obj, f.name) for f in fields(obj))
@@ -653,7 +653,8 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
               right_index = right
               if offset > 0:
                 left_index = sb3.Op("floor", sb3.Op("div", left_index, sb3.Known(2 ** offset)))
-                right_index = sb3.Op("floor", sb3.Op("div", right_index, sb3.Known(2 ** offset)))
+                # No floor instruction needed because scratch rounds down with atindex
+                right_index = sb3.Op("div", right_index, sb3.Known(2 ** offset))
               if offset + cfg.binop_lookup_bits < width:
                 left_index = sb3.Op("mod", left_index, sb3.Known(lookup_size))
                 right_index = sb3.Op("mod", right_index, sb3.Known(lookup_size))
@@ -685,6 +686,11 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
   return blocks, ctx
 
 def main():
+  global ctx, cfg, highest_tmp
+  ctx = Context()
+  cfg = Config()
+  highest_tmp = 0
+  
   # TODO SEC passing raw parmas kinda unsafe, use subprocess
   os.system(f"clang -S -emit-llvm -O{cfg.c_opti} {cfg.file}")
 
@@ -692,8 +698,6 @@ def main():
     ll = file.read()
   
   mod: ir.Module = parse_assembly(ll)
-
-  ctx = Context()
 
   # Blocks that make up the code to setup the stack at the start of the program
   initsblocks = sb3.BlockList([
@@ -770,6 +774,9 @@ def main():
     funcblocks = sb3.BlockList([
       sb3.ProcedureDef(name, param_names)
     ])
+
+    if len(func.blocks) > 1:
+      raise CompException("Cannot support more than 1 LLVM blocks") # TODO FIX
 
     for block in func.blocks.values():
       print("LLVM BLOCK start")
