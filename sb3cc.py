@@ -44,6 +44,13 @@ class Context:
   globvar_to_ptr: dict[str, sb3.Known] = field(default_factory=dict)
 
 @dataclass
+class FuncContext:
+  """Context about the function which instructions are running in"""
+  name: str
+  params: list[str]
+  is_scratch_func: bool # If the instruction can access the parameters normally (in the body of a scratch func) 
+
+@dataclass
 class ValueAndBlocks:
   """A value and any blocks that come before it needed to get that value"""
   value: sb3.Value
@@ -64,7 +71,17 @@ class IValueAndBlocks:
 class Variable:
   """Name of a variable"""
   name: str
+  is_scratch_param: bool
   ty: ir.Type
+
+  def getValue(self) -> sb3.Value:
+    if self.is_scratch_param:
+      return sb3.GetParameter(self.name)
+    return sb3.GetVar(self.name)
+  
+  def setValue(self, value: sb3.Value, op: Literal["set", "change"]="set") -> sb3.Block:
+    if self.is_scratch_param: raise CompException(f"{self.name} param is read only")
+    return sb3.EditVar(op, self.name, value)
 
 class CompException(Exception):
   """Exception in the sb3cc compiler"""
@@ -88,13 +105,13 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(val: ir.value.Value, ctx: Context) -> ValueAndBlocks | IValueAndBlocks:
+def decodeValue(val: ir.value.Value, ctx: Context, fctx: FuncContext | None) -> ValueAndBlocks | IValueAndBlocks:
   match val.val:
     case str(): # if a variable
-      var = decodeVar(val)
+      var = decodeVar(val, fctx)
       res = sb3.Known("") # this means no value - nothing in the block
       if var is not None:
-        res = sb3.GetVar(var.name)
+        res = var.getValue()
         if cfg.opti and var.name in ctx.globvar_to_ptr:
           res = ctx.globvar_to_ptr[var.name]
       return ValueAndBlocks(res)
@@ -123,18 +140,24 @@ def decodeValue(val: ir.value.Value, ctx: Context) -> ValueAndBlocks | IValueAnd
     case _:
       raise CompException(f"Unknown Value: {val.val} (py type: {type(val.val)})")
 
-def decodeVar(var: ir.value.Value) -> Variable | None:
+def decodeVar(var: ir.value.Value, fctx: FuncContext | None) -> Variable | None:
   """Used for getting the assigned variable of an instruction"""
   if not isinstance(var.val, str):
     raise CompException(f"Expected val to be a variable, got Value: {var.val} (py type: {type(var.val)})")
   if var.val == "<badref>":
     return None
-  return Variable(decodeVarName(var.val), var.ty)
-
-def decodeVarName(name: str) -> str:
+  
+  name = var.val
+  is_param = False
   if not name.startswith("%"):
-    return "@" + name
-  return name
+    name = f"@{name}"
+  elif fctx is not None:
+    if name in fctx.params and fctx.is_scratch_func:
+      is_param = True
+    else:
+      name = f"%{fctx.name}:{name[1:]}" # Localise variables for functions
+
+  return Variable(name, is_param, var.ty)
 
 def genTempVar() -> str:
   global highest_tmp
@@ -263,11 +286,13 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlock
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
 
 def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
+  assert var is None or var.is_scratch_param is False
+
   blocks = sb3.BlockList()
   size = getByteSize(ty)
 
   if var is not None:
-    blocks.add(sb3.EditVar("set", var.name, sb3.GetVar(cfg.stack_size_var)))
+    blocks.add(var.setValue(sb3.GetVar(cfg.stack_size_var)))
     
   # TODO OPTI: can skip increasing the size if we know the function does not allocate or call another func
   blocks.add(sb3.EditVar("change", cfg.stack_size_var, sb3.Known(size)))
@@ -296,29 +321,29 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       
       return blocks
 
-def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Context]:
+def transInstr(instr: ir.Instruction, ctx: Context, fctx: FuncContext) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
   match instr:
     case ir.instruction.Alloca(): # Allocate space on the stack
-      blocks.add(transAlloca(decodeVar(instr.result), instr.allocated_ty))
+      blocks.add(transAlloca(decodeVar(instr.result, fctx), instr.allocated_ty))
 
     case ir.instruction.Load(): # Copy a value from an address on the stack
-      address = decodeValue(instr.address, ctx)
+      address = decodeValue(instr.address, ctx, fctx)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
-      var = decodeVar(instr.result)
+      var = decodeVar(instr.result, fctx)
       if var is not None:
         blocks.add(sb3.EditVar("set", var.name, 
                                       sb3.GetOfList("atindex", cfg.stack_list_var, address.value)))
 
     case ir.instruction.Store(): # Copy a value to an address on the stack
-      value = decodeValue(instr.value, ctx)
+      value = decodeValue(instr.value, ctx, fctx)
       blocks.add(value.blocks)
 
-      address = decodeValue(instr.address, ctx)
+      address = decodeValue(instr.address, ctx, fctx)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
@@ -336,19 +361,19 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
       # TODO FIX: in llvm getElementPtr is used but ignored in this code
       values = []
       for arg in instr.args:
-        value = decodeValue(arg, ctx)
+        value = decodeValue(arg, ctx, fctx)
         blocks.add(value.blocks)
         values.append(value.value)
       
       blocks.add(sb3.ProdcedureCall(fn_name, values))
       
-      var = decodeVar(instr.result)
+      var = decodeVar(instr.result, fctx)
       if var is not None:
         blocks.add(sb3.EditVar("set", var.name, sb3.GetVar(cfg.return_var)))
     
     case ir.instruction.Ret():
       if instr.value is not None:
-        value = decodeValue(instr.value, ctx)
+        value = decodeValue(instr.value, ctx, fctx)
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
@@ -357,15 +382,16 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
       blocks.end = True
 
     case ir.instruction.BinOp(): # do something with two vars
-      left = decodeValue(instr.fst_operand, ctx)
+      left = decodeValue(instr.fst_operand, ctx, fctx)
       blocks.add(left.blocks)
       left = left.value
 
-      right = decodeValue(instr.snd_operand, ctx)
+      right = decodeValue(instr.snd_operand, ctx, fctx)
       blocks.add(right.blocks)
       right = right.value
 
-      res_var = decodeVar(instr.result)
+      res_var = decodeVar(instr.result, fctx)
+      assert res_var is None or res_var.is_scratch_param is False
       res_val = None
 
       if isinstance(left, IndexableValue) or \
@@ -676,7 +702,7 @@ def transInstr(instr: ir.Instruction, ctx: Context) -> tuple[sb3.BlockList, Cont
 
       if res_val is not False: # If the binop sets res_var itself
         if res_var is not None:
-          blocks.add(sb3.EditVar("set", res_var.name, res_val))
+          blocks.add(res_var.setValue(res_val))
         else:
           if not cfg.opti: # Values have no effect on state in scratch, only state has effect on values
             blocks.add(sb3.EditVar("set", cfg.unused_var, res_val))
@@ -714,11 +740,11 @@ def main():
   for instr in mod.global_vars.values():
     # TODO OPTI: Don't use allocate and store and set to the var, instead just remember the
     # ptr value in the decoder and replace any uses of the variable with it (only when opti=true)
-    globvar = decodeVar(instr.value)
+    globvar = decodeVar(instr.value, None)
     if globvar is None:
       raise CompException(f"Expected static var {instr} to be named")
     
-    blocks_and_value = decodeValue(instr.initializer, ctx)
+    blocks_and_value = decodeValue(instr.initializer, ctx, None)
     unknown = len(blocks_and_value.blocks) > 0
     value = blocks_and_value.value
 
@@ -778,10 +804,11 @@ def main():
     if len(func.blocks) > 1:
       raise CompException("Cannot support more than 1 LLVM blocks") # TODO FIX
 
+    fctx = FuncContext(name, param_names, True)
     for block in func.blocks.values():
       print("LLVM BLOCK start")
       for instr in block.instrs:
-        blocks, ctx = transInstr(instr, ctx)
+        blocks, ctx = transInstr(instr, ctx, fctx)
         funcblocks.add(blocks)
     
     ctx.funcs[name] = (len(param_names), funcblocks)

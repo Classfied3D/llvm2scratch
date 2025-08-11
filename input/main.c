@@ -2,6 +2,10 @@
 
 static int a = 7;
 
+int add_one(int a) {
+  return a + 1;
+}
+
 int main(void) {
   puts("hello world");
   a += 2;
@@ -19,6 +23,8 @@ int main(void) {
   b ^= 113;
   b |= 1546;
   b &= 393;
+
+  a = add_one(a);
 
   /*for (a = 0; a < 5; a++) {
     printf("%d", a);
