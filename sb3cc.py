@@ -9,6 +9,7 @@ from llvm2py import ir
 import math
 import os
 
+import sb3opt
 import sb3
 
 @dataclass
@@ -365,7 +366,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, fctx: FuncContext) -> tuple[
         blocks.add(value.blocks)
         values.append(value.value)
       
-      blocks.add(sb3.ProdcedureCall(fn_name, values))
+      blocks.add(sb3.ProcedureCall(fn_name, values))
       
       var = decodeVar(instr.result, fctx)
       if var is not None:
@@ -839,16 +840,17 @@ def main():
 
   if not "main" in ctx.funcs:
     raise CompException("No main function") # TODO FIX: allow libs
-  initsblocks.add(sb3.ProdcedureCall("main", [sb3.Known("")] * ctx.funcs["main"][0]))
+  initsblocks.add(sb3.ProcedureCall("main", [sb3.Known("")] * ctx.funcs["main"][0]))
 
-  sctx = sb3.ScratchContext(sb3.ScratchConfig(cfg.invis_blocks))
-  sctx.addBlockList(initsblocks)
-  for name, scratchlist in ctx.lists.items():
-    sctx.addOrGetList(name, scratchlist)
+  proj = sb3.Project(sb3.ScratchConfig(cfg.invis_blocks))
+  proj.code.append(initsblocks)
+  proj.lists.update(ctx.lists)
   for _, (_, func) in ctx.funcs.items():
-    sctx.addBlockList(func)
+    proj.code.append(func)
 
-  sb3.exportSpriteFile(sctx, "out.sprite3")
+  if cfg.opti: proj = sb3opt.optimise(proj)
+
+  sb3.exportSpriteFile(proj.getCtx(), "out.sprite3")
 
 if __name__ == "__main__":
   main()

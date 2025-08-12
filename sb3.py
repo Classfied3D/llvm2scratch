@@ -55,6 +55,20 @@ class ScratchConfig:
   invis_blocks: bool = False # Prevent blocks from rendering; stops editor lag
 
 @dataclass
+class Project:
+  cfg: ScratchConfig
+  code: list[BlockList] = field(default_factory=list)
+  lists: dict[str, list[Known]] = field(default_factory=dict)
+
+  def getCtx(self) -> ScratchContext:
+    ctx = ScratchContext(self.cfg)
+    for name, scratch_list in self.lists.items():
+      ctx.addOrGetList(name, scratch_list)
+    for block_list in self.code:
+      ctx.addBlockList(block_list)
+    return ctx
+
+@dataclass
 class ScratchContext:
   cfg: ScratchConfig = field(default_factory=ScratchConfig)
   vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
@@ -115,6 +129,9 @@ class ScratchContext:
       self.lists.update({list_name: (id, default_val)})
     else:
       id = self.lists[list_name][0]
+      if len(default_val) > 0:
+        if len(self.lists[list_name][1]) > 0: raise ScratchCompException(f"List {list_name} given default value twice")
+        self.lists[list_name] = (id, default_val)
     return id
   
   def addFunc(self, func_name: str, param_ids: list[Id], run_without_refresh: bool) -> None:
@@ -241,14 +258,19 @@ class Value:
 
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
+  def getRawBoolValue(self, _parent: str, _ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
+    raise ScratchCompException("Cannot export for generic type 'BooleanValue'; must be a derived class")
 
 @dataclass
 class Known(Value):
   """Something that can be typed in a block input e.g. x in Say(x)"""
-  known: str | float
+  known: str | float | bool
 
   def getRawValue(self, _: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
-    return ([1, [10 if isinstance(self.known, str) else 4, str(self.known)]], ctx)
+    raw = self.known
+    if not isinstance(self.known, str):
+      raw = float(raw)
+    return [1, [(10 if isinstance(self.known, str) else 4), raw]], ctx
   
   def getRawVarInit(self) -> str | float:
     """Get the raw value to set a var to when it starts with this value"""
@@ -257,13 +279,28 @@ class Known(Value):
     except ValueError:
       return self.known
 
+class KnownBool(Known, BooleanValue):
+  known: bool
+
+  def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+    return Known(int(self.known)).getRawValue(parent, ctx)
+  
+  def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
+    if not self.known:
+      return None, ctx # If false
+    return BoolOp("not", KnownBool(False)).getRawBoolValue(parent, ctx)
+  
+  def getRawVarInit(self) -> str:
+    """Get the raw value to set a var to when it starts with this value"""
+    return "true" if self.known else "false"
+
 # Looks
 @dataclass
 class Say(Block):
-  message: Value
+  value: Value
 
   def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raw_msg, ctx = self.message.getRawValue(my_id, ctx)
+    raw_msg, ctx = self.value.getRawValue(my_id, ctx)
     return {
       "opcode": "looks_say",
       "inputs": {
@@ -294,16 +331,18 @@ class ControlFlow(Block):
       raise ScratchCompException("An if-else statement must contain blocks in the else case")
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raw_val, ctx = self.value.getRawValue(my_id, ctx)
+    if self.op in ["if", "if_else", "until", "while"]:
+      assert isinstance(self.value, BooleanValue)
+      raw_val, ctx = self.value.getRawBoolValue(my_id, ctx)
+    else:
+      raw_val, ctx = self.value.getRawValue(my_id, ctx)
     
     blocks_id = ctx.addBlockList(self.blocks, my_id)
     
     input_name = "TIMES" if self.op == "reptimes" else "CONDITION"
 
-    inputs = {
-      input_name: raw_val,
-      "SUBSTACK": [2, blocks_id]
-    }
+    inputs = {"SUBSTACK": [2, blocks_id]}
+    if raw_val is not None: inputs.update({input_name: raw_val})
 
     if self.op == "if_else":
       assert self.else_blocks is not None
@@ -479,8 +518,16 @@ class BoolOp(BooleanValue):
   def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     id = genId()
 
-    raw_left, ctx = self.left.getRawValue(id, ctx)
-    if not self.right is None:
+    raw_right = None
+    if self.op in ["not", "and", "or"]:
+      assert isinstance(self.left, BooleanValue)
+      raw_left, ctx = self.left.getRawBoolValue(id, ctx)
+      if not self.right is None:
+        assert isinstance(self.right, BooleanValue)
+        raw_right, ctx = self.right.getRawBoolValue(id, ctx)
+    else:
+      raw_left, ctx = self.left.getRawValue(id, ctx)
+      assert self.right is not None
       raw_right, ctx = self.right.getRawValue(id, ctx)
 
     match self.op:
@@ -493,9 +540,9 @@ class BoolOp(BooleanValue):
         lft_param = "OPERAND1"
         rgt_param = "OPERAND2"
     
-    inputs = {lft_param: raw_left}
-    if self.op != "not":
-      inputs.update({rgt_param: raw_right})
+    inputs = {}
+    if raw_left is not None: inputs.update({lft_param: raw_left})
+    if raw_right is not None: inputs.update({rgt_param: raw_right})
 
     ctx.addBlock(id, RawBlock({
       "opcode": SHORT_OP_TO_OPCODE[self.op],
@@ -503,6 +550,9 @@ class BoolOp(BooleanValue):
     }), BlockMeta(parent))
 
     return [2, id], ctx
+  
+  def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
+    return self.getRawValue(parent, ctx)
 
 # Procedures
 @dataclass
@@ -546,7 +596,7 @@ class ProcedureDef(StartBlock):
     }, ctx
 
 @dataclass
-class ProdcedureCall(LateBlock):
+class ProcedureCall(LateBlock):
   proc_name: str
   arguments: list[Value]
 
@@ -642,7 +692,7 @@ def main():
     ControlFlow("until", BoolOp("=", Op("div", GetVar("hello3"), Known(30)), Known(0)), BlockList([
       EditVar("set", "hello2", Known(10)),
     ])),
-    ProdcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
+    ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
     StopScript("stopall"),
   ]))
 

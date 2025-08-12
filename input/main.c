@@ -26,6 +26,9 @@ int main(void) {
 
   a = add_one(a);
 
+  //printf("%u\n", a);
+  //printf("%u", b);
+
   /*for (a = 0; a < 5; a++) {
     printf("%d", a);
   }*/
