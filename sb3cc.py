@@ -708,6 +708,69 @@ def transInstr(instr: ir.Instruction, ctx: Context, fctx: FuncContext) -> tuple[
           if not cfg.opti: # Values have no effect on state in scratch, only state has effect on values
             blocks.add(sb3.EditVar("set", cfg.unused_var, res_val))
 
+    case ir.instruction.ICmp():
+      left = decodeValue(instr.fst_operand, ctx, fctx)
+      blocks.add(left.blocks)
+      left = left.value
+
+      right = decodeValue(instr.snd_operand, ctx, fctx)
+      blocks.add(right.blocks)
+      right = right.value
+
+      res_var = decodeVar(instr.result, fctx)
+      assert res_var is None or res_var.is_scratch_param is False
+
+      if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
+
+      width = instr.fst_operand.ty.num_bits
+      # TODO FIX: support larger values
+      if width > 48:
+        raise CompException(f"Instruction icmp currently supports integers with <= 48 bits")
+
+      # TODO FIX: boolean values 'true' or 'false' could potentially create issues
+      match instr.cond:
+        case "eq":
+          res_val = sb3.BoolOp("=", left, right)
+        case "ne":
+          res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
+        case _:
+          # TODO FIX: ugt, uge, ult, ule, and signed counterparts
+          raise CompException(f"icmp does not support comparsion mode {instr.cond}")
+        
+      if res_var is not None:
+        blocks.add(res_var.setValue(res_val))
+    
+    case ir.instruction.Conversion():
+      value = decodeValue(instr.value, ctx, fctx)
+      blocks.add(value.blocks)
+      value = value.value
+      
+      res_var = decodeVar(instr.result, fctx)
+      assert res_var is None or res_var.is_scratch_param is False
+
+      if not isinstance(instr.value.ty, ir.IntegerType): # TODO: add vector support
+        raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.value.ty)}")
+      assert isinstance(value, sb3.Value)
+
+      width = instr.value.ty.num_bits
+      # TODO FIX: support larger values
+      if width > 48:
+        raise CompException(f"Instruction icmp currently supports integers with <= 48 bits")
+      
+      res_val = None
+
+      match instr.opcode:
+        case "zext":
+          if res_var is not None:
+            res_val = res_var.getValue()
+        case _:
+          raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
+      
+      if res_val is not None and res_var is not None:
+        blocks.add(res_var.setValue(res_val))
+
     case _:
       raise CompException(f"Unknown instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx
@@ -719,7 +782,7 @@ def main():
   highest_tmp = 0
   
   # TODO SEC passing raw parmas kinda unsafe, use subprocess
-  os.system(f"clang -S -emit-llvm -O{cfg.c_opti} {cfg.file}")
+  os.system(f"clang -S -m32 -emit-llvm -O{cfg.c_opti} {cfg.file}")
 
   with open("main.ll", "r") as file:
     ll = file.read()

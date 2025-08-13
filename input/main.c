@@ -6,6 +6,19 @@ int add_one(int a) {
   return a + 1;
 }
 
+int test_branch(int num) {
+  int a = 3;
+  //if (num != 1) {
+  //  a = 4;
+  //  puts("a set to 4");
+  //}
+  a += num != 1;
+
+  int b = a + 1;
+
+  return b;
+}
+
 int main(void) {
   puts("hello world");
   a += 2;
@@ -14,6 +27,7 @@ int main(void) {
   a /= -3;
   a = -340;
   a %= -60;
+
   a = 31;
   a <<= a;
   a >>= 3;
@@ -26,11 +40,14 @@ int main(void) {
 
   a = add_one(a);
 
-  //printf("%u\n", a);
-  //printf("%u", b);
+  int c = test_branch(1);
 
-  /*for (a = 0; a < 5; a++) {
-    printf("%d", a);
-  }*/
+  //printf("%u\n", a);
+  //printf("%u\n", b);
+  //printf("%u", c);
+
+  //for (char c = 65; c < 70; c++) {
+  //  puts(&c);
+  //}
   return 0;
 }
