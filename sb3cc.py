@@ -1074,7 +1074,7 @@ def main():
 
   ctx = addFunc("puts", ["input"], set(), False, sb3.BlockList([
     sb3.EditVar("set", "buffer", sb3.Known("")),
-    sb3.EditVar("set", "ptr", sb3.GetParameter("input")),
+    sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", "buffer",
