@@ -8,7 +8,7 @@ int add_one(int a) {
 
 int test_branch(int num) {
   int a = 3;
-  
+
   if (num != 1) {
     a = 4;
     puts("a set to 4");
@@ -38,7 +38,7 @@ int main(void) {
 
   a = add_one(a);
 
-  int c = test_branch(1);
+  int c = test_branch(2);
 
   //printf("%u\n", a);
   //printf("%u\n", b);

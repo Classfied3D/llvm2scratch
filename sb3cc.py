@@ -734,7 +734,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         case _:
           # TODO FIX: ugt, uge, ult, ule, and signed counterparts
           raise CompException(f"icmp does not support comparsion mode {instr.cond}")
-        
+
+      res_val = sb3.Op("abs", res_val) # TODO OPTI: not always needed, update optimiser  
+      
       if res_var is not None:
         blocks.add(res_var.setValue(res_val))
     
