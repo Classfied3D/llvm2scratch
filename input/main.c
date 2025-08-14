@@ -1,4 +1,4 @@
-#include <stdio.h>
+/*#include <stdio.h>
 
 static int a = 7;
 
@@ -9,10 +9,7 @@ int add_one(int a) {
 int test_branch(int num) {
   int a = 3;
 
-  if (num != 1) {
-    a = 4;
-    puts("a set to 4");
-  }
+  if (num != 1) a = 50;
 
   return a + num;
 }
@@ -38,14 +35,33 @@ int main(void) {
 
   a = add_one(a);
 
-  int c = test_branch(2);
-
   //printf("%u\n", a);
   //printf("%u\n", b);
   //printf("%u", c);
 
-  //for (char c = 65; c < 70; c++) {
-  //  puts(&c);
-  //}
+  for (unsigned char d = 65; d != 70; d++) {
+    putchar(d);
+  }
+
+  int c = test_branch(2);
+  return 0;
+}*/
+
+#include <stdio.h>
+
+int test_branch(int num) {
+  int a = 3;
+
+  if (num != 1) a = 50;
+
+  return a + num;
+}
+
+int main(void) {
+  for (unsigned char d = 65; d != 70; d++) {
+    putchar(d);
+  }
+
+  int c = test_branch(2);
   return 0;
 }

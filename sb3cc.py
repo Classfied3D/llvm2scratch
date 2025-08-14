@@ -761,8 +761,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
       match instr.opcode:
         case "zext":
-          if res_var is not None:
-            res_val = res_var.getValue()
+          res_val = value
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
       
@@ -1083,6 +1082,11 @@ def main():
       sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
     ])),
     sb3.Say(sb3.GetVar("buffer")),
+    sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
+  ]), ctx)
+
+  ctx = addFunc("putchar", ["input"], set(), False, sb3.BlockList([
+    sb3.Say(sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetParameter(localizeParameter("input")))),
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
