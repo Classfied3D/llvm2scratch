@@ -4,29 +4,6 @@ import math
 
 import sb3
 
-def scratchCastToNum(value: sb3.Known) -> float:
-  """Performs the same casting to number as scratch"""
-  raw = value.known
-  if not isinstance(raw, float):
-    try:
-      raw = float(raw)
-    except ValueError:
-      raw = math.nan
-
-  return 0 if math.isnan(raw) else raw
-
-def scratchCastToBool(value: sb3.Known) -> bool:
-  """Performs the same casting to bool as scratch"""
-  raw = value.known
-  match raw:
-    case str():
-      return raw.lower() not in ["", "0", "false"]
-    case float():
-      return not (raw == 0 or math.isnan(raw))
-    case bool():
-      return raw
-  raise AssertionError("Should be unreachable")
-
 def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
   """Optimise a value by using context"""
   did_opti_total = False
@@ -41,13 +18,13 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
       if value.op == "not":
         if isinstance(value.left, sb3.KnownBool):
           did_opti_total = True
-          value = sb3.KnownBool(not scratchCastToBool(value.left))
+          value = sb3.KnownBool(not sb3.scratchCastToBool(value.left))
 
       elif isinstance(value.left, sb3.Known) and isinstance(value.right, sb3.Known):
         if value.op in ["<", ">", "="]:
           did_opti_total = True
-          left = scratchCastToNum(value.left)
-          right = scratchCastToNum(value.right)
+          left = sb3.scratchCastToNum(value.left)
+          right = sb3.scratchCastToNum(value.right)
           match value.op:
             case "<":
               value = sb3.KnownBool(left < right)
@@ -58,8 +35,8 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
 
         elif value.op in ["and", "or"]:
           did_opti_total = True
-          left = scratchCastToBool(value.left)
-          right = scratchCastToBool(value.right)
+          left = sb3.scratchCastToBool(value.left)
+          right = sb3.scratchCastToBool(value.right)
           if value.op == "and":
             value = sb3.KnownBool(left and right)
           else:
@@ -73,8 +50,8 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
       did_opti_total |= did_opti_1 or did_opti_2
 
       if isinstance(value.left, sb3.Known) and (isinstance(value.right, sb3.Known) or value.right is None):
-        left = scratchCastToNum(value.left)
-        if value.right is not None: right = scratchCastToNum(value.right)
+        left = sb3.scratchCastToNum(value.left)
+        if value.right is not None: right = sb3.scratchCastToNum(value.right)
         did_opti_total = True
         match value.op:
           case "add":
@@ -100,10 +77,10 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
         unknown = value.right
         if left_known:
           assert isinstance(value.left, sb3.Known) # why do I have to assert this lol
-          known = scratchCastToNum(value.left)
+          known = sb3.scratchCastToNum(value.left)
         else:
           assert isinstance(value.right, sb3.Known)
-          known = scratchCastToNum(value.right)
+          known = sb3.scratchCastToNum(value.right)
           unknown = value.left
         match value.op:
           case "add" | "sub":
@@ -130,7 +107,7 @@ def knownValuePropagation(blocklist: sb3.BlockList) -> tuple[sb3.BlockList, bool
     while did_opti:
       did_opti = False
       match block:
-        case sb3.Say() | sb3.EditVar() | sb3.ControlFlow():
+        case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast():
           block.value, did_opti = simplifyValue(block.value)
         case sb3.EditList():
           did_opti_1 = did_opti_2 = False
@@ -193,7 +170,7 @@ def knownValuePropagation(blocklist: sb3.BlockList) -> tuple[sb3.BlockList, bool
 
   return new_blocklist, did_opti_total
 
-def optimise(proj: sb3.Project) -> sb3.Project:
+def optimize(proj: sb3.Project) -> sb3.Project:
   new_code = []
   for blocklist in proj.code:
     did_opti = True
@@ -212,7 +189,7 @@ def main():
     ]))
   ]))
 
-  proj = optimise(proj)
+  proj = optimize(proj)
 
   sb3.exportSpriteFile(proj.getCtx(), "out.sprite3")
 

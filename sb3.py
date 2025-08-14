@@ -8,7 +8,9 @@ import zipfile
 import hashlib
 import random
 import json
+import math
 
+DEFAULT_BROADCAST_MESSAGE = "message1"
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
 SHORT_OP_TO_OPCODE = {
@@ -73,6 +75,7 @@ class ScratchContext:
   cfg: ScratchConfig = field(default_factory=ScratchConfig)
   vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
   lists: dict[str, tuple[Id, list[Known]]] = field(default_factory=dict)
+  broadcasts: dict[str, Id] = field(default_factory=dict)
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
@@ -139,6 +142,15 @@ class ScratchContext:
       raise ScratchCompException(f"Function {func_name} registered twice")
     self.funcs[func_name] = (param_ids, run_without_refresh)
   
+  def addBroadcast(self, name: str) -> Id:
+    """Adds a broadcast with the given name, returns the id of the broadcast"""
+    if name in self.broadcasts:
+      return self.broadcasts[name]
+    
+    id = genId()
+    self.broadcasts[name] = id
+    return id
+
   def getRaw(self) -> dict:
     """Returns json for blocks and vars defined"""
     while len(self.late_blocks) > 0:
@@ -156,6 +168,12 @@ class ScratchContext:
     for name, (id, values) in self.lists.items():
       raw_lists.update({
         id: [name, [value.getRawVarInit() for value in values]]
+      })
+    
+    raw_broadcasts = {}
+    for name, id in self.broadcasts.items():
+      raw_broadcasts.update({
+        id: name
       })
     
     raw_blocks = {}
@@ -272,8 +290,9 @@ class Known(Value):
       raw = float(raw)
     return [1, [(10 if isinstance(self.known, str) else 4), raw]], ctx
   
-  def getRawVarInit(self) -> str | float:
+  def getRawVarInit(self) -> str | float | bool:
     """Get the raw value to set a var to when it starts with this value"""
+    if isinstance(self.known, bool): return "true" if self.known else "false"
     try:
       return float(self.known)
     except ValueError:
@@ -306,6 +325,43 @@ class Say(Block):
       "inputs": {
         "MESSAGE": raw_msg
       }
+    }, ctx
+
+# Events
+# Thank you @RetrogradeDev for this wonderful MIT licensed code which I have now stolen
+@dataclass
+class Broadcast(Block):
+  value: Value
+  wait: bool
+
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    opcode = "event_broadcastandwait" if self.wait else "event_broadcast"
+
+    broadcast_name = scratchCastToStr(self.value) if isinstance(self.value, Known) else DEFAULT_BROADCAST_MESSAGE
+    id = ctx.addBroadcast(broadcast_name)
+
+    if not isinstance(self.value, Known):
+      raw_input_value, ctx = self.value.getRawValue(my_id, ctx)
+      # So that if the block is removed you get a normal broadcast
+      raw_value = [3, raw_input_value[1], [11, broadcast_name, id]]
+    else:
+      raw_value = [1, [11, broadcast_name, id]]
+
+    return {
+      "opcode": opcode,
+      "inputs": {"BROADCAST_INPUT": raw_value},
+    }, ctx
+
+@dataclass
+class OnBroadcast(StartBlock):
+  value: str
+
+  def getRaw(self, _my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    id = ctx.addBroadcast(self.value)
+
+    return {
+      "opcode": "event_whenbroadcastreceived",
+      "fields": {"BROADCAST_OPTION": [self.value, id]}
     }, ctx
 
 # Control
@@ -638,6 +694,35 @@ class ScratchCompException(Exception):
   """Exception when compiling to scratch"""
   pass
 
+def scratchCastToNum(value: Known) -> float:
+  """Performs the same casting to number as scratch"""
+  raw = value.known
+  if not isinstance(raw, float):
+    try:
+      raw = float(raw)
+    except ValueError:
+      raw = math.nan
+
+  return 0 if math.isnan(raw) else raw
+
+def scratchCastToBool(value: Known) -> bool:
+  """Performs the same casting to bool as scratch"""
+  raw = value.known
+  match raw:
+    case str():
+      return raw.lower() not in ["", "0", "false"]
+    case float():
+      return not (raw == 0 or math.isnan(raw))
+    case bool():
+      return raw
+  raise AssertionError("Should be unreachable")
+
+def scratchCastToStr(value: Known) -> str:
+  """Performs the same casting to str as scratch"""
+  raw = value.known
+  if isinstance(raw, bool): return "true" if raw else "false"
+  return str(raw)
+
 def genId() -> Id:
   return random.randbytes(16).hex()
 
@@ -693,8 +778,14 @@ def main():
       EditVar("set", "hello2", Known(10)),
     ])),
     ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
+    Broadcast(Op("length_of", GetVar("hello2")), True),
     StopScript("stopall"),
   ]))
+
+  #ctx.addBlockList(BlockList([
+  #  OnBroadcast("hi"),
+  #  Say(Known("hello")),
+  #]))
 
   exportSpriteFile(ctx, "out.sprite3")
 

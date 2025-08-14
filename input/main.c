@@ -8,15 +8,13 @@ int add_one(int a) {
 
 int test_branch(int num) {
   int a = 3;
-  //if (num != 1) {
-  //  a = 4;
-  //  puts("a set to 4");
-  //}
-  a += num != 1;
+  
+  if (num != 1) {
+    a = 4;
+    puts("a set to 4");
+  }
 
-  int b = a + 1;
-
-  return b;
+  return a + num;
 }
 
 int main(void) {
