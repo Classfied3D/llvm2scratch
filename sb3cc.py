@@ -22,6 +22,7 @@ class Config:
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
   stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
+  max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before wiping scratch's call stack via a broadcast
   
   unused_var = "!unused" # Name of the scratch variable for unused values
   return_var = "!return value" # Name of the scratch variable for returing values
@@ -51,6 +52,7 @@ class FuncInfo:
   name: str
   params: list[str] # The parameters the function takes (doesn't include return address)
   can_call: set[str] # Everything the function might call (may include itself)
+  return_addresses: list[str] # Any functions that call this function
   returns_to_address: bool # If the function returns using a broadcast to an address
 
 @dataclass
@@ -174,6 +176,12 @@ def localizeVar(name: str, is_local: bool, bctx: BlockInfo | None) -> Variable:
 
 def localizeParameter(name: str) -> str:
   return "%" + name
+
+def localizeLabel(label: str, fn: FuncInfo) -> str:
+  return f"{fn.name}:{label}"
+
+def localizeCallId(call_id: int, label: str, fn_name: str) -> str:
+  return f"{fn_name}:{label}:return addr {call_id}"
 
 def genTempVar() -> str:
   global highest_tmp
@@ -300,6 +308,19 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlock
     return ValueAndBlocks(value, blocks)
   else:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
+
+def binarySearch(branches: list[sb3.BlockList], value: sb3.Value, lo=0, hi=None) -> sb3.BlockList:
+  if hi is None:
+    hi = len(branches) - 1
+    if hi == -1: return sb3.BlockList([])
+  mid = (lo + hi) // 2
+
+  if lo == hi: return branches[lo]
+  
+  cond = sb3.BoolOp(">", value, sb3.Known(mid))
+  return sb3.BlockList([sb3.ControlFlow("if_else", cond,
+                         binarySearch(branches, value, mid + 1, hi),
+                         binarySearch(branches, value, lo, mid))])
 
 def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
   assert var is None or var.is_scratch_param is False
@@ -781,6 +802,27 @@ def assignParameters(func: FuncInfo) -> sb3.BlockList:
     blocks.add(var.setValue(param.getValue()))
   return blocks
 
+def getCheckedBranchInit(proc_name: str, ctx: Context) -> tuple[sb3.BlockList, Context]:
+  """Returns the blocks needed to return a branch instruction (procedure) that will reset the scratch's stack
+  if reaching a max amount of permutations, preventing scratch from running out of memory"""
+
+  reset_broadcast = f"{proc_name}:reset stack"
+
+  ctx.proj.code.append(sb3.BlockList([
+    sb3.OnBroadcast(reset_broadcast),
+    sb3.ProcedureCall(proc_name, []),
+  ]))
+
+  return sb3.BlockList([
+    sb3.ProcedureDef(proc_name, []),
+    sb3.EditCounter("incr"), # The 'hacked' counter blocks are 20x faster than incrementing a number
+    sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(cfg.max_branch_recursion)), sb3.BlockList([
+      sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
+      sb3.EditCounter("clear"),
+      sb3.StopScript("stopthis"),
+    ]))
+  ]), ctx
+
 def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
   match instr:
@@ -795,7 +837,8 @@ def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -
         blocks.add(sb3.EditVar("set", cfg.return_var, value.value))
       if bctx.fn.returns_to_address:
         return_address = localizeVar(cfg.return_address_local, True, bctx)
-        blocks.add(sb3.Broadcast(return_address.getValue(), False))
+        blocks.add(binarySearch([sb3.BlockList([sb3.ProcedureCall(addr, [])]) for addr in bctx.fn.return_addresses],
+                                return_address.getValue()))
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
     case ir.Br():
@@ -806,7 +849,8 @@ def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -
       if instr.cond is None:
         label = instr.label_false.val
         assert isinstance(label, str)
-        blocks.add(sb3.Broadcast(sb3.Known(label), False))
+        proc_name = localizeLabel(label, bctx.fn)
+        blocks.add(sb3.ProcedureCall(proc_name, []))
       else:
         cond = decodeValue(instr.cond, ctx, bctx)
         if isinstance(cond.value, IndexableValue):
@@ -814,15 +858,15 @@ def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -
         blocks.add(cond.blocks)
 
         assert instr.label_true is not None
-        label_true = instr.label_true.val
-        label_false = instr.label_false.val
+        label_true, label_false = instr.label_true.val, instr.label_false.val
         assert isinstance(label_true, str) and isinstance(label_false, str)
+        true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn), localizeLabel(label_false, bctx.fn)
 
         # TODO: use broadcast(join + condition) where possible
         blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList([
-          sb3.Broadcast(sb3.Known(label_true), False),
+          sb3.ProcedureCall(true_proc_name, [])
         ]), sb3.BlockList([
-          sb3.Broadcast(sb3.Known(label_false), False),
+          sb3.ProcedureCall(false_proc_name, [])
         ])))
     case _:
       raise CompException(f"Unknown terminator instruction opcode {instr} (type {type(instr)})")
@@ -887,30 +931,38 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 def transFuncs(mod: ir.Module, ctx: Context) -> Context:
   # Get info about what a function calls and how it returns
   call_graph: dict[str, tuple[set[str], bool]] = {}
+  return_addresses: dict[str, list[str]] = {}
   returns_to_address: dict[str, bool] = {}
   for func in mod.funcs.values():
-    name = func.value.val
-    assert isinstance(name, str)
+    fn_name = func.value.val
+    assert isinstance(fn_name, str)
 
     if func.has_no_body():
-      if name not in ctx.fn_info:
+      if fn_name not in ctx.fn_info:
         raise CompException("Externally defined function must have info about it")
-      info = ctx.fn_info[name]
-      call_graph[name] = info.can_call, True
-      returns_to_address[name] = info.returns_to_address
+      info = ctx.fn_info[fn_name]
+      call_graph[fn_name] = info.can_call, True
+      returns_to_address[fn_name] = info.returns_to_address
 
     else:
       # What the function calls
       calls: set[str] = set()
       for block in func.blocks.values():
+        block_label = block.value.val
+        assert isinstance(block_label, str)
+        call_id = 0
         for instr in block.instrs:
           if isinstance(instr, ir.Call) or isinstance(instr, ir.CallBr): # TODO FIX: tail recursion treated differently?
-            assert isinstance(instr.callee.val, str)
-            calls.add(instr.callee.val)
-      call_graph[name] = calls, False
+            called_name = instr.callee.val
+            assert isinstance(called_name, str)
+            calls.add(called_name)
+            return_addresses.setdefault(called_name, list())
+            return_addresses[called_name].append(localizeCallId(call_id, block_label, fn_name))
+            call_id += 1
+      call_graph[fn_name] = calls, False
 
       # If the function returns by broadcasting (ignoring any calls to functions that do this)
-      returns_to_address[name] = len(func.blocks) > 1
+      returns_to_address[fn_name] = len(func.blocks) > 1
   
   for start_func in call_graph:
     if call_graph[start_func][1]: continue
@@ -931,46 +983,48 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
     call_graph[start_func] = visited, True
   
-  for name in returns_to_address:
+  for fn_name in returns_to_address:
     # If the function returns by broadcasting because it relies on other functions which return by broadcastiing
-    returns_to_address[name] |= any(returns_to_address[call] for call in call_graph[name][0])
+    returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
 
   for func in mod.funcs.values():
-    name = func.value.val
-    assert isinstance(name, str)
+    fn_name = func.value.val
+    assert isinstance(fn_name, str)
 
     param_names = []
     for arg in func.args:
       assert isinstance(arg.val, str)
       param_names.append(arg.val[1:])
     
-    if returns_to_address[name]: param_names.append(cfg.return_address_local)
+    if returns_to_address[fn_name]: param_names.append(cfg.return_address_local)
 
-    ctx.fn_info[name] = FuncInfo(name, param_names, call_graph[name][0], returns_to_address[name])
+    ctx.fn_info[fn_name] = FuncInfo(fn_name, param_names, call_graph[fn_name][0],
+                                 return_addresses.get(fn_name, list()), returns_to_address[fn_name])
 
   # Translate functions
   for func in mod.funcs.values():
     assert isinstance(func.value.ty, ir.FunctionType)
-    name = func.value.val
-    assert isinstance(name, str)
+    fn_name = func.value.val
+    assert isinstance(fn_name, str)
 
-    info = ctx.fn_info[name]
+    info = ctx.fn_info[fn_name]
 
     for param_ty in func.value.ty.param_tys:
       if getByteSize(param_ty) > 1:
         raise CompException("Parameters can only be one scratch byte in size") # TODO FIX
 
     first_block = True
-    tmp_block_num = 0
     for block in func.blocks.values():
+      call_id = 0
       block_label = block.value.val
       assert isinstance(block_label, str)
 
       if first_block:
         localizedParams = [localizeParameter(param) for param in info.params]
-        block_code = sb3.BlockList([sb3.ProcedureDef(name, localizedParams)])
+        block_code = sb3.BlockList([sb3.ProcedureDef(fn_name, localizedParams)])
       else:
-        block_code = sb3.BlockList([sb3.OnBroadcast(block_label)])
+        proc_name = localizeLabel(block_label, info)
+        block_code, ctx = getCheckedBranchInit(proc_name, ctx)
 
       # After the first block we can no longer access the parameters in the function
       bctx = BlockInfo(info, first_block)
@@ -991,12 +1045,13 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
           output = decodeVar(instr.result, bctx)
 
-          callee_returns_to_address = ctx.fn_info[callee_name].returns_to_address
+          callee_info = ctx.fn_info[callee_name]
+          callee_returns_to_address = callee_info.returns_to_address
 
           if callee_returns_to_address:
-            return_address = f"{name}:{block_label}:{callee_name}:callback {tmp_block_num}"
-            tmp_block_num += 1
-            arguments.append(sb3.Known(return_address)) # Pass return address into function
+            return_proc_name = localizeCallId(call_id, block_label, fn_name)
+            return_addr_id = callee_info.return_addresses.index(return_proc_name)
+            arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
 
             # If adding a broadcast then make sure parameters can be accessed later
             if first_block: block_code.add(assignParameters(info))
@@ -1012,8 +1067,10 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             first_block = False
             bctx = BlockInfo(info, first_block)
             # Add code for callback
-            block_code = sb3.BlockList([sb3.OnBroadcast(return_address)])
+            block_code, ctx = getCheckedBranchInit(return_proc_name, ctx)
             block_code.add(assign_blocks)
+
+          call_id += 1
         else:
           instr_code, ctx = transInstr(instr, ctx, bctx)
           block_code.add(instr_code)
@@ -1035,7 +1092,7 @@ def addFunc(name: str, params: list[str], can_call: set[str],
   blocks = sb3.BlockList([sb3.ProcedureDef(name, localized_params)])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, params, can_call, returns_to_address)
+  ctx.fn_info[name] = FuncInfo(name, params, can_call, list(), returns_to_address)
   return ctx
 
 def main():
@@ -1047,6 +1104,7 @@ def main():
   
   # Compile code
   # TODO SEC passing raw parmas kinda unsafe, use subprocess
+  # --target=i386-none-elf will remove standard lib, preferable when adding own
   os.system(f"clang -S -m32 -emit-llvm -O{cfg.c_opti} {cfg.file}")
 
   # Parse llvm

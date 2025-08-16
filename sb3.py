@@ -63,7 +63,7 @@ class Project:
   lists: dict[str, list[Known]] = field(default_factory=dict)
 
   def getCtx(self) -> ScratchContext:
-    ctx = ScratchContext(self.cfg)
+    ctx = ScratchContext(self.cfg) # pyright: ignore[reportCallIssue] this error only appears sometimes??
     for name, scratch_list in self.lists.items():
       ctx.addOrGetList(name, scratch_list)
     for block_list in self.code:
@@ -418,6 +418,30 @@ class StopScript(EndBlock):
     return {
       "opcode": "control_stop",
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
+    }, ctx
+
+@dataclass
+class GetCounter(Value):
+  """Get the value of the special 'hacked' counter block"""
+
+  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+    id = genId()
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": "control_get_counter"
+    }), BlockMeta(parent))
+
+    return [3, id, [10, ""]], ctx
+
+@dataclass
+class EditCounter(Block):
+  """Increment/Assign zero to the special 'hacked' counter block"""
+
+  op: Literal["incr", "clear"]
+
+  def getRaw(self, _my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    return {
+      "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
 
 # Variables
@@ -778,6 +802,8 @@ def main():
       EditVar("set", "hello2", Known(10)),
     ])),
     ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
+    EditCounter("incr"),
+    Say(GetCounter()),
     Broadcast(Op("length_of", GetVar("hello2")), True),
     StopScript("stopall"),
   ]))
