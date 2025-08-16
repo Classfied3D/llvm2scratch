@@ -1,9 +1,9 @@
-/*#include <stdio.h>
+#include <stdio.h>
 
 static int a = 7;
 
-int add_one(int a) {
-  return a + 1;
+int add_one(int num) {
+  return num + 1;
 }
 
 int test_branch(int num) {
@@ -35,33 +35,30 @@ int main(void) {
 
   a = add_one(a);
 
-  //printf("%u\n", a);
-  //printf("%u\n", b);
-  //printf("%u", c);
+  int c = test_branch(2);
 
   for (unsigned char d = 65; d != 70; d++) {
     putchar(d);
   }
 
-  int c = test_branch(2);
-  return 0;
-}*/
-
-#include <stdio.h>
-
-int test_branch(int num) {
-  int a = 3;
-
-  if (num != 1) a = 50;
-
-  return a + num;
-}
-
-int main(void) {
-  for (unsigned char d = 65; d != 70; d++) {
-    putchar(d);
+  int e = 46;
+  switch (e) {
+    case 10:
+      puts("1");
+      break;
+    case 20:
+      puts("2");
+      break;
+    case 21:
+      puts("3");
+      break;
+    case 255:
+      puts("4");
+      break;
+    default:
+      puts("default");
+      break;
   }
 
-  int c = test_branch(2);
   return 0;
 }

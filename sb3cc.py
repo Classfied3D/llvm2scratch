@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
+from collections import OrderedDict
 from typing import Literal
 
 from llvm2py import parse_assembly
@@ -115,10 +116,11 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(val: ir.value.Value, ctx: Context, fctx: BlockInfo | None) -> ValueAndBlocks | IValueAndBlocks:
+def decodeValue(val: ir.value.Value,
+                ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IValueAndBlocks:
   match val.val:
     case str(): # if a variable
-      var = decodeVar(val, fctx)
+      var = decodeVar(val, bctx)
       res = sb3.Known("") # this means no value - nothing in the block
       if var is not None:
         res = var.getValue()
@@ -198,7 +200,7 @@ def shouldOptimiseValueUse(val: sb3.Value) -> bool:
     case _:
       return True
 
-def optimiseValueUse(val: sb3.Value) -> ValueAndBlocks:
+def optimizeValueUse(val: sb3.Value) -> ValueAndBlocks:
   if shouldOptimiseValueUse(val):
     tmp = genTempVar()
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
@@ -245,7 +247,9 @@ def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Cont
                                                         # which has no effect on the result
     return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(1))), ctx
 
-def bitShift(direction: Literal["left", "right"], width: int, left: sb3.Value, right: sb3.Value, ctx: Context, can_shift_out=True) -> tuple[sb3.Value, Context]:
+def bitShift(direction: Literal["left", "right"],
+             width: int, left: sb3.Value, right: sb3.Value,
+             ctx: Context, can_shift_out=True) -> tuple[sb3.Value, Context]:
   right_mul, ctx = intPow2(right, width, ctx)
 
   if direction == "left":
@@ -275,8 +279,8 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlock
     return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
   elif width <= 36: # Safe: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
     blocks = sb3.BlockList()
-    left, lblocks = astuple(optimiseValueUse(left))
-    right, rblocks = astuple(optimiseValueUse(right))
+    left, lblocks = astuple(optimizeValueUse(left))
+    right, rblocks = astuple(optimizeValueUse(right))
     blocks.add(lblocks)
     blocks.add(rblocks)
 
@@ -309,18 +313,58 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlock
   else:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
 
-def binarySearch(branches: list[sb3.BlockList], value: sb3.Value, lo=0, hi=None) -> sb3.BlockList:
-  if hi is None:
-    hi = len(branches) - 1
-    if hi == -1: return sb3.BlockList([])
-  mid = (lo + hi) // 2
-
-  if lo == hi: return branches[lo]
+def binarySearch(value: sb3.Value,
+                 branches: OrderedDict[int, sb3.BlockList],
+                 default_branch: sb3.BlockList | None = None,
+                 min_poss_value: int | None = None, # Max value - we do not need to check for default values above it
+                 max_poss_value: int | None = None, # Min value - likewise
+                 are_branches_sorted: bool = False,
+                 _default_cases: set[int] | None = None,
+                 _lo: int=0, _hi: int | None=None) -> sb3.BlockList:
+  if len(branches) == 0:
+    return sb3.BlockList([]) if default_branch is None else default_branch
   
-  cond = sb3.BoolOp(">", value, sb3.Known(mid))
+  if _default_cases is None: _default_cases = set()
+
+  if default_branch is not None:
+    keys = branches.keys()
+    lowest_case = min(keys)
+    cases = list(keys)
+    for case in cases:
+      # 'Surround' all cases with the default case
+      if case == lowest_case and case != min_poss_value:
+        branches.update({case - 1: default_branch})
+        _default_cases.add(case - 1)
+      if case != max_poss_value:
+        # If there is no number between this case and the next one, then we don't put a default between them
+        if case + 1 not in branches.keys():
+          branches.update({case + 1: default_branch})
+          _default_cases.add(case + 1)
+    are_branches_sorted = False
+
+  if not are_branches_sorted: branches = OrderedDict(sorted(branches.items()))
+  
+  if _hi is None: _hi = len(branches.keys()) - 1
+  mid = (_lo + _hi) // 2
+  mid_val = list(branches.keys())[mid]
+
+  if _lo == _hi:
+    return list(branches.values())[_lo]
+  
+  # When checking for a branch with two default branches around it, use == instead of two >s
+  if _hi - _lo + 1 == 3 and (list(branches.keys())[_lo] in _default_cases and
+                             list(branches.keys())[_hi] in _default_cases):
+    # FUTURE OPTI: This doesn't rebalance the tree so there is still room for optimisation... but not much
+    cond = sb3.BoolOp("=", value, sb3.Known(mid_val))
+    return sb3.BlockList([sb3.ControlFlow("if_else", cond,
+                          list(branches.values())[mid],
+                          list(branches.values())[_lo])]) # The default case
+  
+  cond = sb3.BoolOp(">", value, sb3.Known(mid_val))
   return sb3.BlockList([sb3.ControlFlow("if_else", cond,
-                         binarySearch(branches, value, mid + 1, hi),
-                         binarySearch(branches, value, lo, mid))])
+                         # Sorting and default branches already taken care of
+                         binarySearch(value, branches, _default_cases=_default_cases, _lo=mid + 1, _hi=_hi),
+                         binarySearch(value, branches, _default_cases=_default_cases, _lo=_lo,     _hi=mid))])
 
 def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
   assert var is None or var.is_scratch_param is False
@@ -358,7 +402,8 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       
       return blocks
 
-def transCall(name: str, arguments: list[sb3.Value], output: Variable | None) -> tuple[sb3.BlockList, sb3.BlockList]:
+def transCall(name: str, arguments: list[sb3.Value],
+              output: Variable | None) -> tuple[sb3.BlockList, sb3.BlockList]:
   """The first block list returned is any blocks to call the function, the second any needed to assign the return value to the output"""
   
   call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
@@ -479,8 +524,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
           else:
             if res_var is not None:
-              left, lblocks = astuple(optimiseValueUse(left))
-              right, rblocks = astuple(optimiseValueUse(right))
+              left, lblocks = astuple(optimizeValueUse(left))
+              right, rblocks = astuple(optimizeValueUse(right))
               blocks.add(lblocks)
               blocks.add(rblocks)
 
@@ -548,9 +593,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           
           if res_var is not None:
             # TODO: Reuse if statement to work out if a / b > 0
-            left, lblocks = astuple(optimiseValueUse(left))
+            left, lblocks = astuple(optimizeValueUse(left))
             right_is_temp = shouldOptimiseValueUse(right)
-            right, rblocks = astuple(optimiseValueUse(right))
+            right, rblocks = astuple(optimizeValueUse(right))
             if right_is_temp:
               assert isinstance(right, sb3.GetVar)
             blocks.add(lblocks)
@@ -678,8 +723,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             # TODO OPTI: gen (11-bit) tables/use mod for known values
 
             if width > cfg.binop_lookup_bits:
-              left, lblocks = astuple(optimiseValueUse(left))
-              right, rblocks = astuple(optimiseValueUse(right))
+              left, lblocks = astuple(optimizeValueUse(left))
+              right, rblocks = astuple(optimizeValueUse(right))
               blocks.add(lblocks)
               blocks.add(rblocks)
 
@@ -823,11 +868,13 @@ def getCheckedBranchInit(proc_name: str, ctx: Context) -> tuple[sb3.BlockList, C
     ]))
   ]), ctx
 
-def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
+def transTerminatorInstr(instr: ir.Instruction,
+                         ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
   match instr:
     case ir.Unreacheble(): # Never reached if not UB
       pass
+
     case ir.Ret(): # Return from a func
       if instr.value is not None:
         value = decodeValue(instr.value, ctx, bctx)
@@ -837,11 +884,14 @@ def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -
         blocks.add(sb3.EditVar("set", cfg.return_var, value.value))
       if bctx.fn.returns_to_address:
         return_address = localizeVar(cfg.return_address_local, True, bctx)
-        blocks.add(binarySearch([sb3.BlockList([sb3.ProcedureCall(addr, [])]) for addr in bctx.fn.return_addresses],
-                                return_address.getValue()))
+        return_to_addr_code = OrderedDict()
+        for i, addr in enumerate(bctx.fn.return_addresses):
+          return_to_addr_code.update({i: sb3.BlockList([sb3.ProcedureCall(addr, [])])})
+        blocks.add(binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True))
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
-    case ir.Br():
+
+    case ir.Br(): # Jump to a label, either known or dependent on a condition
       if bctx.is_scratch_func:
         # Allow the parameters to be accessed later
         blocks.add(assignParameters(bctx.fn))
@@ -868,6 +918,48 @@ def transTerminatorInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -
         ]), sb3.BlockList([
           sb3.ProcedureCall(false_proc_name, [])
         ])))
+
+    case ir.Switch(): # Jump to many labels depending on a value
+      assert isinstance(instr.cond.ty, ir.IntegerType)
+      width = instr.cond.ty.num_bits
+      if getByteSize(instr.cond.ty) > 1:
+        raise CompException("Cannot currently switch with an integer more than 48 bits (would take multiple vars to store)")
+
+      val, val_blocks = astuple(decodeValue(instr.cond, ctx, bctx))
+      blocks.add(val_blocks)
+      if len(instr.cases) > 1:
+        val, opti_val_blocks = astuple(optimizeValueUse(val))
+        blocks.add(opti_val_blocks)
+
+      case_vs_label: OrderedDict[int, sb3.BlockList] = OrderedDict()
+      for case, label in instr.cases:
+        case_val = decodeValue(case, ctx, bctx)
+        # Switch cases should be constant and unique
+        assert isinstance(case_val, ValueAndBlocks)
+        assert len(case_val.blocks.blocks) == 0
+        assert isinstance(case_val.value, sb3.Known)
+        assert isinstance(case_val.value.known, float)
+        assert case_val.value.known == int(case_val.value.known)
+        assert int(case_val.value.known) not in case_vs_label
+        case_val = int(case_val.value.known)
+
+        label_name = label.val
+        assert isinstance(label_name, str)
+        label_proc_name = localizeLabel(label_name, bctx.fn)
+        label_block_call = sb3.ProcedureCall(label_proc_name, [])
+
+        case_vs_label[case_val] = sb3.BlockList([label_block_call])
+
+      assert isinstance(instr.label_default.val, str)
+      default_proc_name = localizeLabel(instr.label_default.val, bctx.fn)
+      default_label_call = sb3.BlockList([sb3.ProcedureCall(default_proc_name, [])])
+
+      lowest_poss = 0
+      highest_poss = (2 ** width) - 1 # FUTURE OPTI: if the value called from was zero-extended (e.g. from an i8)
+                                      # then could set this value to the max of the type before
+
+      blocks.add(binarySearch(val, case_vs_label, default_label_call, lowest_poss, highest_poss))
+
     case _:
       raise CompException(f"Unknown terminator instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx

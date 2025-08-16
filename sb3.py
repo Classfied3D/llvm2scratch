@@ -279,10 +279,15 @@ class BooleanValue(Value):
   def getRawBoolValue(self, _parent: str, _ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'BooleanValue'; must be a derived class")
 
-@dataclass
 class Known(Value):
   """Something that can be typed in a block input e.g. x in Say(x)"""
   known: str | float | bool
+
+  def __init__(self, val: str | float | bool | int):
+    if not isinstance(val, int):
+      self.known = val
+    else:
+      self.known = float(val)
 
   def getRawValue(self, _: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     raw = self.known
