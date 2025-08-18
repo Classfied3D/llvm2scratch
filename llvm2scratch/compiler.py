@@ -1,4 +1,4 @@
-"""The LLVM -> Scratch Compiler"""
+"""LLVM -> Scratch Compiler"""
 
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
@@ -7,50 +7,63 @@ from typing import Literal
 
 from llvm2py import parse_assembly
 from llvm2py import ir
+import random
 import math
-import os
 
-import sb3opt
-import sb3
+from . import scratch as sb3
+from . import optimizer
+
+SCRATCH_LIST_LIMIT = 200_000
+
+@dataclass
+class DebugInfo:
+  """Info about a scratch project which can be used in future compilations for optimization"""
+  debug_branch_func_map: str | None = None
+  debug_branch_log: str | None = None
 
 @dataclass
 class Config:
-  """Config options to pass to the sb3cc compiler"""
-  file: str = "input/main.c" # C file to compile
-  c_opti: str = "0" # Level of optimisation to compile with, passes -O<value> to clang
-  
+  """Config options to pass to the compiler"""
   opti: bool = True # If optimisations for scratch should be applied
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
   stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before wiping scratch's call stack via a broadcast
   
+  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in future compilations for optimization
+  do_debug_branch_log: bool = False # If the times a function recurses should be logged
+  
   unused_var = "!unused" # Name of the scratch variable for unused values
   return_var = "!return value" # Name of the scratch variable for returing values
-  stack_list_var = "!stack" # Name of the scratch list for the stack list
+  stack_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
-  return_address_local = "return address" # Name of the local variable or parameter to the name to broadcast to after returning
-  tmp_prefix = "!temp " # Name of temp variables before a number is added to them
+  debug_branch_log_var = "!!debug_branch_log" # (using underscores to avoid spaces in filename for convenience)
+
   ascii_lookup_var = "!ascii lookup"
   binop_lookup_var = "!binop lookup"
   pow2_lookup_var = "!pow2 lookup"
+
+  return_address_local = "return address" # Name of the local variable or parameter to the name to broadcast to after returning
+  did_reset_local = "did reset" # Name of the local var for if the stack reset
+
+  tmp_prefix = "tmp " # Name of temp variables before a number is added to them
   zero_indexed_suffix = " (0 indexed)"
   one_indexed_suffix = " (1 indexed)"
-
-cfg = Config() # TODO maybe not a global lol, add cfg: Config to Context
-highest_tmp = 0
 
 @dataclass
 class Context:
   """Global context access when translating instructions"""
   proj: sb3.Project
+  cfg: Config
   fn_info: dict[str, FuncInfo] = field(default_factory=dict)
   globvar_to_ptr: dict[str, sb3.Known] = field(default_factory=dict)
+  next_fn_id: int = 0
 
 @dataclass
 class FuncInfo:
   """Info about a LLVM function"""
   name: str
+  fn_id: int
   params: list[str] # The parameters the function takes (doesn't include return address)
   can_call: set[str] # Everything the function might call (may include itself)
   return_addresses: list[str] # Any functions that call this function
@@ -95,7 +108,7 @@ class Variable:
     return sb3.EditVar(op, self.name, value)
 
 class CompException(Exception):
-  """Exception in the sb3cc compiler"""
+  """Exception in the compiler"""
   pass
 
 def astuple(obj):
@@ -124,7 +137,7 @@ def decodeValue(val: ir.value.Value,
       res = sb3.Known("") # this means no value - nothing in the block
       if var is not None:
         res = var.getValue()
-        if cfg.opti and var.name in ctx.globvar_to_ptr:
+        if ctx.cfg.opti and var.name in ctx.globvar_to_ptr:
           res = ctx.globvar_to_ptr[var.name]
       return ValueAndBlocks(res)
     case int():
@@ -161,13 +174,14 @@ def decodeVar(var: ir.value.Value, bctx: BlockInfo | None) -> Variable | None:
   name = var.val
   is_local = name.startswith("%")
   if is_local: name = name[1:]
-  return localizeVar(name, is_local, bctx)
+  return localizeVar(name, not is_local, bctx)
 
-def localizeVar(name: str, is_local: bool, bctx: BlockInfo | None) -> Variable:
+def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
   is_param = False
-  if not is_local:
+  if is_global:
     name = f"@{name}"
-  elif bctx is not None:
+  else:
+    assert bctx is not None
     if name in bctx.fn.params and bctx.is_scratch_func:
       is_param = True
       name = localizeParameter(name)
@@ -185,10 +199,8 @@ def localizeLabel(label: str, fn: FuncInfo) -> str:
 def localizeCallId(call_id: int, label: str, fn_name: str) -> str:
   return f"{fn_name}:{label}:return addr {call_id}"
 
-def genTempVar() -> str:
-  global highest_tmp
-  highest_tmp += 1
-  return cfg.tmp_prefix + str(highest_tmp)
+def genTempVar(ctx: Context) -> str:
+  return ctx.cfg.tmp_prefix + random.randbytes(12).hex()
 
 def shouldOptimiseValueUse(val: sb3.Value) -> bool:
   """Returns if a value that is used more than once should be stored"""
@@ -200,15 +212,15 @@ def shouldOptimiseValueUse(val: sb3.Value) -> bool:
     case _:
       return True
 
-def optimizeValueUse(val: sb3.Value) -> ValueAndBlocks:
+def optimizeValueUse(val: sb3.Value, ctx: Context) -> ValueAndBlocks:
   if shouldOptimiseValueUse(val):
-    tmp = genTempVar()
+    tmp = genTempVar(ctx)
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
   
   return ValueAndBlocks(val)
 
 def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[str, Context]:
-  name = cfg.pow2_lookup_var + (cfg.one_indexed_suffix if is_one_indexed else cfg.zero_indexed_suffix)
+  name = ctx.cfg.pow2_lookup_var + (ctx.cfg.one_indexed_suffix if is_one_indexed else ctx.cfg.zero_indexed_suffix)
   if name not in ctx.proj.lists or size > len(ctx.proj.lists[name]):
     pow2_lookup = []
     for x in range(int(is_one_indexed) + size):
@@ -219,14 +231,14 @@ def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[
 def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
-def undoTwosComplement(width: int, val: sb3.Value, return_var: bool) -> ValueAndBlocks:
+def undoTwosComplement(width: int, val: sb3.Value, return_var: bool, ctx: Context) -> ValueAndBlocks:
   """Calculates two's compilment on a value. If the returned value is used multiple times, it is
   prefered to be a var, which can be done with return_var=True"""
   limit = int(((2 ** width) / 2) - 1)
   decrease = 2 ** width
   
   if shouldOptimiseValueUse(val) or return_var:
-    tmp = genTempVar()
+    tmp = genTempVar(ctx)
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([
       sb3.EditVar("set", tmp, val),
       sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetVar(tmp), sb3.Known(limit)), sb3.BlockList([
@@ -270,7 +282,7 @@ def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
   return sb3.Op("mul", left, right) # Overflow is UB - we don't care if
                                     # the number overflows and gets innacurate
 
-def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlocks:
+def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) -> ValueAndBlocks:
   # TODO OPTI: if one value is a known value, wrapping behaviour could be simpilifed and
   # known info could be propagated
   # TODO OPTI: if multipling by a power of 2, there is no risk that the mantissa cannot store
@@ -279,15 +291,15 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value) -> ValueAndBlock
     return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
   elif width <= 36: # Safe: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
     blocks = sb3.BlockList()
-    left, lblocks = astuple(optimizeValueUse(left))
-    right, rblocks = astuple(optimizeValueUse(right))
+    left, lblocks = astuple(optimizeValueUse(left, ctx))
+    right, rblocks = astuple(optimizeValueUse(right, ctx))
     blocks.add(lblocks)
     blocks.add(rblocks)
 
     # Use some maths to do the calculation (see README for explaination)
     half_width = width // 2
-    a0 = genTempVar()
-    b0 = genTempVar()
+    a0 = genTempVar(ctx)
+    b0 = genTempVar(ctx)
     blocks.add([
       sb3.EditVar("set", a0, sb3.Op("mod", left, sb3.Known(2 ** half_width))),
       sb3.EditVar("set", b0, sb3.Op("mod", right, sb3.Known(2 ** half_width)))
@@ -366,27 +378,14 @@ def binarySearch(value: sb3.Value,
                          binarySearch(value, branches, _default_cases=_default_cases, _lo=mid + 1, _hi=_hi),
                          binarySearch(value, branches, _default_cases=_default_cases, _lo=_lo,     _hi=mid))])
 
-def transAlloca(var: Variable | None, ty: ir.Type) -> sb3.BlockList:
-  assert var is None or var.is_scratch_param is False
-
-  blocks = sb3.BlockList()
-  size = getByteSize(ty)
-
-  if var is not None:
-    blocks.add(var.setValue(sb3.GetVar(cfg.stack_size_var)))
-    
-  # TODO OPTI: can skip increasing the size if we know the function does not allocate or call another func
-  blocks.add(sb3.EditVar("change", cfg.stack_size_var, sb3.Known(size)))
-  return blocks
-
-def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type) -> sb3.BlockList:
+def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
   match value:
     case sb3.Value():
       if getByteSize(ty) > 1:
         # TODO FIX: allow storing of larger values
         raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
       
-      return sb3.BlockList([sb3.EditList("replaceat", cfg.stack_list_var, address, value)])
+      return sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address, value)])
     case IndexableValue():
       if not (isinstance(ty, ir.ArrayType) and isinstance(ty.elem_ty, ir.IntegerType)):
         raise CompException(f"Expected stored type {ty} to be [Y x iN]")
@@ -397,20 +396,20 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       blocks = sb3.BlockList()
       for (i, ival) in enumerate(value.vals):
         # TODO OPTI: when adding operator blocks, calc at compile time if values are known
-        blocks.add(sb3.EditList("replaceat", cfg.stack_list_var,
+        blocks.add(sb3.EditList("replaceat", ctx.cfg.stack_var,
                                   sb3.Op("add", address, sb3.Known(i)), ival))
       
       return blocks
 
 def transCall(name: str, arguments: list[sb3.Value],
-              output: Variable | None) -> tuple[sb3.BlockList, sb3.BlockList]:
+              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
   """The first block list returned is any blocks to call the function, the second any needed to assign the return value to the output"""
   
   call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
   
   set_value_blocks = sb3.BlockList()
   if output is not None:
-    set_value_blocks.add(output.setValue(sb3.GetVar(cfg.return_var)))
+    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
   
   return call_blocks, set_value_blocks
 
@@ -418,7 +417,17 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
   blocks = sb3.BlockList()
   match instr:
     case ir.Alloca(): # Allocate space on the stack and return ptr
-      blocks.add(transAlloca(decodeVar(instr.result, bctx), instr.allocated_ty))
+      var = decodeVar(instr.result, bctx)
+      assert var is None or var.is_scratch_param is False
+
+      blocks = sb3.BlockList()
+      size = getByteSize(instr.allocated_ty)
+
+      if var is not None:
+        blocks.add(var.setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
+        
+      # TODO OPTI: can skip increasing the size if we know the function does not allocate or call another func
+      blocks.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(size)))
 
     case ir.Load(): # Load a value from an address on the stack
       address = decodeValue(instr.address, ctx, bctx)
@@ -430,7 +439,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       var = decodeVar(instr.result, bctx)
       if var is not None:
         blocks.add(sb3.EditVar("set", var.name, 
-                                      sb3.GetOfList("atindex", cfg.stack_list_var, address.value)))
+                                      sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
 
     case ir.Store(): # Copy a value to an address on the stack
       value = decodeValue(instr.value, ctx, bctx)
@@ -442,7 +451,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       if isinstance(address.value, IndexableValue):
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
-      blocks.add(transStore(value.value, address.value, instr.value.ty))
+      blocks.add(transStore(value.value, address.value, instr.value.ty, ctx))
 
     case ir.BinOp(): # Do a calculation with two values
       left = decodeValue(instr.fst_operand, ctx, bctx)
@@ -471,7 +480,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           if width > 48:
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
           
-          if instr.is_nsw and instr.is_nuw and cfg.opti:
+          if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
             res_val = sb3.Op(instr.opcode, left, right)
           else:
@@ -483,10 +492,10 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
           width = instr.fst_operand.ty.num_bits
           
-          if instr.is_nsw and instr.is_nuw and cfg.opti:
+          if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             res_val = multiplyNoWrap(width, left, right)
           else:
-            blocks_and_value = multiplyWrap(width, left, right)
+            blocks_and_value = multiplyWrap(width, left, right, ctx)
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
         
@@ -516,16 +525,16 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
           
           if instr.is_exact:
-            signed_left, lblocks = astuple(undoTwosComplement(width, left, False))
-            signed_right, rblocks = astuple(undoTwosComplement(width, right, False))
+            signed_left, lblocks = astuple(undoTwosComplement(width, left, False, ctx))
+            signed_right, rblocks = astuple(undoTwosComplement(width, right, False, ctx))
             blocks.add(lblocks)
             blocks.add(rblocks)
 
             res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
           else:
             if res_var is not None:
-              left, lblocks = astuple(optimizeValueUse(left))
-              right, rblocks = astuple(optimizeValueUse(right))
+              left, lblocks = astuple(optimizeValueUse(left, ctx))
+              right, rblocks = astuple(optimizeValueUse(right, ctx))
               blocks.add(lblocks)
               blocks.add(rblocks)
 
@@ -593,9 +602,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           
           if res_var is not None:
             # TODO: Reuse if statement to work out if a / b > 0
-            left, lblocks = astuple(optimizeValueUse(left))
+            left, lblocks = astuple(optimizeValueUse(left, ctx))
             right_is_temp = shouldOptimiseValueUse(right)
-            right, rblocks = astuple(optimizeValueUse(right))
+            right, rblocks = astuple(optimizeValueUse(right, ctx))
             if right_is_temp:
               assert isinstance(right, sb3.GetVar)
             blocks.add(lblocks)
@@ -605,7 +614,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             change = 2 ** width
 
             if not right_is_temp:
-              right_minus_change = genTempVar()
+              right_minus_change = genTempVar(ctx)
             # Undo two's complement, calculate modulo, then adjust for differences with llvm's remainder operation
             # (different when one side is negative)
             blocks.add([
@@ -722,14 +731,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           else:
             # TODO OPTI: gen (11-bit) tables/use mod for known values
 
-            if width > cfg.binop_lookup_bits:
-              left, lblocks = astuple(optimizeValueUse(left))
-              right, rblocks = astuple(optimizeValueUse(right))
+            if width > ctx.cfg.binop_lookup_bits:
+              left, lblocks = astuple(optimizeValueUse(left, ctx))
+              right, rblocks = astuple(optimizeValueUse(right, ctx))
               blocks.add(lblocks)
               blocks.add(rblocks)
 
-            lookup_size = 2 ** cfg.binop_lookup_bits
-            name = f"{cfg.binop_lookup_var} {instr.opcode}{cfg.zero_indexed_suffix}"
+            lookup_size = 2 ** ctx.cfg.binop_lookup_bits
+            name = f"{ctx.cfg.binop_lookup_var} {instr.opcode}{ctx.cfg.zero_indexed_suffix}"
             lookup = []
             for l in range(0, lookup_size):
               for r in range(0, lookup_size):
@@ -737,14 +746,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             ctx.proj.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
 
             results = []
-            for offset in range(0, width, cfg.binop_lookup_bits):
+            for offset in range(0, width, ctx.cfg.binop_lookup_bits):
               left_index = left
               right_index = right
               if offset > 0:
                 left_index = sb3.Op("floor", sb3.Op("div", left_index, sb3.Known(2 ** offset)))
                 # No floor instruction needed because scratch rounds down with atindex
                 right_index = sb3.Op("div", right_index, sb3.Known(2 ** offset))
-              if offset + cfg.binop_lookup_bits < width:
+              if offset + ctx.cfg.binop_lookup_bits < width:
                 left_index = sb3.Op("mod", left_index, sb3.Known(lookup_size))
                 right_index = sb3.Op("mod", right_index, sb3.Known(lookup_size))
               left_index = sb3.Op("mul", left_index, sb3.Known(lookup_size))
@@ -767,8 +776,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         if res_var is not None:
           blocks.add(res_var.setValue(res_val))
         else:
-          if not cfg.opti: # Values have no effect on state in scratch, only state has effect on values
-            blocks.add(sb3.EditVar("set", cfg.unused_var, res_val))
+          if not ctx.cfg.opti: # Values have no effect on state in scratch, only state has effect on values
+            blocks.add(sb3.EditVar("set", ctx.cfg.unused_var, res_val))
 
     case ir.ICmp(): # Compare two values
       left = decodeValue(instr.fst_operand, ctx, bctx)
@@ -842,12 +851,25 @@ def assignParameters(func: FuncInfo) -> sb3.BlockList:
   # TODO OPTI: work out if values are needed before assigning them
   blocks = sb3.BlockList()
   for param_name in func.params:
-    param = localizeVar(param_name, True, BlockInfo(func, True))
-    var = localizeVar(param_name, True, BlockInfo(func, False))
+    param = localizeVar(param_name, False, BlockInfo(func, True))
+    var = localizeVar(param_name, False, BlockInfo(func, False))
     blocks.add(var.setValue(param.getValue()))
   return blocks
 
-def getCheckedBranchInit(proc_name: str, ctx: Context) -> tuple[sb3.BlockList, Context]:
+def getUncheckedBranchInit(proc_name: str, fn: FuncInfo, ctx: Context) -> tuple[sb3.BlockList, Context]:
+  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [])])
+
+  if ctx.cfg.do_debug_branch_log:
+    # Increment the branch counter in the log
+    index = sb3.Known((fn.fn_id * 2) + 2)
+    blocks.add(sb3.BlockList([
+      sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add", 
+        sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
+    ))]))
+
+  return blocks, ctx
+
+def getCheckedBranchInit(proc_name: str, fn: FuncInfo, ctx: Context) -> tuple[sb3.BlockList, Context]:
   """Returns the blocks needed to return a branch instruction (procedure) that will reset the scratch's stack
   if reaching a max amount of permutations, preventing scratch from running out of memory"""
 
@@ -858,15 +880,18 @@ def getCheckedBranchInit(proc_name: str, ctx: Context) -> tuple[sb3.BlockList, C
     sb3.ProcedureCall(proc_name, []),
   ]))
 
-  return sb3.BlockList([
-    sb3.ProcedureDef(proc_name, []),
+  blocks, ctx = getUncheckedBranchInit(proc_name, fn, ctx)
+
+  blocks.add(sb3.BlockList([
     sb3.EditCounter("incr"), # The 'hacked' counter blocks are 20x faster than incrementing a number
-    sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(cfg.max_branch_recursion)), sb3.BlockList([
+    sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), sb3.BlockList([
       sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
       sb3.EditCounter("clear"),
       sb3.StopScript("stopthis"),
     ]))
-  ]), ctx
+  ]))
+
+  return blocks, ctx
 
 def transTerminatorInstr(instr: ir.Instruction,
                          ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
@@ -881,13 +906,15 @@ def transTerminatorInstr(instr: ir.Instruction,
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
-        blocks.add(sb3.EditVar("set", cfg.return_var, value.value))
+        blocks.add(sb3.EditVar("set", ctx.cfg.return_var, value.value))
       if bctx.fn.returns_to_address:
-        return_address = localizeVar(cfg.return_address_local, True, bctx)
+        return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
         return_to_addr_code = OrderedDict()
         for i, addr in enumerate(bctx.fn.return_addresses):
           return_to_addr_code.update({i: sb3.BlockList([sb3.ProcedureCall(addr, [])])})
-        blocks.add(binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True))
+
+        return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
+        blocks.add(return_table)
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
 
@@ -928,7 +955,7 @@ def transTerminatorInstr(instr: ir.Instruction,
       val, val_blocks = astuple(decodeValue(instr.cond, ctx, bctx))
       blocks.add(val_blocks)
       if len(instr.cases) > 1:
-        val, opti_val_blocks = astuple(optimizeValueUse(val))
+        val, opti_val_blocks = astuple(optimizeValueUse(val, ctx))
         blocks.add(opti_val_blocks)
 
       case_vs_label: OrderedDict[int, sb3.BlockList] = OrderedDict()
@@ -968,7 +995,10 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
 
   # TODO: not necessary if done beforehand (only need to change stack size)
-  blocks.add(sb3.EditList("deleteall", cfg.stack_list_var, None, None))
+  blocks.add(sb3.EditList("deleteall", ctx.cfg.stack_var, None, None))
+
+  if ctx.cfg.stack_size > SCRATCH_LIST_LIMIT:
+    raise CompException("Stack is too large to fit in one list, multiple lists not implemented")
 
   ptr = 1
 
@@ -1005,16 +1035,16 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
     if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
 
     ctx.globvar_to_ptr[globvar.name] = sb3.Known(ptr)
-    if not cfg.opti:
+    if not ctx.cfg.opti:
       blocks.add(sb3.EditVar("set", globvar.name, sb3.Known(ptr)))
     for value in values:
-      blocks.add(sb3.EditList("addto", cfg.stack_list_var, None, value))
+      blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
     ptr += total_size
 
   blocks.add(sb3.BlockList([
-    sb3.EditVar("set", cfg.stack_size_var, sb3.Known(ptr)),
-    sb3.ControlFlow("reptimes", sb3.Known(cfg.stack_size - (ptr - 1)), sb3.BlockList([
-      sb3.EditList("addto", cfg.stack_list_var, None, sb3.Known(0))
+    sb3.EditVar("set", ctx.cfg.stack_size_var, sb3.Known(ptr)),
+    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.stack_size - (ptr - 1)), sb3.BlockList([
+      sb3.EditList("addto", ctx.cfg.stack_var, None, sb3.Known(0))
     ])),
   ]))
 
@@ -1088,10 +1118,11 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       assert isinstance(arg.val, str)
       param_names.append(arg.val[1:])
     
-    if returns_to_address[fn_name]: param_names.append(cfg.return_address_local)
+    if returns_to_address[fn_name]: param_names.append(ctx.cfg.return_address_local)
 
-    ctx.fn_info[fn_name] = FuncInfo(fn_name, param_names, call_graph[fn_name][0],
+    ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, param_names, call_graph[fn_name][0],
                                  return_addresses.get(fn_name, list()), returns_to_address[fn_name])
+    ctx.next_fn_id += 1
 
   # Translate functions
   for func in mod.funcs.values():
@@ -1114,15 +1145,23 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       if first_block:
         localizedParams = [localizeParameter(param) for param in info.params]
         block_code = sb3.BlockList([sb3.ProcedureDef(fn_name, localizedParams)])
+
+        if ctx.cfg.do_debug_branch_log:
+          # Increment the function counter in the log
+          index = sb3.Known((info.fn_id * 2) + 1)
+          block_code.add(sb3.BlockList([
+            sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add", 
+              sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
+          ))]))
       else:
         proc_name = localizeLabel(block_label, info)
-        block_code, ctx = getCheckedBranchInit(proc_name, ctx)
+        block_code, ctx = getCheckedBranchInit(proc_name, info, ctx)
 
       # After the first block we can no longer access the parameters in the function
       bctx = BlockInfo(info, first_block)
       # Translate everything except the terminator operation
       for instr in block.instrs[:-1]:
-        if isinstance(instr, ir.Call): # Call instructions handled here because might need a broadcast output
+        if isinstance(instr, ir.Call): # Call instructions handled here because might need to return at an address
           callee_name = instr.callee.val
           assert isinstance(callee_name, str)
 
@@ -1148,7 +1187,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             # If adding a broadcast then make sure parameters can be accessed later
             if first_block: block_code.add(assignParameters(info))
           
-          call_blocks, assign_blocks = transCall(callee_name, arguments, output)
+          call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
           block_code.add(call_blocks)
 
           if not callee_returns_to_address:
@@ -1158,8 +1197,9 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             ctx.proj.code.append(block_code)
             first_block = False
             bctx = BlockInfo(info, first_block)
+
             # Add code for callback
-            block_code, ctx = getCheckedBranchInit(return_proc_name, ctx)
+            block_code, ctx = getCheckedBranchInit(return_proc_name, info, ctx)
             block_code.add(assign_blocks)
 
           call_id += 1
@@ -1179,33 +1219,32 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
 def addFunc(name: str, params: list[str], can_call: set[str],
             returns_to_address: bool, contents: sb3.BlockList, ctx: Context) -> Context:
-  if returns_to_address: params.append(cfg.return_address_local)
+  if returns_to_address: params.append(ctx.cfg.return_address_local)
   localized_params = [localizeParameter(param) for param in params]
   blocks = sb3.BlockList([sb3.ProcedureDef(name, localized_params)])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, params, can_call, list(), returns_to_address)
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, params, can_call, list(), returns_to_address)
+  ctx.next_fn_id += 1
   return ctx
 
-def main():
-  global cfg, highest_tmp
-  cfg = Config()
-  highest_tmp = 0
+def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project, DebugInfo]:
+  """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
+  if cfg is None: cfg = Config()
+  debug_info = cfg.debug_info
+  scfg = sb3.ScratchConfig(
+    invis_blocks=cfg.invis_blocks)
 
-  ctx = Context(sb3.Project(sb3.ScratchConfig(cfg.invis_blocks)))
-  
-  # Compile code
-  # TODO SEC passing raw parmas kinda unsafe, use subprocess
-  # --target=i386-none-elf will remove standard lib, preferable when adding own
-  os.system(f"clang -S -m32 -emit-llvm -O{cfg.c_opti} {cfg.file}")
+  ctx = Context(sb3.Project(scfg), cfg)
 
   # Parse llvm
-  with open("main.ll", "r") as file:
-    ll = file.read()
-  mod: ir.Module = parse_assembly(ll)
+  mod: ir.Module = parse_assembly(llvm) if isinstance(llvm, str) else llvm
 
   # Starting code
   initblocks = sb3.BlockList([sb3.OnStartFlag()])
+
+  # Reset call stack
+  initblocks.add(sb3.EditCounter("clear"))
 
   # Setup stack
   globblocks, ctx = transGlobals(mod, ctx)
@@ -1224,12 +1263,12 @@ def main():
   ctx = addFunc("puts", ["input"], set(), False, sb3.BlockList([
     sb3.EditVar("set", "buffer", sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
-    sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
+    sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", "buffer",
         sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
-      sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_list_var, sb3.GetVar("ptr"))),
+      sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
     ])),
     sb3.Say(sb3.GetVar("buffer")),
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
@@ -1243,9 +1282,30 @@ def main():
   # Translate functions
   ctx = transFuncs(mod, ctx)
 
+  # Reset debug info on initialisation
+  if cfg.do_debug_branch_log:
+    initblocks.add(sb3.EditList("deleteall", cfg.debug_branch_log_var, None, None))
+
+    debug_branch_list_length = (ctx.next_fn_id * 2) + 10 # Adding 10 for safety + bc it doesn't really matter
+    if debug_branch_list_length > SCRATCH_LIST_LIMIT:
+      raise CompException("Too many functions; could not add them all to the recursive branch debug list")
+    
+    initblocks.add(sb3.ControlFlow("reptimes", sb3.Known(debug_branch_list_length), sb3.BlockList([
+      sb3.EditList("addto", cfg.debug_branch_log_var, None, sb3.Known(0))
+    ])))
+
+  # Export debug info
+  if cfg.do_debug_branch_log:
+    branch_debug_info: list[tuple[int, str]] = []
+    for info in ctx.fn_info.values():
+      branch_debug_info.append((info.fn_id, info.name))
+    branch_debug_info.sort(key=lambda info: info[0])
+
+    debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
+
   # Call main func call to init code
   if not "main" in ctx.fn_info:
-    raise CompException("No main function") # TODO FIX: allow libs
+    raise CompException("No main function") # TODO FIX: add libs
   main_params_len = len(ctx.fn_info["main"].params) + int(ctx.fn_info["main"].returns_to_address)
   initblocks.add(sb3.ProcedureCall("main", [sb3.Known("")] * main_params_len))
 
@@ -1253,10 +1313,6 @@ def main():
   ctx.proj.code.append(initblocks)
 
   # Optimise scratch project
-  if cfg.opti: ctx.proj = sb3opt.optimize(ctx.proj)
+  if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj)
 
-  # Export as sprite3
-  sb3.exportSpriteFile(ctx.proj.getCtx(), "out.sprite3")
-
-if __name__ == "__main__":
-  main()
+  return ctx.proj, debug_info

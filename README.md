@@ -2,13 +2,19 @@
 
 An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows a lot of programs written languages which can compile to LLVM (C/C++/Rust/etc) to be ported into scratch.
 
-## Dependencies
+## Installation
+
+* The following dependencies require manual installation:
 
 * **llvm2py**@0.2.0b0 (installation requires llvm@19)
-  * If on macos, would recommend running `sudo port install llvm-19` instead of `brew install llvm@19` because brew doesn't have precompiled bottles for older versions of macos, and llvm takes hours to compile
-  * Then `LLVM_DIR=/opt/local/libexec/llvm-19/lib/cmake/llvm/ LLVM_CONFIG=/opt/local/libexec/llvm-19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py` (`LLVM_CONFIG=/usr/local/opt/llvm@19/bin/llvm-config` for brew)
+  * macOS - macports (recommended due to supporting precompiled binaries for older macos versions + LLVM takes several hours to compile)
+    * `sudo port install llvm-19`
+    * `LLVM_DIR=/opt/local/libexec/llvm-19/lib/cmake/llvm/ LLVM_CONFIG=/opt/local/libexec/llvm-19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py`
+  * macOS - brew
+    * `brew install llvm@19`
+    * `LLVM_CONFIG=/usr/local/opt/llvm@19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py`
 
-* Because we only depend on one lib that's difficult to install, there is no need for a venv
+* Then, install llvm2scratch with `pip install ` followed by the path to the project root (the folder containing the pyproject.toml and llvm2scratch folder)
 
 ## Info
 
@@ -37,69 +43,18 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Planning
 
-* Use Scratch's call stack to store variables; when calling a different function pass all temporaries as parameters into a new function which calls the function and executes the rest of the code, rather than adding to the 'stack list' used in alloca. Could also use a variable for each local variable in each function (as long as it cannot recurse), but this might get annoying, so have an option to disable this
-e.g.
-fn main
-  global a = 2
-  global b = 2
-  call main2(global a, global b, (add global a, global b))
-
-fn main2(%a, %b, %c)
-  global d = call half(%c)
-
-fn half(%c)
-  ret %c / 2
-
-* Use broadcasts for branch instructions going backward (using fns could cause stack overflow). Use if/else etc for going forward. Use stop this script for return
-
-* .sb3lib + .sb3exe = .sb3 OR .sprite3
-
-* Global vars from both libs and exes should be allocated to the stack at the start
-
-* Optimisation - No need to assign value if only used once in the next instruction
-  * Make sure nothing the value depends on changes
-
-* Optimisation - Following Code: Could change stack size by 14 instead
-```
-Set `@.str` to (`stack size` + 1)
-Change `stack size` by 13
-Change `stack size` by 1
-Set `@a` to `stack size`
-```
-
-* Optimisiation - different return value for different funcs
-
-* Opti - Variable re-use, also change by for "set a  (a + 1)" and change by self for "set a (a * 2)"
-
-From scratch VM
-```
- getCounter () {
-        return this._counter;
-    }
-
-    clearCounter () {
-        this._counter = 0;
-    }
-
-    incrCounter () {
-        this._counter++;
-    }
-```
-
-```
-
-    forEach (args, util) {
-        const variable = util.target.lookupOrCreateVariable(
-            args.VARIABLE.id, args.VARIABLE.name);
-
-        if (typeof util.stackFrame.index === 'undefined') {
-            util.stackFrame.index = 0;
-        }
-
-        if (util.stackFrame.index < Number(args.VALUE)) {
-            util.stackFrame.index++;
-            variable.value = util.stackFrame.index;
-            util.startBranch(1, true);
-        }
-    }
-```
+* Opti:
+  * No branching or calling functions that branch
+  * Unchecked branches, don't return to address
+  * Unchecked branches, return to address
+  * Checked branches, return to address
+  * 8.29s for 5000000 comparisons
+  * 12s for 5000000 forward traces
+  * 1.00s for 5000000 backtraces
+  * if log2(return addresses) * 8 + 12 > average branches then return by recursing backward
+* Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
+* Opti: Assignment elision
+* Opti: Optimise bool as int casts
+* Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
+* Opti: `set a (a + n)` -> `change a by n`
+* Opti: `set a (a * 2)` -> `change a by a`

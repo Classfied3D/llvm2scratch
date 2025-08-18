@@ -62,7 +62,12 @@ class Project:
   code: list[BlockList] = field(default_factory=list)
   lists: dict[str, list[Known]] = field(default_factory=dict)
 
+  def export(self, filename: str) -> None:
+    """Exports the project into a .sprite3 file"""
+    exportScratchFile(self.getCtx(), filename)
+
   def getCtx(self) -> ScratchContext:
+    """Converts the project into a ScratchContext which can be used to get the raw project"""
     ctx = ScratchContext(self.cfg) # pyright: ignore[reportCallIssue] this error only appears sometimes??
     for name, scratch_list in self.lists.items():
       ctx.addOrGetList(name, scratch_list)
@@ -79,6 +84,7 @@ class ScratchContext:
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
+  exported: bool = False
 
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
     if not isinstance(block, LateBlock):
@@ -333,7 +339,7 @@ class Say(Block):
     }, ctx
 
 # Events
-# Thank you @RetrogradeDev for this wonderful MIT licensed code which I have now stolen
+# Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
 @dataclass
 class Broadcast(Block):
   value: Value
@@ -791,34 +797,8 @@ def exportSpriteData(ctx: ScratchContext) -> str:
 
   return json.dumps(res)
 
-def exportSpriteFile(ctx: ScratchContext, file: str) -> None:
+def exportScratchFile(ctx: ScratchContext, file: str) -> None:
+  """Exports scratch code to """
   with zipfile.ZipFile(file, "w") as zipf:
     zipf.writestr("Sprite/sprite.json", exportSpriteData(ctx))
     zipf.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)
-
-def main():
-  ctx = ScratchContext()
-  ctx.addBlockList(BlockList([
-    ProcedureDef("main", ["%1", "%2"]),
-    EditList("deleteall", "hello2", None, None),
-    EditList("insertat", "hello2", Known(5), Op("div", GetVar("hello3"), Known(30))),
-    EditVar("set", "hello2", Known(10)),
-    ControlFlow("until", BoolOp("=", Op("div", GetVar("hello3"), Known(30)), Known(0)), BlockList([
-      EditVar("set", "hello2", Known(10)),
-    ])),
-    ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
-    EditCounter("incr"),
-    Say(GetCounter()),
-    Broadcast(Op("length_of", GetVar("hello2")), True),
-    StopScript("stopall"),
-  ]))
-
-  #ctx.addBlockList(BlockList([
-  #  OnBroadcast("hi"),
-  #  Say(Known("hello")),
-  #]))
-
-  exportSpriteFile(ctx, "out.sprite3")
-
-if __name__ == "__main__":
-  main()

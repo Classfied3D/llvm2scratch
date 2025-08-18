@@ -60,5 +60,7 @@ int main(void) {
       break;
   }
 
+  for(;;);
+
   return 0;
 }

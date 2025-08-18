@@ -1,8 +1,8 @@
-"""Scratch project optimiser for the LLVM -> Scratch compiler"""
+"""Scratch project post-optimiser for the LLVM -> Scratch compiler"""
 
 import math
 
-import sb3
+from . import scratch as sb3
 
 def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
   """Optimise a value by using context"""
@@ -179,19 +179,3 @@ def optimize(proj: sb3.Project) -> sb3.Project:
     new_code.append(blocklist)
   proj.code = new_code
   return proj
-
-def main():
-  proj = sb3.Project(sb3.ScratchConfig())
-  proj.code.append(sb3.BlockList([
-    sb3.ProcedureDef("main", ["%1", "%2"]),
-    sb3.ControlFlow("if", sb3.BoolOp("=", sb3.Known(30), sb3.Known(0)), sb3.BlockList([
-      sb3.EditVar("set", "hello2", sb3.Known(10)),
-    ]))
-  ]))
-
-  proj = optimize(proj)
-
-  sb3.exportSpriteFile(proj.getCtx(), "out.sprite3")
-
-if __name__ == "__main__":
-  main()

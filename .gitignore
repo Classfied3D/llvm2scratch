@@ -1,5 +1,6 @@
 __pycache__
 **/.DS_Store
-main.ll
-out.sprite3
-input/main
+examples/main.ll
+examples/output
+examples/input/main
+examples/debug_branch_info.txt
