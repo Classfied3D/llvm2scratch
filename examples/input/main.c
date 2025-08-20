@@ -41,26 +41,26 @@ int main(void) {
     putchar(d);
   }
 
-  int e = 46;
+  unsigned int e = 46;
   switch (e) {
-    case 10:
+    case 0:
+      puts("0");
+      break;
+    case 1:
       puts("1");
       break;
     case 20:
-      puts("2");
+      puts("20");
       break;
     case 21:
-      puts("3");
-      break;
-    case 255:
-      puts("4");
+      puts("21");
       break;
     default:
       puts("default");
       break;
   }
 
-  for(;;);
+  //for(;;);
 
   return 0;
 }

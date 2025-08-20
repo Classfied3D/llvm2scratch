@@ -1,6 +1,5 @@
 from collections import defaultdict, deque
 
-
 def strongly_connected_components(graph: dict[str, list[str]]) -> list[list[str]]:
   """Tarjan's algorithm to find strongly connected components"""
   index = 0

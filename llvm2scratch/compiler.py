@@ -333,28 +333,9 @@ def binarySearch(value: sb3.Value,
                  min_poss_value: int | None = None, # Max value - we do not need to check for default values above it
                  max_poss_value: int | None = None, # Min value - likewise
                  are_branches_sorted: bool = False,
-                 _default_cases: set[int] | None = None,
                  _lo: int=0, _hi: int | None=None) -> sb3.BlockList:
   if len(branches) == 0:
     return sb3.BlockList([]) if default_branch is None else default_branch
-  
-  if _default_cases is None: _default_cases = set()
-
-  if default_branch is not None:
-    keys = branches.keys()
-    lowest_case = min(keys)
-    cases = list(keys)
-    for case in cases:
-      # 'Surround' all cases with the default case
-      if case == lowest_case and case != min_poss_value:
-        branches.update({case - 1: default_branch})
-        _default_cases.add(case - 1)
-      if case != max_poss_value:
-        # If there is no number between this case and the next one, then we don't put a default between them
-        if case + 1 not in branches.keys():
-          branches.update({case + 1: default_branch})
-          _default_cases.add(case + 1)
-    are_branches_sorted = False
 
   if not are_branches_sorted: branches = OrderedDict(sorted(branches.items()))
   
@@ -362,23 +343,38 @@ def binarySearch(value: sb3.Value,
   mid = (_lo + _hi) // 2
   mid_val = list(branches.keys())[mid]
 
+  if _lo != 0: min_poss_value = list(branches.keys())[_lo]
+  if _hi != len(branches) - 1: max_poss_value = list(branches.keys())[_hi]
+
   if _lo == _hi:
-    return list(branches.values())[_lo]
-  
-  # When checking for a branch with two default branches around it, use == instead of two >s
-  if _hi - _lo + 1 == 3 and (list(branches.keys())[_lo] in _default_cases and
-                             list(branches.keys())[_hi] in _default_cases):
-    # FUTURE OPTI: This doesn't rebalance the tree so there is still room for optimisation... but not much
-    cond = sb3.BoolOp("=", value, sb3.Known(mid_val))
-    return sb3.BlockList([sb3.ControlFlow("if_else", cond,
-                          list(branches.values())[mid],
-                          list(branches.values())[_lo])]) # The default case
+    if default_branch is not None:
+      check_below = check_above = True
+
+      if mid != len(branches) - 1:
+        # If the value above the one being checked for, there is no need to check for a default above it
+        check_above = not list(branches.keys())[mid + 1] == mid_val + 1
+      if mid_val == max_poss_value: # If the value is the highest, we don't need to check below
+        check_above = False
+
+      # Vice versa
+      if mid != 0:
+        check_below = not list(branches.keys())[mid - 1] == mid_val - 1
+      if mid_val == min_poss_value:
+        check_below = False
+
+      if check_below or check_above:
+        cond = sb3.BoolOp("=", value, sb3.Known(mid_val))
+        return sb3.BlockList([sb3.ControlFlow("if_else", cond, list(branches.values())[mid], default_branch)])
+    
+    return list(branches.values())[mid]
   
   cond = sb3.BoolOp(">", value, sb3.Known(mid_val))
   return sb3.BlockList([sb3.ControlFlow("if_else", cond,
-                         # Sorting and default branches already taken care of
-                         binarySearch(value, branches, _default_cases=_default_cases, _lo=mid + 1, _hi=_hi),
-                         binarySearch(value, branches, _default_cases=_default_cases, _lo=_lo,     _hi=mid))])
+                        # Sorting already taken care of
+                        binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
+                                     _lo=mid + 1, _hi=_hi),
+                        binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
+                                     _lo=_lo,     _hi=mid))])
 
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
   match value:
