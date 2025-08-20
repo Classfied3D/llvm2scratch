@@ -43,6 +43,13 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Planning
 
+* Linking LLVM IR Files: https://stackoverflow.com/a/41181212/
+* Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
+* Opti: Assignment elision
+* Opti: Optimise bool as int casts
+* Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
+* Opti: `set a (a + n)` -> `change a by n`
+* Opti: `set a (a * 2)` -> `change a by a`
 * Opti:
   * No branching or calling functions that branch
   * Unchecked branches, don't return to address
@@ -52,9 +59,3 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
   * 12s for 5000000 forward traces
   * 1.00s for 5000000 backtraces
   * if log2(return addresses) * 8 + 12 > average branches then return by recursing backward
-* Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
-* Opti: Assignment elision
-* Opti: Optimise bool as int casts
-* Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
-* Opti: `set a (a + n)` -> `change a by n`
-* Opti: `set a (a * 2)` -> `change a by a`

@@ -12,6 +12,7 @@ import math
 
 from . import scratch as sb3
 from . import optimizer
+from . import util
 
 SCRATCH_LIST_LIMIT = 200_000
 
@@ -68,6 +69,7 @@ class FuncInfo:
   can_call: set[str] # Everything the function might call (may include itself)
   return_addresses: list[str] # Any functions that call this function
   returns_to_address: bool # If the function returns using a broadcast to an address
+  checked_blocks: list[str] # List of label names that will contain a check to reset the stack
 
 @dataclass
 class BlockInfo:
@@ -844,7 +846,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         blocks.add(res_var.setValue(res_val))
 
     case _:
-      raise CompException(f"Unknown instruction opcode {instr} (type {type(instr)})")
+      raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx
 
 def assignParameters(func: FuncInfo) -> sb3.BlockList:
@@ -856,8 +858,9 @@ def assignParameters(func: FuncInfo) -> sb3.BlockList:
     blocks.add(var.setValue(param.getValue()))
   return blocks
 
-def getUncheckedBranchInit(proc_name: str, fn: FuncInfo, ctx: Context) -> tuple[sb3.BlockList, Context]:
-  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [])])
+def getUncheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
+                               ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
+  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, params)])
 
   if ctx.cfg.do_debug_branch_log:
     # Increment the branch counter in the log
@@ -867,29 +870,37 @@ def getUncheckedBranchInit(proc_name: str, fn: FuncInfo, ctx: Context) -> tuple[
         sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
     ))]))
 
+  if is_counted:
+    blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing a number
+
   return blocks, ctx
 
-def getCheckedBranchInit(proc_name: str, fn: FuncInfo, ctx: Context) -> tuple[sb3.BlockList, Context]:
+def getCheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
+                             ctx: Context) -> tuple[sb3.BlockList, Context]:
   """Returns the blocks needed to return a branch instruction (procedure) that will reset the scratch's stack
   if reaching a max amount of permutations, preventing scratch from running out of memory"""
 
   reset_broadcast = f"{proc_name}:reset stack"
 
+  arguments = [localizeVar(name, False, BlockInfo(fn, False)).getValue() for name in params]
   ctx.proj.code.append(sb3.BlockList([
     sb3.OnBroadcast(reset_broadcast),
-    sb3.ProcedureCall(proc_name, []),
+    sb3.ProcedureCall(proc_name, arguments),
   ]))
 
-  blocks, ctx = getUncheckedBranchInit(proc_name, fn, ctx)
+  blocks, ctx = getUncheckedProcedureStart(proc_name, params, fn, ctx, is_counted=True)
 
-  blocks.add(sb3.BlockList([
-    sb3.EditCounter("incr"), # The 'hacked' counter blocks are 20x faster than incrementing a number
-    sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), sb3.BlockList([
-      sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
-      sb3.EditCounter("clear"),
-      sb3.StopScript("stopthis"),
-    ]))
-  ]))
+  on_reset = sb3.BlockList()
+  if len(params) > 0:
+    # FUTURE OPTI: the assigned params could potentially used elsewhere but there's hardly a perf gain
+    on_reset = assignParameters(fn)
+  on_reset.add(sb3.BlockList([
+    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
+    sb3.EditCounter("clear"),
+    sb3.StopScript("stopthis")]))
+
+  blocks.add(sb3.ControlFlow("if",
+    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), on_reset))
 
   return blocks, ctx
 
@@ -907,6 +918,7 @@ def transTerminatorInstr(instr: ir.Instruction,
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
         blocks.add(sb3.EditVar("set", ctx.cfg.return_var, value.value))
+
       if bctx.fn.returns_to_address:
         return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
         return_to_addr_code = OrderedDict()
@@ -915,6 +927,7 @@ def transTerminatorInstr(instr: ir.Instruction,
 
         return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
         blocks.add(return_table)
+
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
 
@@ -988,7 +1001,7 @@ def transTerminatorInstr(instr: ir.Instruction,
       blocks.add(binarySearch(val, case_vs_label, default_label_call, lowest_poss, highest_poss))
 
     case _:
-      raise CompException(f"Unknown terminator instruction opcode {instr} (type {type(instr)})")
+      raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx
 
 def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
@@ -1050,11 +1063,12 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   return blocks, ctx
 
-def transFuncs(mod: ir.Module, ctx: Context) -> Context:
+def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   # Get info about what a function calls and how it returns
   call_graph: dict[str, tuple[set[str], bool]] = {}
   return_addresses: dict[str, list[str]] = {}
   returns_to_address: dict[str, bool] = {}
+  all_check_locations: dict[str, list[str]] = {}
   for func in mod.funcs.values():
     fn_name = func.value.val
     assert isinstance(fn_name, str)
@@ -1064,12 +1078,11 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         raise CompException("Externally defined function must have info about it")
       info = ctx.fn_info[fn_name]
       call_graph[fn_name] = info.can_call, True
-      returns_to_address[fn_name] = info.returns_to_address
 
     else:
-      # What the function calls
-      calls: set[str] = set()
+      calls: set[str] = set() # What the function calls
       for block in func.blocks.values():
+        # Find every function the function could call
         block_label = block.value.val
         assert isinstance(block_label, str)
         call_id = 0
@@ -1082,9 +1095,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             return_addresses[called_name].append(localizeCallId(call_id, block_label, fn_name))
             call_id += 1
       call_graph[fn_name] = calls, False
-
-      # If the function returns by broadcasting (ignoring any calls to functions that do this)
-      returns_to_address[fn_name] = len(func.blocks) > 1
   
   for start_func in call_graph:
     if call_graph[start_func][1]: continue
@@ -1105,8 +1115,70 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
     call_graph[start_func] = visited, True
   
+  for func in mod.funcs.values():
+    fn_name = func.value.val
+    assert isinstance(fn_name, str)
+
+    if func.has_no_body():
+      info = ctx.fn_info[fn_name]
+      returns_to_address[fn_name] = info.returns_to_address
+      all_check_locations[fn_name] = info.checked_blocks
+    else:
+      branches: dict[str, list[str]] = {"ret": []} # Where different branches could lead
+      for block in func.blocks.values():
+        # Find every function the function could call
+        block_label = block.value.val
+        assert isinstance(block_label, str)
+
+        # Find what each block in the function could branch to
+        term_instr = block.instrs[-1]
+        match term_instr:
+          case ir.Unreacheble():
+            pass
+          case ir.Ret():
+            branches[block_label] = ["ret"]
+          case ir.Br():
+            assert isinstance(term_instr.label_false.val, str)
+            branches[block_label] = [term_instr.label_false.val]
+            if term_instr.label_true is not None:
+              assert isinstance(term_instr.label_true.val, str)
+              branches[block_label].append(term_instr.label_true.val)
+          case ir.Switch():
+            assert isinstance(term_instr.label_default.val, str)
+            branches[block_label] = [term_instr.label_default.val]
+            for _, label in term_instr.cases:
+              assert isinstance(label.val, str)
+              branches[block_label].append(label.val)
+          case ir.CallBr():
+            assert isinstance(term_instr.fallthrough_label.val, str)
+            if term_instr.indirect_labels is not None:
+              raise CompException("Indirect (exceptional) labels not supported")
+            branches[block_label].append(term_instr.fallthrough_label.val)
+          case _:
+            raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
+
+      fn_check_locations = util.select_minimum_checks_scc(branches)
+      could_recurse = len(fn_check_locations) > 0
+      # If the branches could create a loop, we must place stack checks, so we should return to an
+      # address. Furthermore, a binary search and a call is usually faster than potentially
+      # hundreds of recursions backward.
+      returns_to_address[fn_name] = could_recurse
+      all_check_locations[fn_name] = fn_check_locations
+
+      # FUTURE OPTI: could check to see if in a non-recursive environment, there are enough
+      # branches that it is faster to recurse backward. However this happens rarely, it is
+      # difficult to gauge if it will actually have a net positive impact (will force callers
+      # to return to an address, the longest path may only be taken some of the times).
+      #if not could_recurse:
+      #  first_label = list(func.blocks.values())[0].value.val
+      #  assert isinstance(first_label, str)
+      #  longest_path, max_branch_count = util.longest_path_dag(branches, first_label, "ret")
+      #  max_branch_count -= 1 # Ignore "ret" path
+      #  can_return = longest_path is not None
+      #  return_address_count = len(return_addresses.get(fn_name, []))
+
   for fn_name in returns_to_address:
-    # If the function returns by broadcasting because it relies on other functions which return by broadcastiing
+    # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
 
   for func in mod.funcs.values():
@@ -1121,11 +1193,18 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
     if returns_to_address[fn_name]: param_names.append(ctx.cfg.return_address_local)
 
     ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, param_names, call_graph[fn_name][0],
-                                 return_addresses.get(fn_name, list()), returns_to_address[fn_name])
+                                    return_addresses.get(fn_name, list()), returns_to_address[fn_name],
+                                    all_check_locations.get(fn_name, list()))
     ctx.next_fn_id += 1
+  
+  return ctx
 
-  # Translate functions
+def transFuncs(mod: ir.Module, ctx: Context) -> Context:
+  ctx = getFnInfo(mod, ctx)
+
   for func in mod.funcs.values():
+    if func.has_no_body(): continue
+
     assert isinstance(func.value.ty, ir.FunctionType)
     fn_name = func.value.val
     assert isinstance(fn_name, str)
@@ -1143,19 +1222,25 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       assert isinstance(block_label, str)
 
       if first_block:
-        localizedParams = [localizeParameter(param) for param in info.params]
-        block_code = sb3.BlockList([sb3.ProcedureDef(fn_name, localizedParams)])
-
-        if ctx.cfg.do_debug_branch_log:
-          # Increment the function counter in the log
-          index = sb3.Known((info.fn_id * 2) + 1)
-          block_code.add(sb3.BlockList([
-            sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add", 
-              sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
-          ))]))
+        proc_name = fn_name
+        localized_params = [localizeParameter(param) for param in info.params]
       else:
         proc_name = localizeLabel(block_label, info)
-        block_code, ctx = getCheckedBranchInit(proc_name, info, ctx)
+        localized_params = []
+
+      if block_label not in info.checked_blocks:
+        block_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
+                                                     is_counted=info.returns_to_address)
+      else:
+        block_code, ctx = getCheckedProcedureStart(proc_name, localized_params, info, ctx)
+
+      if first_block and ctx.cfg.do_debug_branch_log:
+        # Increment the function counter in the log
+        index = sb3.Known((info.fn_id * 2) + 1)
+        block_code.add(sb3.BlockList([
+          sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add", 
+            sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
+        ))]))
 
       # After the first block we can no longer access the parameters in the function
       bctx = BlockInfo(info, first_block)
@@ -1199,7 +1284,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             bctx = BlockInfo(info, first_block)
 
             # Add code for callback
-            block_code, ctx = getCheckedBranchInit(return_proc_name, info, ctx)
+            block_code, ctx = getUncheckedProcedureStart(return_proc_name, [], info, ctx,
+                                                         is_counted=info.returns_to_address)
             block_code.add(assign_blocks)
 
           call_id += 1
@@ -1218,13 +1304,13 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
   return ctx
 
 def addFunc(name: str, params: list[str], can_call: set[str],
-            returns_to_address: bool, contents: sb3.BlockList, ctx: Context) -> Context:
-  if returns_to_address: params.append(ctx.cfg.return_address_local)
+            contents: sb3.BlockList, ctx: Context) -> Context:
+  #if returns_to_address: params.append(ctx.cfg.return_address_local)
   localized_params = [localizeParameter(param) for param in params]
   blocks = sb3.BlockList([sb3.ProcedureDef(name, localized_params)])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, params, can_call, list(), returns_to_address)
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, params, can_call, list(), False, list())
   ctx.next_fn_id += 1
   return ctx
 
@@ -1260,7 +1346,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
       ascii_lookup.append(sb3.Known(char))
   ctx.proj.lists[cfg.ascii_lookup_var + cfg.zero_indexed_suffix] = ascii_lookup
 
-  ctx = addFunc("puts", ["input"], set(), False, sb3.BlockList([
+  ctx = addFunc("puts", ["input"], set(), sb3.BlockList([
     sb3.EditVar("set", "buffer", sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
@@ -1274,7 +1360,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
-  ctx = addFunc("putchar", ["input"], set(), False, sb3.BlockList([
+  ctx = addFunc("putchar", ["input"], set(), sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetParameter(localizeParameter("input")))),
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]), ctx)
