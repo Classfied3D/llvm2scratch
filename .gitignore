@@ -1,7 +1,11 @@
 **/.DS_Store
 **/.vscode
+**/.zed
+**/.ropeproject
 **/__pycache__
 examples/output
 examples/input/main
 examples/input/main.ll
 examples/debug_branch_info.txt
+poetry.lock
+pyrightconfig.json

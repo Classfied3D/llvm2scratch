@@ -117,11 +117,11 @@ class ScratchContext:
       lastId = currId
       currId = nextId
       nextId = genId()
-    
+
     if len(blocks.blocks) == 0: firstId = None
 
     return firstId
-  
+
   def addOrGetVar(self, var_name: str, default_val: Known | None = None) -> Id:
     if default_val is None: default_val = Known(0)
     if not var_name in self.vars:
@@ -130,7 +130,7 @@ class ScratchContext:
     else:
       id = self.vars[var_name][0]
     return id
-  
+
   def addOrGetList(self, list_name: str, default_val: list[Known] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
@@ -142,17 +142,17 @@ class ScratchContext:
         if len(self.lists[list_name][1]) > 0: raise ScratchCompException(f"List {list_name} given default value twice")
         self.lists[list_name] = (id, default_val)
     return id
-  
+
   def addFunc(self, func_name: str, param_ids: list[Id], run_without_refresh: bool) -> None:
     if func_name in self.funcs:
       raise ScratchCompException(f"Function {func_name} registered twice")
     self.funcs[func_name] = (param_ids, run_without_refresh)
-  
+
   def addBroadcast(self, name: str) -> Id:
     """Adds a broadcast with the given name, returns the id of the broadcast"""
     if name in self.broadcasts:
       return self.broadcasts[name]
-    
+
     id = genId()
     self.broadcasts[name] = id
     return id
@@ -169,19 +169,19 @@ class ScratchContext:
       raw_vars.update({
         id: [name, value.getRawVarInit()]
       })
-    
+
     raw_lists = {}
     for name, (id, values) in self.lists.items():
       raw_lists.update({
         id: [name, [value.getRawVarInit() for value in values]]
       })
-    
+
     raw_broadcasts = {}
     for name, id in self.broadcasts.items():
       raw_broadcasts.update({
         id: name
       })
-    
+
     raw_blocks = {}
     for id, block in self.blocks.items():
       raw_blocks.update({id: block})
@@ -195,7 +195,7 @@ class ScratchContext:
 class Block:
   def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
-  
+
   def isStart(self) -> bool:
     return False
 
@@ -205,7 +205,7 @@ class Block:
 class StartBlock(Block):
   def isStart(self) -> bool:
     return True
-  
+
 class EndBlock(Block):
   def isEnd(self) -> bool:
     return True
@@ -214,7 +214,7 @@ class LateBlock(Block):
   """A block which requires info about the whole program to be added e.g. the id of function parameters which might not yet be defined"""
   def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot call getRaw on a LateBlock because it evaluates after other blocks, call getRawLate")
-  
+
   def getRawLate(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'LateBlock'; must be a derived class")
 
@@ -257,13 +257,13 @@ class BlockList:
         raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks}")
       elif len(blocks.blocks) > 0:
         raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks.blocks[0]}")
-    
+
     if isinstance(blocks, Block):
       self.blocks.append(blocks)
     else:
       self.blocks += blocks.blocks.copy()
       self.end |= blocks.end
-  
+
   def __len__(self):
     return len(self.blocks)
 
@@ -295,12 +295,12 @@ class Known(Value):
     else:
       self.known = float(val)
 
-  def getRawValue(self, _: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     raw = self.known
     if not isinstance(self.known, str):
       raw = float(raw)
     return [1, [(10 if isinstance(self.known, str) else 4), raw]], ctx
-  
+
   def getRawVarInit(self) -> str | float | bool:
     """Get the raw value to set a var to when it starts with this value"""
     if isinstance(self.known, bool): return "true" if self.known else "false"
@@ -312,14 +312,17 @@ class Known(Value):
 class KnownBool(Known, BooleanValue):
   known: bool
 
+  def __init__(self, known: bool):
+    self.known = known
+
   def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
     return Known(int(self.known)).getRawValue(parent, ctx)
-  
+
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     if not self.known:
       return None, ctx # If false
     return BoolOp("not", KnownBool(False)).getRawBoolValue(parent, ctx)
-  
+
   def getRawVarInit(self) -> str:
     """Get the raw value to set a var to when it starts with this value"""
     return "true" if self.known else "false"
@@ -365,14 +368,14 @@ class Broadcast(Block):
 
 @dataclass
 class OnBroadcast(StartBlock):
-  value: str
+  name: str
 
   def getRaw(self, _my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    id = ctx.addBroadcast(self.value)
+    id = ctx.addBroadcast(self.name)
 
     return {
       "opcode": "event_whenbroadcastreceived",
-      "fields": {"BROADCAST_OPTION": [self.value, id]}
+      "fields": {"BROADCAST_OPTION": [self.name, id]}
     }, ctx
 
 # Control
@@ -393,7 +396,7 @@ class ControlFlow(Block):
   def __post_init__(self):
     if self.op in ["if", "if_else", "until", "while"] and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
-    
+
     if self.op == "if_else" and self.else_blocks is None:
       raise ScratchCompException("An if-else statement must contain blocks in the else case")
 
@@ -403,9 +406,9 @@ class ControlFlow(Block):
       raw_val, ctx = self.value.getRawBoolValue(my_id, ctx)
     else:
       raw_val, ctx = self.value.getRawValue(my_id, ctx)
-    
+
     blocks_id = ctx.addBlockList(self.blocks, my_id)
-    
+
     input_name = "TIMES" if self.op == "reptimes" else "CONDITION"
 
     inputs = {"SUBSTACK": [2, blocks_id]}
@@ -568,7 +571,7 @@ class Op(Value): # TODO: make this be able to use one input
         rgt_param = "NUM2"
         if takes_one_op:
           lft_param = "NUM"
-    
+
     opcode = SHORT_OP_TO_OPCODE.setdefault(self.op, "operator_mathop")
 
     raw_left, ctx = self.left.getRawValue(id, ctx)
@@ -600,7 +603,7 @@ class BoolOp(BooleanValue):
     if (not isinstance(self.left, BooleanValue) and self.op in ["not", "and", "or"]) or \
        (not isinstance(self.right, BooleanValue) and self.op in ["and", "or"]):
       raise ScratchCompException(f"BoolOp {self.op} only accepts booleans")
-    
+
     given_one_op = self.right is None
     takes_one_op = self.op == "not"
     if takes_one_op != given_one_op:
@@ -630,7 +633,7 @@ class BoolOp(BooleanValue):
       case _:
         lft_param = "OPERAND1"
         rgt_param = "OPERAND2"
-    
+
     inputs = {}
     if raw_left is not None: inputs.update({lft_param: raw_left})
     if raw_right is not None: inputs.update({rgt_param: raw_right})
@@ -641,7 +644,7 @@ class BoolOp(BooleanValue):
     }), BlockMeta(parent))
 
     return [2, id], ctx
-  
+
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     return self.getRawValue(parent, ctx)
 

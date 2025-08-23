@@ -7,7 +7,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 * The following dependencies require manual installation:
 
 * **llvm2py**@0.2.0b0 (installation requires llvm@19)
-  * macOS - macports (recommended due to supporting precompiled binaries for older macos versions + LLVM takes several hours to compile)
+  * macOS - macports (recommended; better precompiled binary support; can save hours of compile time)
     * `sudo port install llvm-19`
     * `LLVM_DIR=/opt/local/libexec/llvm-19/lib/cmake/llvm/ LLVM_CONFIG=/opt/local/libexec/llvm-19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py`
   * macOS - brew
@@ -45,7 +45,10 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 * Linking LLVM IR Files: https://stackoverflow.com/a/41181212/
 * Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
-* Opti: Assignment elision
+* Opti: not not elision
+* Opti: unused param elision
+* Opti: known list (lookup table) progagation
+* Opti: remove Repeat(Known(1))
 * Opti: Optimise bool as int casts
 * Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
 * Opti: `set a (a + n)` -> `change a by n`
@@ -59,3 +62,32 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
   * 12s for 5000000 forward traces
   * 1.00s for 5000000 backtraces
   * if log2(return addresses) * 8 + 12 > average branches then return by recursing backward
+
+## Block Perf
+
+```
+Time (s) per 200000 iterations:
+
+Set Var:   7.550
+Get Var:   1.538
+Get Param: 1.178
+
+Add:       0.765
+Mod:       0.715
+Rand:      2.473
+Not:       0.725
+And:       0.864
+Eq:        0.929
+Abs:       1.607
+Join:      1.091
+Letter Of: 0.737
+Length Of: 0.483
+Cntin Str: 1.272
+Round Int: 0.304
+Round Flt: 1.250
+
+Item:      1.679
+Item #:    4.920 (Unreliable benchmark)
+
+Counter:   0.190
+```
