@@ -41,6 +41,12 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
   * `(((a0b1 + b0a1) mod (2^n / 2^floor(n/2))) * 2^floor(n/2) + a0b0) mod 2^n`
   * or `(((a0b1 + b0a1) mod 2^ceil(n/2)) * 2^floor(n/2) + a0b0) mod 2^n`
 
+## Examples
+* [Hello World](https://scratch.mit.edu/projects/1201848279/)
+* [Math](https://scratch.mit.edu/projects/1206058442/)
+* [Old Branching](https://scratch.mit.edu/projects/1206466346/)
+* [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
+
 ## Planning
 
 * Linking LLVM IR Files: https://stackoverflow.com/a/41181212/
