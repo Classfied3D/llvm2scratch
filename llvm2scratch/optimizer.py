@@ -34,11 +34,11 @@ ITEM_NUM_COST = 4.920 # Unreliable benchmark
 GET_COUNTER_COST = 0.190
 KNOWN_COST = 0 # Included in the cost of the block that uses it
 
-class Optimisation(Enum):
+class Optimization(Enum):
   ASSIGNMENT_ELISION = 1
   KNOWN_VALUE_PROPAGATION = 2
 
-ALL_OPTIMISATIONS = set(Optimisation)
+ALL_OPTIMIZATIONS = set(Optimization)
 
 class OptimizerException(Exception):
   """Exception in the optimizer"""
@@ -444,6 +444,12 @@ def getValueCost(value: sb3.Value) -> float:
 
   return cost
 
+def shouldElide(value: sb3.Value, times_used: float) -> bool:
+  calc_cost = getValueCost(value)
+  elision_cost = calc_cost * times_used
+  no_elision_cost = SET_VAR_COST + calc_cost + (GET_VAR_COST * times_used)
+  return no_elision_cost > elision_cost
+
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
     case sb3.Known() | sb3.GetParameter() | sb3.GetCounter():
@@ -601,11 +607,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
     # Calculate if it is actually faster to elide
     slower_to_elide: set[str] = set()
     for var_name, (_, value) in to_elide.items():
-      times_used = var_use_counts.get(var_name, 0)
-      calc_cost = getValueCost(value)
-      elision_cost = calc_cost * times_used
-      no_elision_cost = SET_VAR_COST + calc_cost + (GET_VAR_COST * times_used)
-      if no_elision_cost < elision_cost:
+      if not shouldElide(value, var_use_counts.get(var_name, 0)):
         slower_to_elide.add(var_name)
     for var_name in slower_to_elide:
       del to_elide[var_name]
@@ -629,22 +631,22 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
 
   return proj, did_total_opti
 
-def optimize(proj: sb3.Project, all_opti: set[Optimisation] | None = None) -> sb3.Project:
+def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None) -> sb3.Project:
   if all_opti is None:
-    all_opti = ALL_OPTIMISATIONS
+    all_opti = ALL_OPTIMIZATIONS
 
   times_optimized = 0
-  opti_to_perform = all_opti
+  opti_to_perform = deepcopy(all_opti)
   while len(opti_to_perform) > 0 and times_optimized < MAX_OPTIMIZATIONS:
-    current_opti = all_opti.pop()
+    current_opti = opti_to_perform.pop()
     match current_opti:
-      case Optimisation.ASSIGNMENT_ELISION:
+      case Optimization.ASSIGNMENT_ELISION:
         proj, did_opti = assignmentElision(proj)
-      case Optimisation.KNOWN_VALUE_PROPAGATION:
+      case Optimization.KNOWN_VALUE_PROPAGATION:
         proj, did_opti = knownValuePropagation(proj)
       case _:
         raise OptimizerException(f"Unknown Optimisation {current_opti}")
-    if did_opti: opti_to_perform = all_opti - {current_opti}
+    if did_opti: opti_to_perform = deepcopy(all_opti) - {current_opti}
     times_optimized += 1
 
   return proj
