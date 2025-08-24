@@ -808,7 +808,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           # TODO FIX: ugt, uge, ult, ule, and signed counterparts
           raise CompException(f"icmp does not support comparsion mode {instr.cond}")
 
-      res_val = sb3.Op("abs", res_val) # TODO OPTI: not always needed, update optimiser  
+      # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
+      res_val = sb3.Op("bool_as_int", res_val)
       
       if res_var is not None:
         blocks.add(res_var.setValue(res_val))

@@ -1,6 +1,22 @@
 # LLVM2Scratch
 
-An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows a lot of programs written languages which can compile to LLVM (C/C++/Rust/etc) to be ported into scratch.
+An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
+
+## Progress
+* 🆕 Stack Allocation, Loading, and Storing (No deallocations yet)
+* 🔢 Integer Operations (Up to 48 bits)
+* ↔️ Functions + Return Values (No recursion support)
+* 🔀 Branch + Switch Instructions
+* 🔁 Loops (Which unwind the call stack when necessary)
+* 🔡 Static Variables
+* ⚡ Optimizations (Known Value Propagation, Assignment Elision)
+* 📝 Sprite3 file output
+
+## Examples
+* [Hello World](https://scratch.mit.edu/projects/1201848279/)
+* [Math](https://scratch.mit.edu/projects/1206058442/)
+* [Old Branching](https://scratch.mit.edu/projects/1206466346/)
+* [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
 
 ## Installation
 
@@ -41,21 +57,13 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
   * `(((a0b1 + b0a1) mod (2^n / 2^floor(n/2))) * 2^floor(n/2) + a0b0) mod 2^n`
   * or `(((a0b1 + b0a1) mod 2^ceil(n/2)) * 2^floor(n/2) + a0b0) mod 2^n`
 
-## Examples
-* [Hello World](https://scratch.mit.edu/projects/1201848279/)
-* [Math](https://scratch.mit.edu/projects/1206058442/)
-* [Old Branching](https://scratch.mit.edu/projects/1206466346/)
-* [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
-
 ## Planning
 
 * Linking LLVM IR Files: https://stackoverflow.com/a/41181212/
 * Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
-* Opti: not not elision
 * Opti: unused param elision
 * Opti: known list (lookup table) progagation
 * Opti: remove Repeat(Known(1))
-* Opti: Optimise bool as int casts
 * Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
 * Opti: `set a (a + n)` -> `change a by n`
 * Opti: `set a (a * 2)` -> `change a by a`

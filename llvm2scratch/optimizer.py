@@ -2,7 +2,6 @@
 
 from collections import defaultdict, deque, Counter
 from dataclasses import dataclass, field
-from typing import Literal
 from copy import deepcopy
 from enum import Enum
 
@@ -28,22 +27,22 @@ JOIN_COST = 1.091
 LETTER_OF_COST = 0.737
 LENGTH_OF_COST = 0.483
 CONTAINS_STR_COST = 1.272
-BOOL_TO_INT_COST = 0.304 # Bool to int use round on a boolean value, which is cheaper than a round on a fp value
+BOOL_AS_INT_COST = 0.304 # Bool to int use round on a boolean value, which is cheaper than a round on a fp value
 ROUND_COST = 1.250
 GET_ITEM_COST = 1.679
 ITEM_NUM_COST = 4.920 # Unreliable benchmark
 GET_COUNTER_COST = 0.190
-KNOWN_COST = 0 # Probably not zero, but is included in the cost of the block that uses it
+KNOWN_COST = 0 # Included in the cost of the block that uses it
+
+class Optimisation(Enum):
+  ASSIGNMENT_ELISION = 1
+  KNOWN_VALUE_PROPAGATION = 2
+
+ALL_OPTIMISATIONS = set(Optimisation)
 
 class OptimizerException(Exception):
   """Exception in the optimizer"""
   pass
-
-class Optimisation(str, Enum):
-  ASSIGNMENT_ELISION = "Assignment Elision"
-  KNOWN_VALUE_PROPAGATION = "Known Value Proagation"
-
-ALL_OPTIMISATIONS = set(Optimisation)
 
 @dataclass
 class BlockListInfo:
@@ -100,6 +99,9 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
         if isinstance(value.left, sb3.KnownBool):
           did_opti_total = True
           value = sb3.KnownBool(not sb3.scratchCastToBool(value.left))
+        elif isinstance(value.left, sb3.BoolOp) and value.left.op == "not":
+          did_opti_total = True
+          value = value.left.left
 
       elif isinstance(value.left, sb3.Known) and isinstance(value.right, sb3.Known):
         if value.op in ["<", ">", "="]:
@@ -123,6 +125,40 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
           else:
             value = sb3.KnownBool(left or right)
 
+      elif value.op in ["<", ">", "="] and \
+          ((isinstance(value.left, sb3.Op) and value.left.op == "bool_as_int") ^ \
+          (isinstance(value.right, sb3.Op) and value.right.op == "bool_as_int")) and \
+          (isinstance(value.left, sb3.Known) ^ isinstance(value.right, sb3.Known)):
+        did_opti_total = True
+        op = value.op
+        unknown, known = value.left, value.right
+        if isinstance(value.right, sb3.Op):
+          unknown, known = value.right, value.left
+          if op == "<": op = ">="
+          if op == ">": op = "<="
+        assert isinstance(known, sb3.Known)
+        assert isinstance(unknown, sb3.Op)
+
+        comparison = {
+          "=": lambda a, b: a == b,
+          ">": lambda a, b: a > b,
+          "<": lambda a, b: a < b,
+          "<=": lambda a, b: a <= b,
+          ">=": lambda a, b: a >= b,
+        }[op]
+
+        if isinstance(known.known, str): known.known = known.known.lower()
+        value_true, value_false = ("true", "false") if isinstance(known.known, str) else (1, 0)
+        result_true = bool(comparison(value_true, known.known))
+        result_false = bool(comparison(value_false, known.known))
+
+        if result_true == result_false:
+          value = sb3.KnownBool(result_true)
+        elif result_true:
+          value = unknown.left
+        else:
+          value = sb3.BoolOp("not", unknown.left)
+
     case sb3.Op():
       value.left, did_opti_1 = simplifyValue(value.left)
       did_opti_2 = False
@@ -145,6 +181,8 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
             value = sb3.Known(left / right)
           case "mod":
             value = sb3.Known(left % right)
+          case "bool_as_int":
+            value = sb3.Known(left)
           case "abs":
             value = sb3.Known(abs(left))
           case "floor":
@@ -168,7 +206,7 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
             if known == 0: value = unknown
           case "mul":
             if known == 0: value = sb3.Known(0)
-    
+
     case sb3.GetOfList():
       value.value, did_opti = simplifyValue(value.value)
       did_opti_total |= did_opti
@@ -200,7 +238,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
       did_opti_2 = False
       if block.else_blocks is not None:
         block.else_blocks, did_opti_2 = knownValuePropagationBlock(block.else_blocks)
-    
+
       did_opti_total |= did_opti_1 or did_opti_2
 
     # Finally, optimise the blocks themselves depending on the value
@@ -236,7 +274,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
               did_opti = True
               block.op = "until" if block.op == "while" else "while"
               block.value = block.value.left
-            
+
     did_opti_total |= did_opti
 
     if add_block: new_blocklist.add(block)
@@ -335,7 +373,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         match block.op:
           case "if" | "reptimes" | "until" | "while":
             b_info = getBlockListVarUse(block.blocks, func_info)
-            
+
             info.dependent    |= b_info.dependent - info.always_modify
             info.might_modify |= b_info.might_modify
             info.might_call   |= b_info.might_call
@@ -362,7 +400,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
             b1_counts, b2_counts = b1_info.use_counts, b2_info.use_counts
             all_keys = set(b1_counts) | set(b2_counts)
             info.use_counts += Counter({key: (b1_counts.get(key, 0) + b2_counts.get(key, 0)) / 2 for key in all_keys})
-  
+
   assert info.might_modify.issuperset(info.always_modify)
   assert info.might_call.issuperset(info.always_call)
   return info
@@ -379,8 +417,8 @@ def getValueCost(value: sb3.Value) -> float:
       elif value.op == "join":         cost = JOIN_COST
       elif value.op == "rand_between": cost = RAND_COST
       elif value.op == "round":        cost = ROUND_COST
+      elif value.op == "bool_as_int":  cost = BOOL_AS_INT_COST
       else:                            cost = MATH_FUNC_COST
-      # FUTURE Bool To Int cost
     case sb3.BoolOp():
       if value.op in ["=", "<", ">"]:  cost = COMPARISON_COST
       elif value.op in ["and", "or"]:  cost = AND_OR_COST
@@ -395,7 +433,7 @@ def getValueCost(value: sb3.Value) -> float:
       cost = GET_ITEM_COST if value.op == "atindex" else ITEM_NUM_COST
     case _:
       raise OptimizerException(f"Unknown value, {type(value)}")
-  
+
   match value:
     case sb3.Op() | sb3.BoolOp():
       cost += getValueCost(value.left)
@@ -473,7 +511,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
             raise OptimizerException("Multiple starting blocks")
         case _:
           raise OptimizerException(f"Unknown starting block, {type(first_block)}")
-        
+
       fn_blocks[name] = blocklist
       fn_info[name] = getBlockListVarUse(blocklist)
 
@@ -484,7 +522,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
       poss_callers[callee].add(caller)
     for callee in callees.always_call:
       cert_callers[callee].add(caller)
-  
+
   worklist = deque(fn_info.keys())
   recu_fn_info: dict[str, BlockListInfo] = deepcopy(fn_info)
 
@@ -545,7 +583,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
           changed_but_unread[var_name] = var_dependents, var_value
       for var_name in to_remove:
         del to_elide[var_name]
-      
+
       if not isinstance(block, sb3.EditVar):
         cannot_elide |= use.might_modify
       else:
@@ -558,6 +596,8 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
 
     to_elide.update(changed_but_unread)
 
+    # FUTURE OPTI: This doesn't account for the costs of subelisions, would require a more
+    # complex algorithm to do so
     # Calculate if it is actually faster to elide
     slower_to_elide: set[str] = set()
     for var_name, (_, value) in to_elide.items():
@@ -584,7 +624,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
     # Perform the elision
     fn_blocks[name], did_opti = assignmentElisionBlock(blocklist, {k: v for k, (_, v) in to_elide.items()})
     did_total_opti |= did_opti
-  
+
   proj.code = list(fn_blocks.values())
 
   return proj, did_total_opti
@@ -592,7 +632,7 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
 def optimize(proj: sb3.Project, all_opti: set[Optimisation] | None = None) -> sb3.Project:
   if all_opti is None:
     all_opti = ALL_OPTIMISATIONS
-  
+
   times_optimized = 0
   opti_to_perform = all_opti
   while len(opti_to_perform) > 0 and times_optimized < MAX_OPTIMIZATIONS:

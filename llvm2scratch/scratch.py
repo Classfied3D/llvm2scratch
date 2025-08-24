@@ -3,6 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
+from enum import Enum
 
 import zipfile
 import hashlib
@@ -41,6 +42,7 @@ SHORT_OP_TO_OPCODE = {
   "letter_n_of": "operator_letter_of",
   "length_of": "operator_length",
   "round": "operator_round",
+  "bool_as_int": "operator_round",
   "not": "operator_not",
   "and": "operator_and",
   "or": "operator_or",
@@ -54,6 +56,8 @@ Id = str
 
 @dataclass
 class ScratchConfig:
+  # TODO add an option to replace hacked blocks with a working version that isn't hacked
+  # (since they're used for better performance anyway)
   invis_blocks: bool = False # Prevent blocks from rendering; stops editor lag
 
 @dataclass
@@ -192,6 +196,11 @@ class ScratchContext:
       "blocks": raw_blocks,
     }
 
+class ScratchCast(Enum):
+  """How the block will cast a value. Affects number coercion and boolean casting"""
+  TO_STR = 1
+  TO_INT = 2
+
 class Block:
   def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
@@ -276,7 +285,7 @@ class RawBlock(Block):
 
 class Value:
   """Something that can be in a blocks input e.g. x in Say(x)"""
-  def getRawValue(self, _parent: Id, _ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, _parent: Id, _ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     """Gets the json that can be put in the "inputs" field of a block"""
     raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
 
@@ -295,7 +304,7 @@ class Known(Value):
     else:
       self.known = float(val)
 
-  def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     raw = self.known
     if not isinstance(self.known, str):
       raw = float(raw)
@@ -315,8 +324,8 @@ class KnownBool(Known, BooleanValue):
   def __init__(self, known: bool):
     self.known = known
 
-  def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
-    return Known(int(self.known)).getRawValue(parent, ctx)
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    return Known(int(self.known)).getRawValue(parent, ctx, cast)
 
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     if not self.known:
@@ -333,7 +342,7 @@ class Say(Block):
   value: Value
 
   def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raw_msg, ctx = self.value.getRawValue(my_id, ctx)
+    raw_msg, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
     return {
       "opcode": "looks_say",
       "inputs": {
@@ -355,7 +364,7 @@ class Broadcast(Block):
     id = ctx.addBroadcast(broadcast_name)
 
     if not isinstance(self.value, Known):
-      raw_input_value, ctx = self.value.getRawValue(my_id, ctx)
+      raw_input_value, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
       # So that if the block is removed you get a normal broadcast
       raw_value = [3, raw_input_value[1], [11, broadcast_name, id]]
     else:
@@ -405,7 +414,7 @@ class ControlFlow(Block):
       assert isinstance(self.value, BooleanValue)
       raw_val, ctx = self.value.getRawBoolValue(my_id, ctx)
     else:
-      raw_val, ctx = self.value.getRawValue(my_id, ctx)
+      raw_val, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_INT)
 
     blocks_id = ctx.addBlockList(self.blocks, my_id)
 
@@ -438,7 +447,7 @@ class StopScript(EndBlock):
 class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
-  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     ctx.addBlock(id, RawBlock({
@@ -463,7 +472,7 @@ class EditCounter(Block):
 class GetVar(Value):
   var_name: str
 
-  def getRawValue(self, _: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, _: Id, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id], [10, ""]], ctx
 
@@ -475,7 +484,8 @@ class EditVar(Block):
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
-    raw_val, ctx = self.value.getRawValue(my_id, ctx)
+    # NOTE: technically set variable doesn't cast but we need to assume the worst scenario
+    raw_val, ctx = self.value.getRawValue(my_id, ctx, (ScratchCast.TO_STR if self.op == "set" else ScratchCast.TO_INT))
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": {"VALUE": raw_val},
@@ -496,11 +506,11 @@ class EditList(Block):
     if self.index is not None:
       if self.op in ["addto", "deleteall"]:
         raise ScratchCompException(f"{self.op} does not support an index value")
-      raw_index, ctx = self.index.getRawValue(my_id, ctx)
+      raw_index, ctx = self.index.getRawValue(my_id, ctx, ScratchCast.TO_INT)
       inputs.update({"INDEX": raw_index})
 
     if self.item is not None:
-      raw_item, ctx = self.item.getRawValue(my_id, ctx)
+      raw_item, ctx = self.item.getRawValue(my_id, ctx, ScratchCast.TO_STR)
       if self.op in ["deleteat", "deleteall"]:
         raise ScratchCompException(f"{self.op} does not support an item")
       inputs.update({"ITEM": raw_item})
@@ -517,11 +527,11 @@ class GetOfList(Value):
   list_name: str
   value: Value
 
-  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
     list_id = ctx.addOrGetList(self.list_name)
 
-    raw_value, ctx = self.value.getRawValue(parent, ctx)
+    raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_INT if self.op == "atindex" else ScratchCast.TO_STR))
 
     input_name = "INDEX" if self.op == "atindex" else "ITEM"
 
@@ -534,7 +544,7 @@ class GetOfList(Value):
     return [3, id, [10, ""]], ctx
 
 # Operators
-OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round",
+OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
 @dataclass
 class Op(Value): # TODO: make this be able to use one input
@@ -543,13 +553,17 @@ class Op(Value): # TODO: make this be able to use one input
   right: Value | None = None
 
   def __post_init__(self):
-    takes_one_op = self.op in ["length_of", "round"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
+    takes_one_op = self.op in ["length_of", "round", "bool_as_int"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
     given_one_op = self.right is None
 
     if takes_one_op != given_one_op:
       raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
-  def getRawValue(self, parent: Id, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    # We don't need to round the number if it gets casted to int anyway
+    if self.op == "bool_as_int" and cast == ScratchCast.TO_INT:
+      return self.left.getRawValue(parent, ctx, cast)
+    
     id = genId()
 
     takes_one_op = self.right is None
@@ -574,10 +588,18 @@ class Op(Value): # TODO: make this be able to use one input
 
     opcode = SHORT_OP_TO_OPCODE.setdefault(self.op, "operator_mathop")
 
-    raw_left, ctx = self.left.getRawValue(id, ctx)
+    casts_left_input_to = ScratchCast.TO_INT
+    if self.op in ["join", "length_of"]:
+      casts_left_input_to = ScratchCast.TO_STR
+
+    raw_left, ctx = self.left.getRawValue(id, ctx, casts_left_input_to)
     inputs = {lft_param: raw_left}
     if self.right is not None:
-      raw_right, ctx = self.right.getRawValue(id, ctx)
+      casts_right_input_to = casts_left_input_to
+      if self.op == "letter_n_of":
+        casts_right_input_to = ScratchCast.TO_STR
+
+      raw_right, ctx = self.right.getRawValue(id, ctx, casts_right_input_to)
       inputs.update({rgt_param: raw_right})
 
     fields = {}
@@ -609,7 +631,7 @@ class BoolOp(BooleanValue):
     if takes_one_op != given_one_op:
       raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
-  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     raw_right = None
@@ -620,9 +642,9 @@ class BoolOp(BooleanValue):
         assert isinstance(self.right, BooleanValue)
         raw_right, ctx = self.right.getRawBoolValue(id, ctx)
     else:
-      raw_left, ctx = self.left.getRawValue(id, ctx)
+      raw_left, ctx = self.left.getRawValue(id, ctx, ScratchCast.TO_STR)
       assert self.right is not None
-      raw_right, ctx = self.right.getRawValue(id, ctx)
+      raw_right, ctx = self.right.getRawValue(id, ctx, ScratchCast.TO_STR)
 
     match self.op:
       case "not":
@@ -646,7 +668,7 @@ class BoolOp(BooleanValue):
     return [2, id], ctx
 
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
-    return self.getRawValue(parent, ctx)
+    return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
 
 # Procedures
 @dataclass
@@ -667,7 +689,7 @@ class ProcedureDef(StartBlock):
       param_block_ids.append(param_block_id)
       ctx.addBlock(param_block_id, RawBlock({
         "opcode": "argument_reporter_string_number",
-        "fields": {"VALUE": [param, None]}
+        "fields": {"VALUE": [sanitizeProcName(param, True), None]}
       }), BlockMeta(proto_id))
 
     ctx.addBlock(proto_id, RawBlock({
@@ -676,9 +698,9 @@ class ProcedureDef(StartBlock):
       "mutation": {
         "tagName": "mutation",
         "children": [],
-        "proccode": self.name + (" %s" * len(self.params)),
+        "proccode": sanitizeProcName(self.name, False) + (" %s" * len(self.params)),
         "argumentids": json.dumps(param_ids),
-        "argumentnames": json.dumps([param for param in self.params]),
+        "argumentnames": json.dumps([sanitizeProcName(param, True) for param in self.params]),
         "argumentdefaults": json.dumps(["" for _ in self.params]),
         "warp": json.dumps(self.run_without_refresh)
       }
@@ -697,7 +719,8 @@ class ProcedureCall(LateBlock):
   def getRawLate(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     values = []
     for arg in self.arguments:
-      value, ctx = arg.getRawValue(my_id, ctx)
+      # We don't know how the args will be casted so we assume the worst scenatio
+      value, ctx = arg.getRawValue(my_id, ctx, ScratchCast.TO_STR)
       values.append(value)
 
     param_ids, run_without_refresh = ctx.funcs[self.proc_name]
@@ -708,7 +731,7 @@ class ProcedureCall(LateBlock):
       "mutation": {
         "tagName": "mutation",
         "children": [],
-        "proccode": self.proc_name + (" %s" * len(param_ids)),
+        "proccode": sanitizeProcName(self.proc_name, False) + (" %s" * len(param_ids)),
         "argumentids": json.dumps(param_ids),
         "warp": json.dumps(run_without_refresh)
       }
@@ -718,19 +741,29 @@ class ProcedureCall(LateBlock):
 class GetParameter(Value):
   param_name: str
 
-  def getRawValue(self, parent: str, ctx: ScratchContext) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     ctx.addBlock(id, RawBlock({
       "opcode": "argument_reporter_string_number",
-      "fields": {"VALUE": [self.param_name, None]}
+      "fields": {"VALUE": [sanitizeProcName(self.param_name, True), None]}
     }), BlockMeta(parent))
 
     return [3, id, [10, ""]], ctx
 
+
 class ScratchCompException(Exception):
   """Exception when compiling to scratch"""
   pass
+
+def sanitizeProcName(name: str, is_param: bool) -> str:
+  """Fixes the Bunching Blocks Bug (https://en.scratch-wiki.info/wiki/My_Blocks#Glitches)
+  and the hasOwnProperty bug by replacing % with a similar unicode character when necessary"""
+  if (is_param and name in ["%b", "%n"]) or (not is_param and name == "%"):
+    return name.replace("%", "\uFF05")
+  elif not is_param and name == "hasOwnProperty":
+    return name + ":bro why"
+  return name
 
 def scratchCastToNum(value: Known) -> float:
   """Performs the same casting to number as scratch"""
