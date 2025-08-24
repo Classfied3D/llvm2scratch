@@ -5,7 +5,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Progress
 * 🆕 Stack Allocation, Loading, and Storing (No deallocations yet)
 * 🔢 Integer Operations (Up to 48 bits)
-* ↔️ Functions + Return Values (No recursion support)
+* 🔃 Functions + Return Values (No recursion support)
 * 🔀 Branch + Switch Instructions
 * 🔁 Loops (Which unwind the call stack when necessary)
 * 🔡 Static Variables
