@@ -30,10 +30,10 @@ class Config:
   stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before wiping scratch's call stack via a broadcast
-  
+
   debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
-  
+
   unused_var = "!unused" # Name of the scratch variable for unused values
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_var = "!stack" # Name of the scratch list for the stack list
@@ -75,7 +75,7 @@ class FuncInfo:
 class BlockInfo:
   """Info about a LLVM block"""
   fn: FuncInfo
-  is_scratch_func: bool # If the instruction can access the parameters normally (in the body of a scratch func) 
+  is_scratch_func: bool # If the instruction can access the parameters normally (in the body of a scratch func)
 
 @dataclass
 class ValueAndBlocks:
@@ -391,6 +391,8 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
                                   sb3.Op("add", address, sb3.Known(i)), ival))
 
       return blocks
+    case _:
+      raise CompException("Unmatched")
 
 def transCall(name: str, arguments: list[sb3.Value],
               output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:

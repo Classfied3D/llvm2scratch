@@ -202,7 +202,7 @@ class ScratchCast(Enum):
   TO_INT = 2
 
 class Block:
-  def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
   def isStart(self) -> bool:
@@ -221,10 +221,10 @@ class EndBlock(Block):
 
 class LateBlock(Block):
   """A block which requires info about the whole program to be added e.g. the id of function parameters which might not yet be defined"""
-  def getRaw(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot call getRaw on a LateBlock because it evaluates after other blocks, call getRawLate")
 
-  def getRawLate(self, _my_id: Id, _ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRawLate(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'LateBlock'; must be a derived class")
 
 @dataclass
@@ -280,18 +280,18 @@ class BlockList:
 class RawBlock(Block):
   contents: dict
 
-  def getRaw(self, _: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return self.contents, ctx
 
 class Value:
   """Something that can be in a blocks input e.g. x in Say(x)"""
-  def getRawValue(self, _parent: Id, _ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     """Gets the json that can be put in the "inputs" field of a block"""
     raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
 
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
-  def getRawBoolValue(self, _parent: str, _ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
+  def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'BooleanValue'; must be a derived class")
 
 class Known(Value):
@@ -304,7 +304,7 @@ class Known(Value):
     else:
       self.known = float(val)
 
-  def getRawValue(self, parent: Id, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     raw = self.known
     if not isinstance(self.known, str):
       raw = float(raw)
@@ -319,8 +319,6 @@ class Known(Value):
       return self.known
 
 class KnownBool(Known, BooleanValue):
-  known: bool
-
   def __init__(self, known: bool):
     self.known = known
 
@@ -379,7 +377,7 @@ class Broadcast(Block):
 class OnBroadcast(StartBlock):
   name: str
 
-  def getRaw(self, _my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     id = ctx.addBroadcast(self.name)
 
     return {
@@ -389,7 +387,7 @@ class OnBroadcast(StartBlock):
 
 # Control
 class OnStartFlag(StartBlock):
-  def getRaw(self, _my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return {
       "opcode": "event_whenflagclicked"
     }, ctx
@@ -437,7 +435,7 @@ class ControlFlow(Block):
 class StopScript(EndBlock):
   op: Literal["stopthis", "stopall"]
 
-  def getRaw(self, _my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return {
       "opcode": "control_stop",
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
@@ -447,7 +445,7 @@ class StopScript(EndBlock):
 class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
-  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     ctx.addBlock(id, RawBlock({
@@ -462,7 +460,7 @@ class EditCounter(Block):
 
   op: Literal["incr", "clear"]
 
-  def getRaw(self, _my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return {
       "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
@@ -472,7 +470,7 @@ class EditCounter(Block):
 class GetVar(Value):
   var_name: str
 
-  def getRawValue(self, _: Id, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id], [10, ""]], ctx
 
@@ -527,7 +525,7 @@ class GetOfList(Value):
   list_name: str
   value: Value
 
-  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
     list_id = ctx.addOrGetList(self.list_name)
 
@@ -563,7 +561,7 @@ class Op(Value): # TODO: make this be able to use one input
     # We don't need to round the number if it gets casted to int anyway
     if self.op == "bool_as_int" and cast == ScratchCast.TO_INT:
       return self.left.getRawValue(parent, ctx, cast)
-    
+
     id = genId()
 
     takes_one_op = self.right is None
@@ -631,7 +629,7 @@ class BoolOp(BooleanValue):
     if takes_one_op != given_one_op:
       raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
-  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     raw_right = None
@@ -741,7 +739,7 @@ class ProcedureCall(LateBlock):
 class GetParameter(Value):
   param_name: str
 
-  def getRawValue(self, parent: str, ctx: ScratchContext, _cast: ScratchCast) -> tuple[list, ScratchContext]:
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = genId()
 
     ctx.addBlock(id, RawBlock({

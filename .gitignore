@@ -9,3 +9,4 @@ examples/input/main.ll
 examples/debug_branch_info.txt
 poetry.lock
 pyrightconfig.json
+pyrefly.toml
