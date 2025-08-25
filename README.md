@@ -39,7 +39,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 * Scratch uses JS' Number which can store a maximum of [2 ^ 53 - 1](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER) before the accuracy is less than 1
 * This means 32 bit multiplication `(2^32 * 2^32) mod 2^32` does not give the correct result because the number calculated is 2^64 which is not accurate enough (it works with up to 26-bit integers)
 * To resolve this the following maths is used:
-  * Assuming `a`, `a0`, `b1`, `b,` `b0` and `b1` are positive 32-bit integers
+  * Assuming `a`, `a0`, `b1`, `b`, `b0` and `b1` are positive 32-bit integers
   * Assuming `a0` and `b0` are less than `2^16` (always possible with a 32-bit `a` and `b`)
   * Where `a = a1 * 2^16 + a0`
   * And `b = b1 * 2^16 + b0`
@@ -53,7 +53,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
   * It can be generalised for n bits as
   * `((a0b1 + b0a1) * 2^floor(n/2) + a0b0) mod 2^n`
   * We can calculate `a0 = a % mod 2^floor(n/2)`, `a1 = a // 2^floor(n/2)`, etc
-  * This works with up to 36 bits, after which it can be rewritten as
+  * This works with up to 34 bits, after which it can be rewritten as
   * `(((a0b1 + b0a1) mod (2^n / 2^floor(n/2))) * 2^floor(n/2) + a0b0) mod 2^n`
   * or `(((a0b1 + b0a1) mod 2^ceil(n/2)) * 2^floor(n/2) + a0b0) mod 2^n`
 

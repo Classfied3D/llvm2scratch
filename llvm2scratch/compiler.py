@@ -14,6 +14,8 @@ from . import scratch as sb3
 from . import optimizer
 from . import util
 
+VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum because while scratch's doubles support
+                       # up to 53 bits, some operations require extra precision
 SCRATCH_LIST_LIMIT = 200_000
 
 @dataclass
@@ -27,7 +29,7 @@ class Config:
   """Config options to pass to the compiler"""
   opti: bool = True # If optimisations for scratch should be applied
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
-  stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is 48 bits), max 200,000
+  stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before wiping scratch's call stack via a broadcast
 
@@ -123,7 +125,7 @@ def getByteSize(ty: ir.Type) -> int:
   match ty:
     case ir.IntegerType():
       # Scratch's fp variables can store < 52 bits per variable accurately
-      return math.ceil(ty.num_bits / 48)
+      return math.ceil(ty.num_bits / VARIABLE_MAX_BITS)
     case ir.ArrayType():
       return ty.elem_count * getByteSize(ty.elem_ty)
     case ir.PtrType():
@@ -147,7 +149,7 @@ def decodeValue(val: ir.value.Value,
         raise CompException(f"Expected {val} to be an integer, got type {type(val.ty)}")
 
       # TODO FIX: allow different sizes with val.ty
-      if val.ty.num_bits > 48: raise CompException(f">48 bits not yet supported, got {val.ty.num_bits}")
+      if val.ty.num_bits > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not yet supported, got {val.ty.num_bits}")
 
       # Calculate the two's complement version of the number
       num = val.val
@@ -271,7 +273,7 @@ def bitShift(direction: Literal["left", "right"],
     return sb3.Op("floor", unwrapped), ctx
 
 def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
-  if width > 48:
+  if width > VARIABLE_MAX_BITS:
     raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
 
   return sb3.Op("mul", left, right) # Overflow is UB - we don't care if
@@ -282,43 +284,56 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) ->
   # known info could be propagated
   # TODO OPTI: if multipling by a power of 2, there is no risk that the mantissa cannot store
   # enough to be accurate, since only the exponent changes
+  if width > VARIABLE_MAX_BITS:
+    raise CompException(f"Multipling {width} bits not supported")
+
   if width <= 26: # Safe: (2**26) ** 2 < 9007199254740991
     return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
-  elif width <= 36: # Safe: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
+  elif width <= 50: # Safe (with extra mod step): 2**25 * 2**25 + 2**25 * 2**25 < 9007199254740991
     blocks = sb3.BlockList()
-    left, lblocks = astuple(optimizeValueUse(left, 2, ctx))
-    right, rblocks = astuple(optimizeValueUse(right, 2, ctx))
+    left, lblocks = astuple(optimizeValueUse(left, 3, ctx))
+    right, rblocks = astuple(optimizeValueUse(right, 3, ctx))
     blocks.add(lblocks)
     blocks.add(rblocks)
 
     # Use some maths to do the calculation (see README for explaination)
     half_width = width // 2
-    a0 = genTempVar(ctx)
-    b0 = genTempVar(ctx)
-    blocks.add([
-      sb3.EditVar("set", a0, sb3.Op("mod", left, sb3.Known(2 ** half_width))),
-      sb3.EditVar("set", b0, sb3.Op("mod", right, sb3.Known(2 ** half_width)))
-    ])
+    a0 = sb3.Op("mod", left, sb3.Known(2 ** half_width))
+    b0 = sb3.Op("mod", right, sb3.Known(2 ** half_width))
+
+    a0, a0blocks = astuple(optimizeValueUse(a0, 2, ctx))
+    b0, b0blocks = astuple(optimizeValueUse(b0, 2, ctx))
+    blocks.add(a0blocks)
+    blocks.add(b0blocks)
+
+    a0b1_plus_b0a1 = sb3.Op("add",
+      sb3.Op("mul",
+        a0,
+        sb3.Op("floor", sb3.Op("div", right, sb3.Known(2 ** half_width)))
+      ),
+      sb3.Op("mul",
+        b0,
+        sb3.Op("floor", sb3.Op("div", left, sb3.Known(2 ** half_width)))
+      ),
+    )
+
+    # 34 bits or less: no mod step needed: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
+    # 50 bits or less: mod step is safe:   2**25 * 2**25 + 2**25 * 2**25 < 9007199254740991
+    extra_mod_step = width > 34
+    if extra_mod_step:
+      a0b1_plus_b0a1 = sb3.Op("mod", a0b1_plus_b0a1, sb3.Known(2 ** math.ceil(width / 2)))
+
     value = sb3.Op("mod",
       sb3.Op("add",
         sb3.Op("mul",
-          sb3.Op("add", # TODO FIX: modding this number by 2^(width/half_width) for width > 36
-            sb3.Op("mul",
-              sb3.GetVar(a0),
-              sb3.Op("floor", sb3.Op("div", right, sb3.Known(2 ** half_width)))
-            ),
-            sb3.Op("mul",
-              sb3.GetVar(b0),
-              sb3.Op("floor", sb3.Op("div", left, sb3.Known(2 ** half_width)))
-            ),
-          ),
+          a0b1_plus_b0a1,
           sb3.Known(2 ** half_width)),
-        sb3.Op("mul", sb3.GetVar(a0), sb3.GetVar(b0))
+        sb3.Op("mul", a0, b0)
       ),
       sb3.Known(2 ** width))
     return ValueAndBlocks(value, blocks)
   else:
-    raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
+    raise CompException(f"Multipling {width} bits is not supported")
 
 def binarySearch(value: sb3.Value,
                  branches: OrderedDict[int, sb3.BlockList],
@@ -470,8 +485,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values by using multiple vars and carrying
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
@@ -499,8 +514,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           # Division by zero is UB
           if not instr.is_exact:
@@ -514,8 +529,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           width = instr.fst_operand.ty.num_bits
 
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_exact:
             signed_left, lblocks = astuple(undoTwosComplement(width, left, False, ctx))
@@ -577,8 +592,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           # mod 0 is UB, can ignore
           res_val = sb3.Op("mod", left, right)
@@ -590,8 +605,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if res_var is not None:
             # TODO: Reuse if statement to work out if a / b > 0
@@ -668,8 +683,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not (instr.is_nsw and instr.is_nuw)
           res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
@@ -680,8 +695,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not instr.is_exact
           res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
@@ -692,8 +707,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if res_var is not None:
             point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
@@ -723,8 +738,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
-          if width > 48:
-            raise CompException(f"Instruction {instr} currently supports integers with <= 48 bits")
+          if width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.opcode == "or" and instr.is_disjoint:
             # If there would be no carry
@@ -799,8 +814,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
       width = instr.fst_operand.ty.num_bits
       # TODO FIX: support larger values
-      if width > 48:
-        raise CompException(f"Instruction icmp currently supports integers with <= 48 bits")
+      if width > VARIABLE_MAX_BITS:
+        raise CompException(f"Instruction icmp currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
       # TODO FIX: boolean values 'true' or 'false' could potentially create issues, use a new class called BoolIntCast
       match instr.cond:
@@ -832,8 +847,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
       width = instr.value.ty.num_bits
       # TODO FIX: support larger values
-      if width > 48:
-        raise CompException(f"Instruction icmp currently supports integers with <= 48 bits")
+      if width > VARIABLE_MAX_BITS:
+        raise CompException(f"Instruction icmp currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
       res_val = None
 
@@ -964,7 +979,7 @@ def transTerminatorInstr(instr: ir.Instruction,
       assert isinstance(instr.cond.ty, ir.IntegerType)
       width = instr.cond.ty.num_bits
       if getByteSize(instr.cond.ty) > 1:
-        raise CompException("Cannot currently switch with an integer more than 48 bits (would take multiple vars to store)")
+        raise CompException("Cannot currently switch with an integer more than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
 
       val, val_blocks = astuple(decodeValue(instr.cond, ctx, bctx))
       blocks.add(val_blocks)
