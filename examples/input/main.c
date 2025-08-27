@@ -18,6 +18,11 @@ int test_branch(int num) {
   return a + num;
 }
 
+int factorial_recurse(int n) {
+  if (n == 1) return 1;
+  return factorial_recurse(n - 1) * n;
+}
+
 int main(void) {
   puts("hello world");
   a += 2;
@@ -63,6 +68,8 @@ int main(void) {
       puts("default");
       break;
   }
+
+  int f = factorial_recurse(10);
 
   return 0;
 }

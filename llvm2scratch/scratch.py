@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, NamedTuple
 from enum import Enum
+import attr
 
 import zipfile
 import hashlib
@@ -54,8 +55,7 @@ SHORT_OP_TO_OPCODE = {
 
 Id = str
 
-@dataclass
-class ScratchConfig:
+class ScratchConfig(NamedTuple):
   # TODO add an option to replace hacked blocks with a working version that isn't hacked
   # (since they're used for better performance anyway)
   invis_blocks: bool = False # Prevent blocks from rendering; stops editor lag
@@ -64,7 +64,7 @@ class ScratchConfig:
 class Project:
   cfg: ScratchConfig
   code: list[BlockList] = field(default_factory=list)
-  lists: dict[str, list[Known]] = field(default_factory=dict)
+  lists: dict[str, list[int | float | str | bool]] = field(default_factory=dict)
 
   def export(self, filename: str) -> None:
     """Exports the project into a .sprite3 file"""
@@ -83,7 +83,7 @@ class Project:
 class ScratchContext:
   cfg: ScratchConfig = field(default_factory=ScratchConfig)
   vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
-  lists: dict[str, tuple[Id, list[Known]]] = field(default_factory=dict)
+  lists: dict[str, tuple[Id, list[int | float | str | bool]]] = field(default_factory=dict)
   broadcasts: dict[str, Id] = field(default_factory=dict)
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
@@ -135,7 +135,7 @@ class ScratchContext:
       id = self.vars[var_name][0]
     return id
 
-  def addOrGetList(self, list_name: str, default_val: list[Known] | None = None) -> Id:
+  def addOrGetList(self, list_name: str, default_val: list[int | float | str | bool] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
       id = genId()
@@ -176,9 +176,9 @@ class ScratchContext:
 
     raw_lists = {}
     for name, (id, values) in self.lists.items():
-      raw_lists.update({
-        id: [name, [value.getRawVarInit() for value in values]]
-      })
+      raw_lists[id] = [
+        name,
+        ["true" if v is True else "false" if v is False else v for v in values]]
 
     raw_broadcasts = {}
     for name, id in self.broadcasts.items():
@@ -201,7 +201,8 @@ class ScratchCast(Enum):
   TO_STR = 1
   TO_INT = 2
 
-class Block:
+@attr.s(slots=True, auto_attribs=True)
+class Block():
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
@@ -276,7 +277,7 @@ class BlockList:
   def __len__(self):
     return len(self.blocks)
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class RawBlock(Block):
   contents: dict
 
@@ -335,7 +336,7 @@ class KnownBool(Known, BooleanValue):
     return "true" if self.known else "false"
 
 # Looks
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class Say(Block):
   value: Value
 
@@ -350,7 +351,7 @@ class Say(Block):
 
 # Events
 # Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class Broadcast(Block):
   value: Value
   wait: bool
@@ -373,7 +374,7 @@ class Broadcast(Block):
       "inputs": {"BROADCAST_INPUT": raw_value},
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class OnBroadcast(StartBlock):
   name: str
 
@@ -393,7 +394,7 @@ class OnStartFlag(StartBlock):
     }, ctx
 
 FlowOp = Literal["if", "if_else", "reptimes", "until", "while"]
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class ControlFlow(Block):
   op: FlowOp
   value: Value
@@ -431,7 +432,7 @@ class ControlFlow(Block):
       "inputs": inputs
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class StopScript(EndBlock):
   op: Literal["stopthis", "stopall"]
 
@@ -441,7 +442,7 @@ class StopScript(EndBlock):
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
@@ -454,7 +455,7 @@ class GetCounter(Value):
 
     return [3, id, [10, ""]], ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class EditCounter(Block):
   """Increment/Assign zero to the special 'hacked' counter block"""
 
@@ -466,7 +467,7 @@ class EditCounter(Block):
     }, ctx
 
 # Variables
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class GetVar(Value):
   var_name: str
 
@@ -474,7 +475,7 @@ class GetVar(Value):
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id], [10, ""]], ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class EditVar(Block):
   op: Literal["set", "change"]
   var_name: str
@@ -490,7 +491,7 @@ class EditVar(Block):
       "fields": {"VARIABLE": [self.var_name, id]}
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class EditList(Block):
   op: Literal["addto", "replaceat", "insertat", "deleteat", "deleteall"]
   list_name: str
@@ -519,7 +520,7 @@ class EditList(Block):
       "fields": {"LIST": [self.list_name, list_id]},
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class GetOfList(Value):
   op: Literal["atindex", "indexof"]
   list_name: str
@@ -544,7 +545,7 @@ class GetOfList(Value):
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class Op(Value): # TODO: make this be able to use one input
   op: OperatorsCodes
   left: Value
@@ -613,7 +614,7 @@ class Op(Value): # TODO: make this be able to use one input
     return [3, id, [10, ""]], ctx
 
 BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class BoolOp(BooleanValue):
   op: BoolOpCodes
   left: Value
@@ -669,7 +670,7 @@ class BoolOp(BooleanValue):
     return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
 
 # Procedures
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class ProcedureDef(StartBlock):
   name: str
   params: list[str]
@@ -709,7 +710,7 @@ class ProcedureDef(StartBlock):
       "inputs": {"custom_block": [1, proto_id]}
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class ProcedureCall(LateBlock):
   proc_name: str
   arguments: list[Value]
@@ -735,7 +736,7 @@ class ProcedureCall(LateBlock):
       }
     }, ctx
 
-@dataclass
+@attr.s(slots=True, auto_attribs=True)
 class GetParameter(Value):
   param_name: str
 
@@ -832,7 +833,7 @@ def exportSpriteData(ctx: ScratchContext) -> str:
   return json.dumps(res)
 
 def exportScratchFile(ctx: ScratchContext, file: str) -> None:
-  """Exports scratch code to """
+  """Exports scratch code to a .sprite3 file"""
   with zipfile.ZipFile(file, "w") as zipf:
     zipf.writestr("Sprite/sprite.json", exportSpriteData(ctx))
     zipf.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)

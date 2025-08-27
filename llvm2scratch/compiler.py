@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
 from collections import OrderedDict, defaultdict
-from typing import Literal
+from typing import Literal, Callable
 
 from llvm2py import parse_assembly
 from llvm2py import ir
@@ -14,7 +14,7 @@ from . import scratch as sb3
 from . import optimizer
 from . import util
 
-VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum because while scratch's doubles support
+VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
                        # up to 53 bits, some operations require extra precision
 SCRATCH_LIST_LIMIT = 200_000
 
@@ -240,7 +240,7 @@ def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[
   if name not in ctx.proj.lists or size > len(ctx.proj.lists[name]):
     pow2_lookup = []
     for x in range(int(is_one_indexed) + size):
-      pow2_lookup.append(sb3.Known(2 ** x))
+      pow2_lookup.append(2 ** x)
     ctx.proj.lists[name] = pow2_lookup
   return name, ctx
 
@@ -780,7 +780,6 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             res_val = sb3.Op("add", left, right)
           else:
             # TODO OPTI: gen (11-bit) tables/use mod for known values
-
             if width > ctx.cfg.binop_lookup_bits:
               uses = width / ctx.cfg.binop_lookup_bits
               left, lblocks = astuple(optimizeValueUse(left, uses, ctx))
@@ -790,11 +789,18 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
             lookup_size = 2 ** ctx.cfg.binop_lookup_bits
             name = f"{ctx.cfg.binop_lookup_var} {instr.opcode}{ctx.cfg.zero_indexed_suffix}"
-            lookup = []
-            for l in range(0, lookup_size):
-              for r in range(0, lookup_size):
-                lookup.append(sb3.Known({"and": l & r, "or": l | r, "xor": l ^ r}[instr.opcode]))
-            ctx.proj.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
+
+            if name not in ctx.proj.lists:
+              lookup: list[int | float | str | bool] = []
+              if instr.opcode == "and":
+                lookup = [l & r for l in range(lookup_size) for r in range(lookup_size)]
+              elif instr.opcode == "or":
+                lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
+              elif instr.opcode == "xor":
+                lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
+              else:
+                raise CompException(f"Unknown opcode {instr.opcode}")
+              ctx.proj.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
 
             results = []
             for offset in range(0, width, ctx.cfg.binop_lookup_bits):
@@ -1300,8 +1306,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         if isinstance(instr, ir.Call): # Call instructions handled here because might need to return at an address
           callee_name = instr.callee.val
           assert isinstance(callee_name, str)
+          callee_info = ctx.fn_info[callee_name]
 
-          # TODO FIX: in llvm getElementPtr is used but seems to be ignored in this code
           arguments: list[sb3.Value] = []
           for arg in instr.args:
             value = decodeValue(arg, ctx, bctx)
@@ -1312,7 +1318,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
           output = decodeVar(instr.result, bctx)
 
-          callee_info = ctx.fn_info[callee_name]
           callee_returns_to_address = callee_info.returns_to_address
 
           if callee_returns_to_address:
@@ -1455,9 +1460,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
   for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
     char = chr(x)
     if char.encode("unicode_escape").decode("ascii").startswith("\\") and char != "\\":
-      ascii_lookup.append(sb3.Known(f"\\{x:02X}"))
+      ascii_lookup.append(f"\\{x:02X}")
     else:
-      ascii_lookup.append(sb3.Known(char))
+      ascii_lookup.append(char)
   ctx.proj.lists[cfg.ascii_lookup_var + cfg.zero_indexed_suffix] = ascii_lookup
 
   ctx = addFunc("puts", ["input"], 0, sb3.BlockList([

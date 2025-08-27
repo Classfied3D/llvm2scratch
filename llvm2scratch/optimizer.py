@@ -293,14 +293,20 @@ def knownValuePropagation(proj: sb3.Project) -> tuple[sb3.Project, bool]:
   proj.code = new_code
   return proj, did_total_opti
 
+_value_varuse_cache: dict[int, tuple[set[str], Counter[str]]] = {}
+
 def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
   """Returns what variable a value depends upon and how many times a var is used"""
+  key = id(value)
+  if key in _value_varuse_cache:
+    return _value_varuse_cache[key]
+
   match value:
     case sb3.Known() | sb3.GetParameter():
-      return set(), Counter()
+      result = set(), Counter()
     case sb3.GetVar():
       name = "var:" + value.var_name
-      return {name}, Counter({name: 1})
+      result = {name}, Counter({name: 1})
     case sb3.GetCounter():
       return {"counter:"}, Counter()
     case sb3.Op() | sb3.BoolOp():
@@ -309,12 +315,15 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
         new_depends, new_counts = getValueVarUse(value.right)
         depends.update(new_depends)
         counts += new_counts
-      return depends, counts
+      result = depends, counts
     case sb3.GetOfList():
       use, counts = getValueVarUse(value.value)
-      return {"list:" + value.list_name} | use, counts
+      result = {"list:" + value.list_name} | use, counts
     case _:
       raise OptimizerException(f"Unknown value type {type(value)}")
+
+  _value_varuse_cache[key] = result
+  return result
 
 def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListInfo] | None=None,
   ignore_external_change: set[str] | None=None) -> BlockListInfo:
@@ -459,23 +468,28 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
     case sb3.Known() | sb3.GetParameter() | sb3.GetCounter():
-      return value, False
+      result = value
+      did_opti = False
     case sb3.GetVar():
       name = "var:" + value.var_name
       if name in to_elide:
         return to_elide[name], True
-      return value, False
+      result = value
+      did_opti = False
     case sb3.Op() | sb3.BoolOp():
       value.left, did_opti = assignmentElisionValue(value.left, to_elide)
       if value.right is not None:
         value.right, did_opti_right = assignmentElisionValue(value.right, to_elide)
         did_opti |= did_opti_right
-      return value, did_opti
+      result = value
     case sb3.GetOfList():
       value.value, did_opti = assignmentElisionValue(value.value, to_elide)
-      return value, did_opti
+      result = value
     case _:
       raise OptimizerException(f"Unknown value type {type(value)}")
+  if did_opti and id(value) in _value_varuse_cache:
+    del _value_varuse_cache[id(value)]
+  return result, did_opti
 
 def assignmentElisionBlock(blocklist: sb3.BlockList, to_elide: dict[str, sb3.Value]) -> tuple[sb3.BlockList, bool]:
   did_opti = False
@@ -507,6 +521,8 @@ def assignmentElision(proj: sb3.Project, ignore_external_change: set[str] | None
   """Optimise a code block by removing variable assignments which only lead to one read.
   Ignore external change: a set of variables in which even though might be modified outside
   the function lead to no overall change (e.g. current stack size)."""
+  _value_varuse_cache.clear()
+
   if ignore_external_change is None:
     ignore_external_change = set()
   else:
