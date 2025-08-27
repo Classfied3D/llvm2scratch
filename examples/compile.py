@@ -10,5 +10,5 @@ subprocess.run(["clang", "-S", "-m32", "-O0", "-emit-llvm", "main.c"],
                cwd=os.path.join(script_dir, "input"))
 
 with open("input/main.ll", "r") as file:
-  proj, _ = llvm2scratch.compile(file.read())
+  proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(opti=True))
   proj.export("output/out.sprite3")

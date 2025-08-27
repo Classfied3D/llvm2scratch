@@ -3,7 +3,7 @@
 An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
 
 ## Progress
-* 🆕 Stack Allocation, Loading, and Storing (No deallocations yet)
+* 🆕 Stack Allocation, Deallocation, Loading + Storing
 * 🔢 Integer Operations (Up to 48 bits)
 * 🔃 Functions + Return Values (No recursion support)
 * 🔀 Branch + Switch Instructions
@@ -63,6 +63,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 * Opti: For checked branch functions, find each path of recursion then only check if the counter > max recursions for one branch in each path (otherwise just increment the counter). Sort branches most used in each trail and add the highest each time.
 * Opti: unused param elision
 * Opti: known list (lookup table) progagation
+* Opti: (boolasint<not<cond>>) -> (1 - <cond>) (do this in scratch.py so that it doesn't interfere with other optimizations)
 * Opti: remove Repeat(Known(1))
 * Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
 * Opti: `set a (a + n)` -> `change a by n`

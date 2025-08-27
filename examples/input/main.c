@@ -6,7 +6,11 @@ int add_one(int num) {
   return num + 1;
 }
 
+void do_nothing() {}
+
 int test_branch(int num) {
+  do_nothing();
+
   int a = 3;
 
   if (num != 1) a = 50;

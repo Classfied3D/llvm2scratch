@@ -50,7 +50,7 @@ class BlockListInfo:
   always_modify: set[str] # What the blocklist definitely modifies
   dependent: set[str] # What variables the blocklist might depend on
   might_call: set[str] # What the function might call
-  always_call: set[str] # What the function always calls
+  always_call: set[str] # What the function always calls
   use_counts: Counter[str] = field(default_factory=Counter)
 
 def getInputs(block: sb3.Block) -> list[sb3.Value]:
@@ -316,9 +316,15 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
     case _:
       raise OptimizerException(f"Unknown value type {type(value)}")
 
-def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListInfo] | None=None) -> BlockListInfo:
-  """Returns what a block list sometimes modifies, always modifies and depends on"""
+def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListInfo] | None=None,
+  ignore_external_change: set[str] | None=None) -> BlockListInfo:
+  """Returns what a block list sometimes modifies, always modifies and depends on.
+  Ignore external change: a set of variables in which even though might be modified outside
+  the function lead to no overall change (e.g. current stack size)."""
   info = BlockListInfo(set(), set(), set(), set(), set())
+
+  if ignore_external_change is None:
+    ignore_external_change = set()
 
   for block in blocklist.blocks:
     # Work out what any values used depend on
@@ -366,8 +372,8 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         if func_info is not None:
           callee_info = func_info[name]
           info.dependent |= callee_info.dependent - info.always_modify
-          info.might_modify |= callee_info.might_modify
-          info.always_modify |= callee_info.always_modify
+          info.might_modify |= callee_info.might_modify - ignore_external_change
+          info.always_modify |= callee_info.always_modify - ignore_external_change
           info.use_counts += callee_info.use_counts
       case sb3.ControlFlow():
         match block.op:
@@ -497,8 +503,15 @@ def assignmentElisionBlock(blocklist: sb3.BlockList, to_elide: dict[str, sb3.Val
 
   return new_blocklist, did_opti
 
-def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
-  """Optimise a code block by removing variable assignments which only lead to one read"""
+def assignmentElision(proj: sb3.Project, ignore_external_change: set[str] | None = None) -> tuple[sb3.Project, bool]:
+  """Optimise a code block by removing variable assignments which only lead to one read.
+  Ignore external change: a set of variables in which even though might be modified outside
+  the function lead to no overall change (e.g. current stack size)."""
+  if ignore_external_change is None:
+    ignore_external_change = set()
+  else:
+    ignore_external_change = {"var:" + var_name for var_name in ignore_external_change}
+
   did_total_opti = False
 
   fn_blocks: dict[str, sb3.BlockList] = {}
@@ -552,86 +565,89 @@ def assignmentElision(proj: sb3.Project) -> tuple[sb3.Project, bool]:
       for caller in poss_callers[name]:
         worklist.append(caller)
 
-  for name, blocklist in list(fn_blocks.items()):
-    # Find every variable that isn't used elsewhere
-    cannot_elide: set[str] = set()
-    for other_name, other_info in fn_info.items():
-      # FUTURE OPTI: across function value elison - would require working out where each function returns
-      if other_name != name:
-        cannot_elide |= other_info.might_modify | other_info.always_call | other_info.dependent
+  for name, blocklist in fn_blocks.items():
+    # Perform the elisions
+    did_elide = True
+    while did_elide:
+      did_elide = False
 
-    # Each variable that could be elided and its dependents
-    to_elide: dict[str, tuple[set[str], sb3.Value]] = {}
-    # A variable's dependents might have changed but it can still be elided if not read after this
-    changed_but_unread: dict[str, tuple[set[str], sb3.Value]] = {}
+      # Find every variable that isn't used elsewhere
+      cannot_elide: set[str] = set()
+      for other_name, other_info in fn_info.items():
+        # FUTURE OPTI: across function value elison - would require working out where each function returns
+        if other_name != name:
+          cannot_elide |= other_info.might_modify | other_info.always_call | other_info.dependent
 
-    var_use_counts: Counter[str] = Counter()
+      # Each variable that could be elided and its dependents
+      to_elide: dict[str, tuple[set[str], sb3.Value]] = {}
+      # A variable's dependents might have changed but it can still be elided if not read after this
+      changed_but_unread: dict[str, tuple[set[str], sb3.Value]] = {}
 
-    # Figure out what can be elided
-    for block in blocklist.blocks:
-      use = getBlockListVarUse(sb3.BlockList([block]), recu_fn_info)
-      var_use_counts += use.use_counts
+      var_use_counts: Counter[str] = Counter()
 
-      to_remove = []
-      for var_name in changed_but_unread.keys():
-        if var_name in use.dependent:
-          to_remove.append(var_name)
-      for var_name in to_remove:
-        del changed_but_unread[var_name]
+      for block in blocklist.blocks:
+        use = getBlockListVarUse(sb3.BlockList([block]), recu_fn_info, ignore_external_change)
+        var_use_counts += use.use_counts
 
-      to_remove = []
-      for var_name, (var_dependents, var_value) in to_elide.items():
-        if var_name in use.might_modify:
-          to_remove.append(var_name)
-        elif bool(use.might_modify & var_dependents):
-          # If any of the variables are changed
-          to_remove.append(var_name)
-          changed_but_unread[var_name] = var_dependents, var_value
-      for var_name in to_remove:
+        to_remove = []
+        for var_name in changed_but_unread.keys():
+          if var_name in use.dependent:
+            to_remove.append(var_name)
+        for var_name in to_remove:
+          del changed_but_unread[var_name]
+
+        to_remove = []
+        for var_name, (var_dependents, var_value) in to_elide.items():
+          if var_name in use.might_modify:
+            to_remove.append(var_name)
+          elif bool(use.might_modify & var_dependents):
+            # If any of the variables are changed
+            to_remove.append(var_name)
+            changed_but_unread[var_name] = var_dependents, var_value
+        for var_name in to_remove:
+          del to_elide[var_name]
+
+        if not isinstance(block, sb3.EditVar):
+          cannot_elide |= use.might_modify
+        else:
+          var_name = "var:" + block.var_name
+          depends_on, _ = getValueVarUse(block.value)
+          if block.op == "set" and var_name not in (depends_on | cannot_elide):
+            to_elide[var_name] = depends_on, block.value
+          # Don't elide if overwritten
+          cannot_elide.add(var_name)
+
+      to_elide.update(changed_but_unread)
+
+      # Calculate if it is actually faster to elide
+      slower_to_elide: set[str] = set()
+      for var_name, (_, value) in to_elide.items():
+        if not shouldElide(value, var_use_counts.get(var_name, 0)):
+          slower_to_elide.add(var_name)
+      for var_name in slower_to_elide:
         del to_elide[var_name]
 
-      if not isinstance(block, sb3.EditVar):
-        cannot_elide |= use.might_modify
+      # Perform one elision at a time - otherwise issues can be created where
+      # the dependencies of sub-elisions are not respected
+      if len(to_elide) > 0:
+        single_elision_key = list(to_elide.keys())[0]
+        single_elision = {single_elision_key: to_elide[single_elision_key][1]}
       else:
-        var_name = "var:" + block.var_name
-        depends_on, _ = getValueVarUse(block.value)
-        if block.op == "set" and var_name not in (depends_on | cannot_elide):
-          to_elide[var_name] = depends_on, block.value
-        # Don't elide if overwritten
-        cannot_elide.add(var_name)
+        single_elision = {}
 
-    to_elide.update(changed_but_unread)
-
-    # FUTURE OPTI: This doesn't account for the costs of subelisions, would require a more
-    # complex algorithm to do so
-    # Calculate if it is actually faster to elide
-    slower_to_elide: set[str] = set()
-    for var_name, (_, value) in to_elide.items():
-      if not shouldElide(value, var_use_counts.get(var_name, 0)):
-        slower_to_elide.add(var_name)
-    for var_name in slower_to_elide:
-      del to_elide[var_name]
-
-    # Apply elisions to elision values
-    total_was_subelision_made = True
-    while total_was_subelision_made:
-      total_was_subelision_made = False
-      for var_name, (depends, value) in list(to_elide.items()):
-        # We don't care if an optimisation was made if it was never used - used elided values set
-        # did_opti to true anyway
-        new_value, was_subelision_made = assignmentElisionValue(value, {k: v for k, (_, v) in to_elide.items()})
-        to_elide[var_name] = depends, new_value
-        total_was_subelision_made |= was_subelision_made
-
-    # Perform the elision
-    fn_blocks[name], did_opti = assignmentElisionBlock(blocklist, {k: v for k, (_, v) in to_elide.items()})
-    did_total_opti |= did_opti
+      # Perform the elision
+      blocklist, did_elide = assignmentElisionBlock(blocklist, single_elision)
+      did_total_opti |= did_elide
+    fn_blocks[name] = blocklist
 
   proj.code = list(fn_blocks.values())
 
   return proj, did_total_opti
 
-def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None) -> sb3.Project:
+def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None, ignore_external_change: set[str] | None = None) -> sb3.Project:
+  """Perform various optimizations (definied in all_opti) on a project.
+  Ignore external change: a set of variables in which even though might be modified outside
+  the function lead to no overall change (e.g. current stack size)."""
   if all_opti is None:
     all_opti = ALL_OPTIMIZATIONS
 
@@ -641,7 +657,7 @@ def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None) -> sb
     current_opti = opti_to_perform.pop()
     match current_opti:
       case Optimization.ASSIGNMENT_ELISION:
-        proj, did_opti = assignmentElision(proj)
+        proj, did_opti = assignmentElision(proj, ignore_external_change)
       case Optimization.KNOWN_VALUE_PROPAGATION:
         proj, did_opti = knownValuePropagation(proj)
       case _:
