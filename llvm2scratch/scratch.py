@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, NamedTuple
 from enum import Enum
-import attr
 
 import zipfile
 import hashlib
@@ -201,7 +200,7 @@ class ScratchCast(Enum):
   TO_STR = 1
   TO_INT = 2
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class Block():
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
@@ -277,7 +276,7 @@ class BlockList:
   def __len__(self):
     return len(self.blocks)
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class RawBlock(Block):
   contents: dict
 
@@ -336,7 +335,7 @@ class KnownBool(Known, BooleanValue):
     return "true" if self.known else "false"
 
 # Looks
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class Say(Block):
   value: Value
 
@@ -351,7 +350,7 @@ class Say(Block):
 
 # Events
 # Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class Broadcast(Block):
   value: Value
   wait: bool
@@ -374,7 +373,7 @@ class Broadcast(Block):
       "inputs": {"BROADCAST_INPUT": raw_value},
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class OnBroadcast(StartBlock):
   name: str
 
@@ -394,7 +393,7 @@ class OnStartFlag(StartBlock):
     }, ctx
 
 FlowOp = Literal["if", "if_else", "reptimes", "until", "while"]
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class ControlFlow(Block):
   op: FlowOp
   value: Value
@@ -432,7 +431,7 @@ class ControlFlow(Block):
       "inputs": inputs
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class StopScript(EndBlock):
   op: Literal["stopthis", "stopall"]
 
@@ -442,7 +441,7 @@ class StopScript(EndBlock):
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
@@ -455,7 +454,7 @@ class GetCounter(Value):
 
     return [3, id, [10, ""]], ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class EditCounter(Block):
   """Increment/Assign zero to the special 'hacked' counter block"""
 
@@ -467,7 +466,7 @@ class EditCounter(Block):
     }, ctx
 
 # Variables
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class GetVar(Value):
   var_name: str
 
@@ -475,7 +474,7 @@ class GetVar(Value):
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id], [10, ""]], ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class EditVar(Block):
   op: Literal["set", "change"]
   var_name: str
@@ -491,7 +490,7 @@ class EditVar(Block):
       "fields": {"VARIABLE": [self.var_name, id]}
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class EditList(Block):
   op: Literal["addto", "replaceat", "insertat", "deleteat", "deleteall"]
   list_name: str
@@ -520,7 +519,7 @@ class EditList(Block):
       "fields": {"LIST": [self.list_name, list_id]},
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class GetOfList(Value):
   op: Literal["atindex", "indexof"]
   list_name: str
@@ -545,7 +544,7 @@ class GetOfList(Value):
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class Op(Value): # TODO: make this be able to use one input
   op: OperatorsCodes
   left: Value
@@ -614,7 +613,7 @@ class Op(Value): # TODO: make this be able to use one input
     return [3, id, [10, ""]], ctx
 
 BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class BoolOp(BooleanValue):
   op: BoolOpCodes
   left: Value
@@ -670,7 +669,7 @@ class BoolOp(BooleanValue):
     return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
 
 # Procedures
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class ProcedureDef(StartBlock):
   name: str
   params: list[str]
@@ -710,7 +709,7 @@ class ProcedureDef(StartBlock):
       "inputs": {"custom_block": [1, proto_id]}
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class ProcedureCall(LateBlock):
   proc_name: str
   arguments: list[Value]
@@ -736,7 +735,7 @@ class ProcedureCall(LateBlock):
       }
     }, ctx
 
-@attr.s(slots=True, auto_attribs=True)
+@dataclass
 class GetParameter(Value):
   param_name: str
 
