@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
 from collections import OrderedDict, defaultdict
 from typing import Literal, Callable
+from copy import deepcopy
 
 from llvm2py import parse_assembly
 from llvm2py import ir
@@ -67,22 +68,29 @@ class FuncInfo:
   """Info about a LLVM function"""
   name: str
   fn_id: int
-  params: list[str] # The parameters the function takes (doesn't include return address)
+  params: list[Variable] # The parameters the function takes (doesn't include return address)
   can_call: set[str] # Everything the function might call (may include itself)
   return_addresses: list[str] # Any functions that call this function
   returns_to_address: bool # If the function returns using a broadcast to an address
   checked_blocks: list[str] # List of label names that will contain a check to reset the stack
-  branch_alloca_size: defaultdict[str, int] # Amount allocated per branch
+  block_alloca_size: defaultdict[str, int] # Amount allocated per branch
   total_alloca_size: int | None # Amount allocated total. None if this amount is not known
   skip_stack_size_change: bool # Whether to skip increasing the stack size because other functions don't rely on it
+  block_var_use: dict[str, BlockVarUse] # What a block depends on and modifies
 
 @dataclass
 class BlockInfo:
   """Info about a LLVM block"""
   fn: FuncInfo
-  is_scratch_func: bool # If the instruction can access the parameters normally (in the body of a scratch func)
+  available_params: list[Variable] # All params that can be accessed from the function
   label: str = "" # Name/Label of the block
   allocated: int = 0 # Out of the amount allocated for the branch beforehand, how much has been translated into addresses
+
+@dataclass
+class BlockVarUse:
+  depends: set[str] = field(default_factory=set)
+  modifies: set[str] = field(default_factory=set)
+  branches: set[str] = field(default_factory=set)
 
 @dataclass
 class ValueAndBlocks:
@@ -96,25 +104,38 @@ class IndexableValue:
   vals: list[sb3.Value]
 
 @dataclass
-class IValueAndBlocks:
+class IndexableValueAndBlocks:
   """An indexable value and any blocks that come before it needed to get that value"""
   value: IndexableValue
   blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
 
 @dataclass
 class Variable:
-  """Name of a variable"""
-  name: str
-  is_scratch_param: bool
+  var_name: str
+  var_type: Literal["global", "param", "var"]
+  fn_name: str | None
+
+  def getRawVarName(self) -> str:
+    match self.var_type:
+      case "global":
+        return f"@{self.var_name}"
+      case "param":
+        return localizeParameter(self.var_name)
+      case "var":
+        assert self.fn_name is not None
+        return f"%{self.fn_name}:{self.var_name}" # Localize variables per function
+      case _:
+        raise CompException("Unmatched")
 
   def getValue(self) -> sb3.Value:
-    if self.is_scratch_param:
-      return sb3.GetParameter(self.name)
-    return sb3.GetVar(self.name)
+    name = self.getRawVarName()
+    if self.var_type == "param":
+      return sb3.GetParameter(name)
+    return sb3.GetVar(name)
 
   def setValue(self, value: sb3.Value, op: Literal["set", "change"]="set") -> sb3.Block:
-    if self.is_scratch_param: raise CompException(f"{self.name} param is read only")
-    return sb3.EditVar(op, self.name, value)
+    if self.var_type == "param": raise CompException(f"{self.var_name} param is read only")
+    return sb3.EditVar(op, self.getRawVarName(), value)
 
 class CompException(Exception):
   """Exception in the compiler"""
@@ -125,6 +146,24 @@ def astuple(obj):
   if not is_dataclass(obj):
     raise TypeError("Expected dataclass instance")
   return tuple(getattr(obj, f.name) for f in fields(obj))
+
+def assertNoNamedTemporaries(mod: ir.Module) -> None:
+  """Due to an issue with llvm2py, it is impossible to tell apart a named temporary from a global var with the same name"""
+  for fn_name, fn in mod.funcs.items():
+    temporaries: set[ir.Value | None] = set()
+
+    for block_label, block in fn.blocks.items():
+      for instr in block.instrs:
+        temporaries.add(getattr(instr, "result", None))
+
+    for param in fn.args:
+      temporaries.add(param)
+
+    for temporary in temporaries:
+      if temporary is not None:
+        assert isinstance(temporary.val, str)
+        if not (temporary.val.startswith("%") or temporary.val == "<badref>"):
+          raise CompException(f"Named temporary %{temporary.val} in {fn_name} not supported due to llvm2py not being able to tell it apart from a global")
 
 def getByteSize(ty: ir.Type) -> int:
   match ty:
@@ -138,16 +177,17 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(val: ir.value.Value,
-                ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IValueAndBlocks:
+def decodeValue(val: ir.Value,
+                ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IndexableValueAndBlocks:
   match val.val:
     case str(): # if a variable
       var = decodeVar(val, bctx)
       res = sb3.Known("") # this means no value - nothing in the block
       if var is not None:
         res = var.getValue()
-        if ctx.cfg.opti and var.name in ctx.globvar_to_ptr:
-          res = ctx.globvar_to_ptr[var.name]
+        name = var.getRawVarName()
+        if ctx.cfg.opti and name in ctx.globvar_to_ptr:
+          res = ctx.globvar_to_ptr[name]
       return ValueAndBlocks(res)
     case int():
       if not isinstance(val.ty, ir.IntegerType):
@@ -169,49 +209,39 @@ def decodeValue(val: ir.value.Value,
       if val.ty.elem_ty.num_bits != 8:
         raise CompException(f"Cannot assign bytes value {val} a non byte (i8)")
 
-      return IValueAndBlocks(
+      return IndexableValueAndBlocks(
         IndexableValue([sb3.Known(str(int(byte))) for byte in val.val]))
     case _:
-      raise CompException(f"Unknown Value: {val.val} (py type: {type(val.val)})")
+      raise CompException(f"Unknown Value: {val.val} (type: {type(val.val)})")
 
-def decodeVar(var: ir.value.Value, bctx: BlockInfo | None) -> Variable | None:
+def decodeVar(var: ir.Value | str, bctx: BlockInfo | None) -> Variable | None:
   """Used for getting the assigned variable of an instruction"""
-  if not isinstance(var.val, str):
-    raise CompException(f"Expected val to be a variable, got Value: {var.val} (py type: {type(var.val)})")
-  if var.val == "<badref>":
+  if isinstance(var, ir.Value):
+    if not isinstance(var.val, str):
+      raise CompException(f"Expected val to be a variable, got Value: {var.val} (py type: {type(var.val)})")
+    var = var.val
+  if var == "<badref>":
     return None
-  name = var.val
+
   # This is the only way to tell apart a local value from a global one. llvm2py removes the % from the start of named temporaries so
   # it is impossible to tell apart against a global with the same name, hence the assertNoNamedTemporaries
-  is_local = name.startswith("%")
-  if is_local: name = name[1:]
-  return localizeVar(name, not is_local, bctx)
-
-def assertNoNamedTemporaries(mod: ir.Module) -> None:
-  """Due to an issue with llvm2py, it is impossible to tell apart a named temporary from a global var with the same name"""
-  for fn_name, fn in mod.funcs.items():
-    for block_label, block in fn.blocks.items():
-      for instr in block.instrs:
-        res: ir.value.Value | None = getattr(instr, "result", None)
-
-        if res is not None:
-          assert isinstance(res.val, str)
-          if not (res.val.startswith("%") or res.val == "<badref>"):
-            raise CompException(f"Named temprary %{res.val} at {fn_name}:{block_label} not supported due to llvm2py not being able to tell it apart from a global")
+  is_local = var.startswith("%")
+  if is_local: var = var[1:]
+  return localizeVar(var, not is_local, bctx)
 
 def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
-  is_param = False
   if is_global:
-    name = f"@{name}"
+    var_type = "global"
+    fn_name = None
   else:
     assert bctx is not None
-    if name in bctx.fn.params and bctx.is_scratch_func:
-      is_param = True
-      name = localizeParameter(name)
+    fn_name = bctx.fn.name
+    if bctx is not None and name in [param.var_name for param in bctx.available_params]:
+      var_type = "param"
     else:
-      name = f"%{bctx.fn.name}:{name}" # Localize variables per function
+      var_type = "var"
 
-  return Variable(name, is_param)
+  return Variable(name, var_type, fn_name)
 
 def localizeParameter(name: str) -> str:
   return "%" + name
@@ -219,8 +249,10 @@ def localizeParameter(name: str) -> str:
 def localizeLabel(label: str, fn: FuncInfo) -> str:
   return f"{fn.name}:{label}"
 
-def localizeCallId(call_id: int, label: str, fn_name: str) -> str:
-  return f"{fn_name}:{label}:return addr {call_id}"
+def localizeCallId(call_id: int, label: str, fn_name: str, recursive: bool = False) -> str:
+  if not recursive:
+    return f"{fn_name}:{label}:return addr {call_id}"
+  return f"{fn_name}:{label}:recursive call {call_id}"
 
 def genTempVar(ctx: Context) -> str:
   return ctx.cfg.tmp_prefix + random.randbytes(12).hex()
@@ -269,7 +301,6 @@ def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Cont
       return sb3.Known(2 ** int(val.known)), ctx
     except ValueError:
       raise CompException("Cannot calculate pow2 of a known non-integer")
-      #return sb3.Known("NaN"), ctx
   else:
     lookup, ctx = makePow2LookupTable(max_val, True, ctx) # Any value above the width will be treated as a zero
                                                         # which has no effect on the result
@@ -403,6 +434,17 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
                                      _lo=_lo,     _hi=mid))])
 
+def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tuple[list[sb3.Value], sb3.BlockList]:
+  arguments: list[sb3.Value] = []
+  blocks = sb3.BlockList()
+  for arg in args:
+    value = decodeValue(arg, ctx, bctx)
+    if isinstance(value, IndexableValueAndBlocks):
+      raise CompException(f"Function argument cannot be an indexable value")
+    blocks.add(value.blocks)
+    arguments.append(value.value)
+  return arguments, blocks
+
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
   match value:
     case sb3.Value():
@@ -445,7 +487,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
   match instr:
     case ir.Alloca(): # Allocate space on the stack and return ptr
       var = decodeVar(instr.result, bctx)
-      assert var is None or var.is_scratch_param is False
+      assert var is None or var.var_type != "param"
 
       blocks = sb3.BlockList()
       size = getByteSize(instr.allocated_ty)
@@ -454,7 +496,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       if bctx.fn.skip_stack_size_change:
         offset = 0
       elif bctx.fn.total_alloca_size is None:
-        offset = -bctx.fn.branch_alloca_size[bctx.label]
+        offset = -bctx.fn.block_alloca_size[bctx.label]
       else:
         offset = -bctx.fn.total_alloca_size
       offset += bctx.allocated + 1 # Adding one means that some addresses will be equal to the stack size, allowing better
@@ -480,7 +522,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
       var = decodeVar(instr.result, bctx)
       if var is not None:
-        blocks.add(sb3.EditVar("set", var.name,
+        blocks.add(sb3.EditVar("set", var.getRawVarName(),
                                       sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
 
     case ir.Store(): # Copy a value to an address on the stack
@@ -505,7 +547,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       right = right.value
 
       res_var = decodeVar(instr.result, bctx)
-      assert res_var is None or res_var.is_scratch_param is False
+      assert res_var is None or res_var.var_type != "param"
+      if res_var is not None:
+        res_var_name = res_var.getRawVarName()
       res_val = None
 
       if isinstance(left, IndexableValue) or \
@@ -590,10 +634,10 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
                 sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
                   sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
                     # If left + right are pos
-                    sb3.EditVar("set", res_var.name, sb3.Op("floor", sb3.Op("div", left, right))),
+                    sb3.EditVar("set", res_var_name, sb3.Op("floor", sb3.Op("div", left, right))),
                   ]), sb3.BlockList([
                     # If left is pos and right is neg
-                    sb3.EditVar("set", res_var.name, sb3.Op("add",
+                    sb3.EditVar("set", res_var_name, sb3.Op("add",
                                                       sb3.Op("ceiling",
                                                         sb3.Op("div",
                                                           left,
@@ -603,7 +647,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
                 ]), sb3.BlockList([
                   sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
                     # If left is neg and right is pos
-                    sb3.EditVar("set", res_var.name, sb3.Op("add",
+                    sb3.EditVar("set", res_var_name, sb3.Op("add",
                                                       sb3.Op("ceiling",
                                                         sb3.Op("div",
                                                           sb3.Op("sub", left, sb3.Known(change)),
@@ -611,7 +655,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
                                                       sb3.Known(change))),
                   ]), sb3.BlockList([
                     # If left + right are neg
-                    sb3.EditVar("set", res_var.name, sb3.Op("floor",
+                    sb3.EditVar("set", res_var_name, sb3.Op("floor",
                                                       sb3.Op("div",
                                                         sb3.Op("sub", left, sb3.Known(change)),
                                                         sb3.Op("sub", right, sb3.Known(change))))),
@@ -662,7 +706,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
               right_sub_change, pos_neg_block = astuple(optimizeValueUse(right, 2, ctx))
               pos_neg_block.add(sb3.BlockList([
                 # If left is pos and right is neg - remainder = (l mod r) - r
-                sb3.EditVar("set", res_var.name, sb3.Op("sub",
+                sb3.EditVar("set", res_var_name, sb3.Op("sub",
                                                   sb3.Op("mod",
                                                     left,
                                                     right_sub_change),
@@ -671,7 +715,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
               # Re-use the generated temp var
               pos_neg_block = sb3.BlockList([
                 sb3.EditVar("change", right.var_name, sb3.Known(-change)),
-                sb3.EditVar("set", res_var.name, sb3.Op("sub",
+                sb3.EditVar("set", res_var_name, sb3.Op("sub",
                                                   sb3.Op("mod",
                                                     left,
                                                     right),
@@ -683,7 +727,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
               sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
                 sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
                     # Modulus and remainder operations do the same
-                    sb3.EditVar("set", res_var.name, sb3.Op("mod", left, right)),
+                    sb3.EditVar("set", res_var_name, sb3.Op("mod", left, right)),
                   ]),
                   # If left is pos and right is neg - remainder = (l mod r) - r
                   pos_neg_block
@@ -691,7 +735,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
               ]), sb3.BlockList([
                 sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
                   # If left is neg and right is pos - remainder = (l mod r) - r
-                  sb3.EditVar("set", res_var.name, sb3.Op("add",
+                  sb3.EditVar("set", res_var_name, sb3.Op("add",
                                                     sb3.Op("sub",
                                                       sb3.Op("mod",
                                                         sb3.Op("sub", left, sb3.Known(change)),
@@ -700,7 +744,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
                                                     sb3.Known(change))),
                 ]), sb3.BlockList([
                   # If left + right are neg
-                  sb3.EditVar("set", res_var.name, sb3.Op("add",
+                  sb3.EditVar("set", res_var_name, sb3.Op("add",
                                                     sb3.Op("mod",
                                                       sb3.Op("sub", left, sb3.Known(change)),
                                                       sb3.Op("sub", right, sb3.Known(change))),
@@ -758,9 +802,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
             blocks.add([
               sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-                sb3.EditVar("set", res_var.name, val_pos),
+                sb3.EditVar("set", res_var_name, val_pos),
               ]), sb3.BlockList([
-                sb3.EditVar("set", res_var.name, val_neg),
+                sb3.EditVar("set", res_var_name, val_neg),
               ])),
             ])
 
@@ -846,7 +890,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       right = right.value
 
       res_var = decodeVar(instr.result, bctx)
-      assert res_var is None or res_var.is_scratch_param is False
+      assert res_var is None or res_var.var_type != "param"
 
       if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
@@ -879,7 +923,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       value = value.value
 
       res_var = decodeVar(instr.result, bctx)
-      assert res_var is None or res_var.is_scratch_param is False
+      assert res_var is None or res_var.var_type != "param"
 
       if not isinstance(instr.value.ty, ir.IntegerType): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.value.ty)}")
@@ -905,18 +949,167 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx, bctx
 
-def assignParameters(func: FuncInfo) -> sb3.BlockList:
+def getTerminatorInstrLabels(instr: ir.Instruction) -> list[str]:
+  """Returns every label a terminator instruction could branch to. Returns the string "ret" to indictate a return"""
+  match instr:
+    case ir.Unreacheble():
+      return []
+    case ir.Ret():
+      return ["ret"]
+    case ir.Br():
+      assert isinstance(instr.label_false.val, str)
+      branches = [instr.label_false.val]
+      if instr.label_true is not None:
+        assert isinstance(instr.label_true.val, str)
+        branches.append(instr.label_true.val)
+      return branches
+    case ir.Switch():
+      assert isinstance(instr.label_default.val, str)
+      branches = [instr.label_default.val]
+      for _, label in instr.cases:
+        assert isinstance(label.val, str)
+        branches.append(label.val)
+      return branches
+    case ir.CallBr():
+      assert isinstance(instr.fallthrough_label.val, str)
+      if instr.indirect_labels is not None:
+        raise CompException("Indirect (exceptional) labels not supported")
+      return [instr.fallthrough_label.val]
+    case _:
+      raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
+
+def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
+  """Returns what the instruction depends on and modifies"""
+  depends: set[str] = set()
+  modifies: set[str] = set()
+
+  result = getattr(instr, "result", None)
+  if result is not None:
+    assert isinstance(result.val, str)
+    if result.val.startswith("%"):
+      modifies.add(result.val)
+
+  vals: list[ir.Value | None]
+  match instr:
+    case ir.Unreacheble() | ir.Alloca():
+      vals = []
+    case ir.Ret() | ir.Conversion():
+      vals = [instr.value]
+    case ir.Load():
+      vals = [instr.address]
+    case ir.Store():
+      vals = [instr.address, instr.value]
+    case ir.Call():
+      vals = [v for v in instr.args]
+    case ir.BinOp():
+      vals = [instr.fst_operand, instr.snd_operand]
+    case ir.ICmp():
+      vals = [instr.fst_operand, instr.snd_operand]
+    case ir.Br() | ir.Switch():
+      vals = [instr.cond]
+    case _:
+      raise CompException(f"Unknown instruction {instr} (type {type(instr)})")
+
+  for val in vals:
+    if val is not None:
+      match val.val:
+        # TODO FIX: special handling for getElementPtr etc
+        case str() | int() | bytes():
+          pass
+        case _:
+          raise CompException(f"Unknown Value: {val.val} (type: {type(val.val)})")
+
+      if isinstance(val.val, str) and val.val.startswith("%"):
+        depends.add(val.val)
+
+  return depends, modifies
+
+def getBlockVarUse(instrs: list[ir.Instruction],
+                   block_var_use: dict[str, BlockVarUse] | None = None,
+                   starting_var_use: BlockVarUse | None = None) -> BlockVarUse:
+  """
+  Accepts a list of instructions. The last should be an terminator instruction.
+  Also accepts information about what other branches depend on/use which it will apply to all possible branches.
+  """
+  if len(instrs) == 0: return BlockVarUse()
+
+  res = BlockVarUse() if starting_var_use is None else starting_var_use
+
+  for instr in instrs:
+    instr_depends, instr_modifies = getInstrVarUse(instr)
+    # If we modify something before using it then we don't depend on it
+    res.depends |= instr_depends - res.modifies
+    res.modifies |= instr_modifies
+
+  res.branches = set(getTerminatorInstrLabels(instrs[-1])) - {"ret"}
+  if block_var_use is not None:
+    modified = deepcopy(res.modifies)
+    for label in res.branches:
+      res.depends |= block_var_use[label].depends - modified
+      res.modifies |= block_var_use[label].modifies
+
+  return res
+
+def getFuncBranchesVarUse(func: ir.Function) -> dict[str, BlockVarUse]:
+  label_var_use: dict[str, BlockVarUse] = {
+    name: getBlockVarUse(block.instrs) for name, block in func.blocks.items()
+  }
+
+  memo: dict[tuple[str, frozenset[str]], BlockVarUse] = {}
+
+  res: dict[str, BlockVarUse] = {}
+
+  for start_label in func.blocks:
+    # Worklist (current label, depends so far, modifies so far)
+    stack: list[tuple[str, set[str], set[str]]] = [(start_label,
+                                                    set(label_var_use[start_label].depends),
+                                                    set(label_var_use[start_label].modifies))]
+    # Track visited states per block to prevent infinite loops
+    visited_states: dict[str, set[frozenset[str]]] = {label: set() for label in func.blocks}
+
+    agg_depends: set[str] = set()
+    agg_modifies: set[str] = set()
+    agg_branches: set[str] = set()
+
+    while stack:
+      label, depends_so_far, modifies_so_far = stack.pop()
+      state_key = frozenset(depends_so_far | modifies_so_far)
+      if state_key in visited_states[label]:
+        continue
+      visited_states[label].add(state_key)
+
+      block_use = label_var_use[label]
+
+      # Update dependencies (only if not modified already)
+      new_depends = block_use.depends - modifies_so_far
+      depends_so_far = depends_so_far | new_depends
+      modifies_so_far = modifies_so_far | block_use.modifies
+
+      # Aggregate results for this start label
+      agg_depends |= new_depends
+      agg_modifies |= block_use.modifies
+      agg_branches |= block_use.branches
+
+      # Push successors with updated state
+      for succ in block_use.branches:
+        stack.append((succ, set(depends_so_far), set(modifies_so_far)))
+
+    res[start_label] = BlockVarUse(agg_depends, agg_modifies, agg_branches)
+
+  return res
+
+def assignParameters(params: list[Variable]) -> sb3.BlockList:
   # TODO OPTI: work out if values are needed before assigning them
   blocks = sb3.BlockList()
-  for param_name in func.params:
-    param = localizeVar(param_name, False, BlockInfo(func, True))
-    var = localizeVar(param_name, False, BlockInfo(func, False))
+  for param in params:
+    var = deepcopy(param)
+    var.var_type = "var"
     blocks.add(var.setValue(param.getValue()))
   return blocks
 
-def getUncheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
+def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
                                ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
-  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, params)])
+  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [param.getRawVarName() for param in params])])
 
   if ctx.cfg.do_debug_branch_log:
     # Increment the branch counter in the log
@@ -931,14 +1124,13 @@ def getUncheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
 
   return blocks, ctx
 
-def getCheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
+def getCheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
                              ctx: Context) -> tuple[sb3.BlockList, Context]:
   """Returns the blocks needed to return a branch instruction (procedure) that will reset the scratch's stack
   if reaching a max amount of permutations, preventing scratch from running out of memory"""
 
   reset_broadcast = f"{proc_name}:reset stack"
-
-  arguments = [localizeVar(name, False, BlockInfo(fn, False)).getValue() for name in params]
+  arguments = [name.getValue() for name in params]
   ctx.proj.code.append(sb3.BlockList([
     sb3.OnBroadcast(reset_broadcast),
     sb3.ProcedureCall(proc_name, arguments),
@@ -949,7 +1141,7 @@ def getCheckedProcedureStart(proc_name: str, params: list[str], fn: FuncInfo,
   on_reset = sb3.BlockList()
   if len(params) > 0:
     # FUTURE OPTI: the assigned params could potentially used elsewhere but there's hardly a perf gain
-    on_reset = assignParameters(fn)
+    on_reset = assignParameters(params)
   on_reset.add(sb3.BlockList([
     sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
     sb3.EditCounter("clear"),
@@ -996,9 +1188,8 @@ def transTerminatorInstr(instr: ir.Instruction,
       blocks.end = True
 
     case ir.Br(): # Jump to a label, either known or dependent on a condition
-      if bctx.is_scratch_func:
-        # Allow the parameters to be accessed later
-        blocks.add(assignParameters(bctx.fn))
+      # Allow the parameters to be accessed later
+      blocks.add(assignParameters(bctx.available_params))
 
       if instr.cond is None:
         label = instr.label_false.val
@@ -1068,35 +1259,6 @@ def transTerminatorInstr(instr: ir.Instruction,
       raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx
 
-def getTerminatorInstrLabels(instr: ir.Instruction) -> list[str]:
-  """Returns every label a terminator instruction could branch to. Returns the string "ret" to indictate a return"""
-  match instr:
-    case ir.Unreacheble():
-      return []
-    case ir.Ret():
-      return ["ret"]
-    case ir.Br():
-      assert isinstance(instr.label_false.val, str)
-      branches = [instr.label_false.val]
-      if instr.label_true is not None:
-        assert isinstance(instr.label_true.val, str)
-        branches.append(instr.label_true.val)
-      return branches
-    case ir.Switch():
-      assert isinstance(instr.label_default.val, str)
-      branches = [instr.label_default.val]
-      for _, label in instr.cases:
-        assert isinstance(label.val, str)
-        branches.append(label.val)
-      return branches
-    case ir.CallBr():
-      assert isinstance(instr.fallthrough_label.val, str)
-      if instr.indirect_labels is not None:
-        raise CompException("Indirect (exceptional) labels not supported")
-      return [instr.fallthrough_label.val]
-    case _:
-      raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
-
 def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   """Get info about a function needed to translate it's instructions"""
   call_graph: dict[str, tuple[set[str], bool]] = {}
@@ -1105,6 +1267,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   all_check_locations: dict[str, list[str]] = {}
   branch_alloca_size: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
   total_alloca_size: dict[str, int | None] = {}
+  block_var_use: dict[str, dict[str, BlockVarUse]] = {}
 
   for func in mod.funcs.values():
     fn_name = func.value.val
@@ -1115,6 +1278,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
         raise CompException("Externally defined function must have info about it")
       info = ctx.fn_info[fn_name]
       call_graph[fn_name] = info.can_call, True
+      block_var_use[fn_name] = info.block_var_use
 
     else:
       calls: set[str] = set() # What the function calls
@@ -1135,6 +1299,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
             case ir.Alloca():
               branch_alloca_size[fn_name][block_label] += getByteSize(instr.allocated_ty)
       call_graph[fn_name] = calls, False
+
+      block_var_use[fn_name] = getFuncBranchesVarUse(func)
 
   for start_func in call_graph:
     if call_graph[start_func][1]: continue
@@ -1224,15 +1390,18 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     param_names = []
     for arg in func.args:
       assert isinstance(arg.val, str)
+      assert arg.val.startswith("%")
       param_names.append(arg.val[1:])
 
     if returns_to_address[fn_name]: param_names.append(ctx.cfg.return_address_local)
 
-    ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, param_names, call_graph[fn_name][0],
+    params = [Variable(name, "param", fn_name) for name in param_names]
+
+    ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, params, call_graph[fn_name][0],
                                     return_addresses.get(fn_name, list()), returns_to_address[fn_name],
                                     all_check_locations.get(fn_name, list()),
                                     branch_alloca_size[fn_name], total_alloca_size.get(fn_name, None),
-                                    skip_stack_size_change)
+                                    skip_stack_size_change, block_var_use[fn_name])
     ctx.next_fn_id += 1
 
   return ctx
@@ -1262,10 +1431,16 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       if first_block:
         proc_name = fn_name
-        localized_params = [localizeParameter(param) for param in info.params]
+        localized_params = info.params
       else:
         proc_name = localizeLabel(block_label, info)
         localized_params = []
+
+      # TODO FIX: branching to first block of function. Since we assign
+      # the parameters anyway we could do this in caller function. Perhaps
+      # we could look at the var usage of each branches and decide which
+      # parameters should be passed and pass none if we ever branch to the
+      # main function.
 
       # Get code to start the branch (procedure definition, etc)
       if block_label not in info.checked_blocks:
@@ -1284,7 +1459,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       # Store the previous stack size if necessary
       if first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
-        block_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, True))
+        block_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params))
           .setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
 
       # Change stack size by the amount the function/branch allocates beforehand
@@ -1294,55 +1469,93 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       if first_block and info.total_alloca_size is not None:
         to_allocate = info.total_alloca_size
       elif info.total_alloca_size is None:
-        to_allocate = info.branch_alloca_size[block_label]
+        to_allocate = info.block_alloca_size[block_label]
 
       if to_allocate != 0 and not info.skip_stack_size_change:
         block_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
-      bctx = BlockInfo(info, first_block, block_label, total_fn_allocated)
+      available_params: list[Variable] = info.params if first_block else []
+      bctx = BlockInfo(info, available_params, block_label, total_fn_allocated)
+
       # Translate everything except the terminator operation
-      for instr in block.instrs[:-1]:
+      for instr_index, instr in enumerate(block.instrs[:-1]):
         if isinstance(instr, ir.Call): # Call instructions handled here because might need to return at an address
           callee_name = instr.callee.val
           assert isinstance(callee_name, str)
           callee_info = ctx.fn_info[callee_name]
 
-          arguments: list[sb3.Value] = []
-          for arg in instr.args:
-            value = decodeValue(arg, ctx, bctx)
-            if isinstance(value, IValueAndBlocks):
-              raise CompException(f"Function argument cannot be an indexable value in {instr}")
-            block_code.add(value.blocks)
-            arguments.append(value.value)
+          poss_recursive = fn_name in callee_info.can_call
 
           output = decodeVar(instr.result, bctx)
 
-          callee_returns_to_address = callee_info.returns_to_address
+          if not poss_recursive: # TODO OPTI: this can also be used if possibly recusive but we don't depend on anything after
+            arguments, arg_value_blocks = getCallArguments(instr.args, ctx, bctx)
 
-          if callee_returns_to_address:
-            return_proc_name = localizeCallId(call_id, block_label, fn_name)
-            return_addr_id = callee_info.return_addresses.index(return_proc_name)
-            arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
+            if callee_info.returns_to_address:
+              return_proc_name = localizeCallId(call_id, block_label, fn_name)
+              return_addr_id = callee_info.return_addresses.index(return_proc_name)
+              arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
 
-            # If adding a broadcast then make sure parameters can be accessed later
-            if first_block: block_code.add(assignParameters(info))
+              # Make sure parameters can be accessed later
+              block_code.add(assignParameters(available_params))
 
-          call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
-          block_code.add(call_blocks)
+            call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
+            block_code.add(arg_value_blocks)
+            block_code.add(call_blocks)
 
-          if not callee_returns_to_address:
-            block_code.add(assign_blocks)
+            if not callee_info.returns_to_address:
+              block_code.add(assign_blocks)
+            else:
+              # Start new block list
+              ctx.proj.code.append(block_code)
+              first_block = False
+              bctx.available_params = []
+
+              # Add code for callback
+              block_code, ctx = getUncheckedProcedureStart(return_proc_name, [], info, ctx,
+                                                          is_counted=callee_info.returns_to_address)
+              block_code.add(assign_blocks)
           else:
-            # Start new block list
-            ctx.proj.code.append(block_code)
-            first_block = False
-            bctx.is_scratch_func = False
+            # Get all variables which are used later after the recursion
+            must_store: list[Variable] = []
+            # Include the return value in variables which aren't depended on
+            starting_var_use = BlockVarUse() if output is None else BlockVarUse(modifies={"%" + output.var_name})
+            for var in getBlockVarUse(block.instrs[instr_index + 1:],
+                                      info.block_var_use,
+                                      starting_var_use).depends:
+              decoded_var = decodeVar(var, bctx)
+              assert decoded_var is not None
+              must_store.append(decoded_var)
 
-            # Add code for callback
-            block_code, ctx = getUncheckedProcedureStart(return_proc_name, [], info, ctx,
-                                                         is_counted=info.returns_to_address)
-            block_code.add(assign_blocks)
+            # Sort the parameters in numeric then alphabetical order for better readability
+            must_store.sort(key=lambda var: (0, int(var.var_name)) if var.var_name.isdigit() else (1, var.var_name))
+
+            if info.total_alloca_size is None and not info.skip_stack_size_change:
+              must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
+
+            if info.returns_to_address:
+              must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
+
+            if not callee_info.returns_to_address:
+              recurse_proc_name = localizeCallId(call_id, block_label, fn_name, True)
+              block_code.add(sb3.ProcedureCall(recurse_proc_name, [var.getValue() for var in must_store]))
+
+              for i, var in enumerate(must_store):
+                must_store[i].var_type = "param"
+
+              ctx.proj.code.append(block_code)
+              first_block = False
+              bctx.available_params = must_store
+              block_code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
+
+              arguments, arg_value_blocks = getCallArguments(instr.args, ctx, bctx)
+              call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
+              block_code.add(arg_value_blocks)
+              block_code.add(call_blocks)
+              block_code.add(assign_blocks)
+            else:
+              raise CompException("Recursive functions that may return to an address are not yet supported")
 
           call_id += 1
         else:
@@ -1404,9 +1617,10 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
     if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
 
-    ctx.globvar_to_ptr[globvar.name] = sb3.Known(ptr)
+    globvar_name = globvar.getRawVarName()
+    ctx.globvar_to_ptr[globvar_name] = sb3.Known(ptr)
     if not ctx.cfg.opti:
-      blocks.add(sb3.EditVar("set", globvar.name, sb3.Known(ptr)))
+      blocks.add(sb3.EditVar("set", globvar_name, sb3.Known(ptr)))
     for value in values:
       blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
     ptr += total_size
@@ -1422,11 +1636,11 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
 def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.BlockList, ctx: Context) -> Context:
   """total_alloca_size: int of how much the function allocates to the stack. 0 if it doesn't, None if a not fixed amount."""
-  localized_params = [localizeParameter(param) for param in params]
-  blocks = sb3.BlockList([sb3.ProcedureDef(name, localized_params)])
+  localized_params = [Variable(param, "param", name) for param in params]
+  blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, params, set(), list(), False, list(), defaultdict(int), 0, False)
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, set(), list(), False, list(), defaultdict(int), 0, False, {})
   ctx.next_fn_id += 1
   return ctx
 
