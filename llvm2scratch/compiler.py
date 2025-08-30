@@ -32,9 +32,11 @@ class Config:
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
   stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
-  max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before wiping scratch's call stack via a broadcast
+  max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before reseting
+                                        # scratch's call stack via a broadcast
 
-  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in future compilations for optimization
+  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
+                                                           # future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
   unused_var = "!unused" # Name of the scratch variable for unused values
@@ -148,7 +150,10 @@ def astuple(obj):
   return tuple(getattr(obj, f.name) for f in fields(obj))
 
 def assertNoNamedTemporaries(mod: ir.Module) -> None:
-  """Due to an issue with llvm2py, it is impossible to tell apart a named temporary from a global var with the same name"""
+  """
+  Due to an issue with llvm2py, it is impossible to tell apart a named
+  temporary from a global var with the same name
+  """
   for fn_name, fn in mod.funcs.items():
     temporaries: set[ir.Value | None] = set()
 
@@ -163,7 +168,8 @@ def assertNoNamedTemporaries(mod: ir.Module) -> None:
       if temporary is not None:
         assert isinstance(temporary.val, str)
         if not (temporary.val.startswith("%") or temporary.val == "<badref>"):
-          raise CompException(f"Named temporary %{temporary.val} in {fn_name} not supported due to llvm2py not being able to tell it apart from a global")
+          raise CompException(f"Named temporary %{temporary.val} in {fn_name} not supported due "
+                              "to llvm2py not being able to tell it apart from a global")
 
 def getByteSize(ty: ir.Type) -> int:
   match ty:
@@ -194,7 +200,8 @@ def decodeValue(val: ir.Value,
         raise CompException(f"Expected {val} to be an integer, got type {type(val.ty)}")
 
       # TODO FIX: allow different sizes with val.ty
-      if val.ty.num_bits > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not yet supported, got {val.ty.num_bits}")
+      if val.ty.num_bits > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not "
+                                                                  f"yet supported, got {val.ty.num_bits}")
 
       # Calculate the two's complement version of the number
       num = val.val
@@ -472,7 +479,8 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
 
 def transCall(name: str, arguments: list[sb3.Value],
               output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
-  """The first block list returned is any blocks to call the function, the second any needed to assign the return value to the output"""
+  """The first block list returned is any blocks to call the function, the
+  second any needed to assign the return value to the output"""
 
   call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
 
@@ -559,12 +567,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       match instr.opcode:
         case "add" | "sub": # Add/Sub two values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values by using multiple vars and carrying
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
@@ -575,7 +585,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
         case "mul": # Multiply two values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
           width = instr.fst_operand.ty.num_bits
 
           if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
@@ -588,12 +599,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         case "udiv": # Divide one value by another (unsigned)
           # TODO OPTI: optimise for known values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           # Division by zero is UB
           if not instr.is_exact:
@@ -603,7 +616,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
         case "sdiv": # Divide one value by another (signed)
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
           width = instr.fst_operand.ty.num_bits
 
           # TODO FIX: support larger values
@@ -666,12 +680,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
         case "urem": # Calculate remainder (unsigned)
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports"
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           # mod 0 is UB, can ignore
           res_val = sb3.Op("mod", left, right)
@@ -679,12 +695,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         case "srem": # Calculate remainder (signed)
           # TODO OPTI: optimise for known values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                "integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           if res_var is not None:
             # TODO: Reuse if statement to work out if a / b > 0
@@ -757,36 +775,42 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
         case "shl": # Calculate left shift
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not (instr.is_nsw and instr.is_nuw)
           res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
 
         case "lshr": # Calculate right shift (unsigned)
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not instr.is_exact
           res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
 
         case "ashr": # Calculate right shift (signed)
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           if res_var is not None:
             point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
@@ -798,7 +822,9 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
 
             unwrapped_neg = sb3.Op("div", sb3.Op("sub", left, sb3.Known(change)), right_mul)
-            val_neg = sb3.Op("add", unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg), sb3.Known(change))
+            val_neg = sb3.Op("add",
+                        unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg),
+                        sb3.Known(change))
 
             blocks.add([
               sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
@@ -812,12 +838,14 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
         case "and" | "or" | "xor": # Calculate binary operation
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.opcode == "or" and instr.is_disjoint:
             # If there would be no carry
@@ -893,15 +921,16 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       assert res_var is None or res_var.var_type != "param"
 
       if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
-        raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.fst_operand.ty)}")
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"integers, got type {type(instr.fst_operand.ty)}")
       assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
 
       width = instr.fst_operand.ty.num_bits
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
-        raise CompException(f"Instruction icmp currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+        raise CompException(f"Instruction icmp currently supports "
+                            f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-      # TODO FIX: boolean values 'true' or 'false' could potentially create issues, use a new class called BoolIntCast
       match instr.cond:
         case "eq":
           res_val = sb3.BoolOp("=", left, right)
@@ -926,13 +955,15 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       assert res_var is None or res_var.var_type != "param"
 
       if not isinstance(instr.value.ty, ir.IntegerType): # TODO: add vector support
-        raise CompException(f"Instruction {instr} with opcode add only supports integers, got type {type(instr.value.ty)}")
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"integers, got type {type(instr.value.ty)}")
       assert isinstance(value, sb3.Value)
 
       width = instr.value.ty.num_bits
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
-        raise CompException(f"Instruction icmp currently supports integers with <= {VARIABLE_MAX_BITS} bits")
+        raise CompException(f"Instruction icmp currently supports "
+                            f"integers with <= {VARIABLE_MAX_BITS} bits")
 
       res_val = None
 
@@ -950,7 +981,10 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
   return blocks, ctx, bctx
 
 def getTerminatorInstrLabels(instr: ir.Instruction) -> list[str]:
-  """Returns every label a terminator instruction could branch to. Returns the string "ret" to indictate a return"""
+  """
+  Returns every label a terminator instruction could branch to.
+  Returns the string "ret" to indictate a return
+  """
   match instr:
     case ir.Unreacheble():
       return []
@@ -1029,7 +1063,8 @@ def getBlockVarUse(instrs: list[ir.Instruction],
                    starting_var_use: BlockVarUse | None = None) -> BlockVarUse:
   """
   Accepts a list of instructions. The last should be an terminator instruction.
-  Also accepts information about what other branches depend on/use which it will apply to all possible branches.
+  Also accepts information about what other branches depend on/use which it will
+  apply to all possible branches.
   """
   if len(instrs) == 0: return BlockVarUse()
 
@@ -1120,14 +1155,18 @@ def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncI
     ))]))
 
   if is_counted:
-    blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing a number
+    blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing
+                                        # a number
 
   return blocks, ctx
 
 def getCheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
                              ctx: Context) -> tuple[sb3.BlockList, Context]:
-  """Returns the blocks needed to return a branch instruction (procedure) that will reset the scratch's stack
-  if reaching a max amount of permutations, preventing scratch from running out of memory"""
+  """
+  Returns the blocks needed to return a branch instruction (procedure)
+  that will reset the scratch's stack if reaching a max amount of permutations,
+  preventing scratch from running out of memory
+  """
 
   reset_broadcast = f"{proc_name}:reset stack"
   arguments = [name.getValue() for name in params]
@@ -1218,7 +1257,8 @@ def transTerminatorInstr(instr: ir.Instruction,
       assert isinstance(instr.cond.ty, ir.IntegerType)
       width = instr.cond.ty.num_bits
       if getByteSize(instr.cond.ty) > 1:
-        raise CompException("Cannot currently switch with an integer more than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
+        raise CompException("Cannot currently switch with an integer more "
+                           f"than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
 
       val, val_blocks = astuple(decodeValue(instr.cond, ctx, bctx))
       blocks.add(val_blocks)
@@ -1635,12 +1675,16 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   return blocks, ctx
 
 def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.BlockList, ctx: Context) -> Context:
-  """total_alloca_size: int of how much the function allocates to the stack. 0 if it doesn't, None if a not fixed amount."""
+  """
+  total_alloca_size: int of how much the function allocates to the stack.
+  0 if it doesn't, None if a not fixed amount.
+  """
   localized_params = [Variable(param, "param", name) for param in params]
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, set(), list(), False, list(), defaultdict(int), 0, False, {})
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, set(),
+                               list(), False, list(), defaultdict(int), 0, False, {})
   ctx.next_fn_id += 1
   return ctx
 
@@ -1685,7 +1729,11 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", "buffer",
-        sb3.Op("join", sb3.GetVar("buffer"), sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetVar("char")))),
+        sb3.Op("join",
+          sb3.GetVar("buffer"),
+          sb3.GetOfList("atindex",
+            (cfg.ascii_lookup_var + cfg.zero_indexed_suffix),
+            sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
       sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
     ])),
@@ -1694,7 +1742,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
   ]), ctx)
 
   ctx = addFunc("putchar", ["input"], 0, sb3.BlockList([
-    sb3.Say(sb3.GetOfList("atindex", (cfg.ascii_lookup_var + cfg.zero_indexed_suffix), sb3.GetParameter(localizeParameter("input")))),
+    sb3.Say(sb3.GetOfList("atindex",
+      (cfg.ascii_lookup_var + cfg.zero_indexed_suffix),
+      sb3.GetParameter(localizeParameter("input")))),
     sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
