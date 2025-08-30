@@ -85,6 +85,9 @@ class BlockInfo:
   """Info about a LLVM block"""
   fn: FuncInfo
   available_params: list[Variable] # All params that can be accessed from the function
+  first_block: bool = False # Is this is the first block of the function
+  next_call_id: int = 0 # The id to give to the nth function call
+  code: sb3.BlockList = field(default_factory=sb3.BlockList) # The current code instructions are being added to
   label: str = "" # Name/Label of the block
   allocated: int = 0 # Out of the amount allocated for the branch beforehand, how much has been translated into addresses
 
@@ -452,6 +455,173 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
     arguments.append(value.value)
   return arguments, blocks
 
+def assignParameters(params: list[Variable]) -> sb3.BlockList:
+  # TODO OPTI: work out if values are needed before assigning them
+  blocks = sb3.BlockList()
+  for param in params:
+    var = deepcopy(param)
+    var.var_type = "var"
+    blocks.add(var.setValue(param.getValue()))
+  return blocks
+
+def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
+                               ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
+  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [param.getRawVarName() for param in params])])
+
+  if ctx.cfg.do_debug_branch_log:
+    # Increment the branch counter in the log
+    index = sb3.Known((fn.fn_id * 2) + 2)
+    blocks.add(sb3.BlockList([
+      sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add",
+        sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
+    ))]))
+
+  if is_counted:
+    blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing
+                                        # a number
+
+  return blocks, ctx
+
+def getCheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
+                             ctx: Context) -> tuple[sb3.BlockList, Context]:
+  """
+  Returns the blocks needed to return a branch instruction (procedure)
+  that will reset the scratch's stack if reaching a max amount of permutations,
+  preventing scratch from running out of memory
+  """
+
+  reset_broadcast = f"{proc_name}:reset stack"
+  arguments = [name.getValue() for name in params]
+  ctx.proj.code.append(sb3.BlockList([
+    sb3.OnBroadcast(reset_broadcast),
+    sb3.ProcedureCall(proc_name, arguments),
+  ]))
+
+  blocks, ctx = getUncheckedProcedureStart(proc_name, params, fn, ctx, is_counted=True)
+
+  on_reset = sb3.BlockList()
+  if len(params) > 0:
+    # FUTURE OPTI: the assigned params could potentially used elsewhere but there's hardly a perf gain
+    on_reset = assignParameters(params)
+  on_reset.add(sb3.BlockList([
+    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
+    sb3.EditCounter("clear"),
+    sb3.StopScript("stopthis")]))
+
+  blocks.add(sb3.ControlFlow("if",
+    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), on_reset))
+
+  return blocks, ctx
+
+def transComplexCall(caller: FuncInfo, callee: FuncInfo,
+                     args: list[ir.Value], result: Variable | None,
+                     following_instrs: list[ir.Instruction],
+                     ctx: Context, bctx: BlockInfo) -> tuple[Context, BlockInfo]:
+  """
+  Translates a function call. Deals with functions with return
+  addresses and recursion. May change the function that instructions
+  are being added to.
+  """
+
+  assert len(bctx.label) > 0
+
+  poss_recursive = caller.name in callee.can_call
+  if poss_recursive:
+    # Get all variables which are used later after the recursion
+    must_store: list[Variable] = []
+    # Include the return value in variables which aren't depended on
+    starting_var_use = BlockVarUse() if result is None else BlockVarUse(modifies={"%" + result.var_name})
+    for var in getBlockVarUse(following_instrs,
+                              caller.block_var_use,
+                              starting_var_use).depends:
+      decoded_var = decodeVar(var, bctx)
+      assert decoded_var is not None
+      must_store.append(decoded_var)
+
+    # Sort the parameters in numeric then alphabetical order for better readability
+    must_store.sort(key=lambda var: (0, int(var.var_name)) if var.var_name.isdigit() else (1, var.var_name))
+
+    if caller.total_alloca_size is None and not caller.skip_stack_size_change:
+      must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
+
+    if caller.returns_to_address:
+      must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
+
+    # If we don't need to store any parameters for later we don't need to do anything special when we recurse
+    poss_recursive = len(must_store) > 0
+
+  if not poss_recursive: # TODO OPTI: this can also be used if possibly recusive but we don't depend on anything after
+    arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
+
+    if callee.returns_to_address:
+      return_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name)
+      return_addr_id = callee.return_addresses.index(return_proc_name)
+      arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
+
+      # Make sure parameters can be accessed later
+      bctx.code.add(assignParameters(bctx.available_params))
+
+    call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+    bctx.code.add(arg_value_blocks)
+    bctx.code.add(call_blocks)
+
+    if not callee.returns_to_address:
+      bctx.code.add(assign_blocks)
+    else:
+      # Start new block list
+      ctx.proj.code.append(bctx.code)
+      bctx.first_block = False
+      bctx.available_params = []
+
+      # Add code for callback
+      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], caller, ctx,
+                                                  is_counted=callee.returns_to_address)
+      bctx.code.add(assign_blocks)
+  else:
+    if not callee.returns_to_address:
+      # Use the parameters for procedures to use scratch's stack to store any variables needed later
+      recurse_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name, True)
+      bctx.code.add(sb3.ProcedureCall(recurse_proc_name, [var.getValue() for var in must_store]))
+
+      for i, var in enumerate(must_store):
+        must_store[i].var_type = "param"
+
+      # Start new block list
+      bctx.first_block = False
+      ctx.proj.code.append(bctx.code)
+      # Make sure that these parameters are assigned back to variables if needed later
+      bctx.available_params = must_store
+      bctx.code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
+
+      arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
+      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+      bctx.code.add(arg_value_blocks)
+      bctx.code.add(call_blocks)
+      bctx.code.add(assign_blocks)
+    else:
+      raise CompException("Recursive functions that may return to an address are not yet supported")
+
+  bctx.next_call_id += 1
+
+  return ctx, bctx
+
+def transSimpleCall(name: str, arguments: list[sb3.Value],
+              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
+  """
+  Translates simple function calls. Deals with passing parameters and
+  return values. The first block list returned is any blocks to call
+  the function, the second any needed to assign the return value to
+  the output.
+  """
+
+  call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
+
+  set_value_blocks = sb3.BlockList()
+  if output is not None:
+    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
+
+  return call_blocks, set_value_blocks
+
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
   match value:
     case sb3.Value():
@@ -476,19 +646,6 @@ def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Typ
       return blocks
     case _:
       raise CompException("Unmatched")
-
-def transCall(name: str, arguments: list[sb3.Value],
-              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
-  """The first block list returned is any blocks to call the function, the
-  second any needed to assign the return value to the output"""
-
-  call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
-
-  set_value_blocks = sb3.BlockList()
-  if output is not None:
-    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
-
-  return call_blocks, set_value_blocks
 
 def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context, BlockInfo]:
   blocks = sb3.BlockList()
@@ -1133,64 +1290,6 @@ def getFuncBranchesVarUse(func: ir.Function) -> dict[str, BlockVarUse]:
 
   return res
 
-def assignParameters(params: list[Variable]) -> sb3.BlockList:
-  # TODO OPTI: work out if values are needed before assigning them
-  blocks = sb3.BlockList()
-  for param in params:
-    var = deepcopy(param)
-    var.var_type = "var"
-    blocks.add(var.setValue(param.getValue()))
-  return blocks
-
-def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
-                               ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
-  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [param.getRawVarName() for param in params])])
-
-  if ctx.cfg.do_debug_branch_log:
-    # Increment the branch counter in the log
-    index = sb3.Known((fn.fn_id * 2) + 2)
-    blocks.add(sb3.BlockList([
-      sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add",
-        sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
-    ))]))
-
-  if is_counted:
-    blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing
-                                        # a number
-
-  return blocks, ctx
-
-def getCheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
-                             ctx: Context) -> tuple[sb3.BlockList, Context]:
-  """
-  Returns the blocks needed to return a branch instruction (procedure)
-  that will reset the scratch's stack if reaching a max amount of permutations,
-  preventing scratch from running out of memory
-  """
-
-  reset_broadcast = f"{proc_name}:reset stack"
-  arguments = [name.getValue() for name in params]
-  ctx.proj.code.append(sb3.BlockList([
-    sb3.OnBroadcast(reset_broadcast),
-    sb3.ProcedureCall(proc_name, arguments),
-  ]))
-
-  blocks, ctx = getUncheckedProcedureStart(proc_name, params, fn, ctx, is_counted=True)
-
-  on_reset = sb3.BlockList()
-  if len(params) > 0:
-    # FUTURE OPTI: the assigned params could potentially used elsewhere but there's hardly a perf gain
-    on_reset = assignParameters(params)
-  on_reset.add(sb3.BlockList([
-    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
-    sb3.EditCounter("clear"),
-    sb3.StopScript("stopthis")]))
-
-  blocks.add(sb3.ControlFlow("if",
-    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), on_reset))
-
-  return blocks, ctx
-
 def transTerminatorInstr(instr: ir.Instruction,
                          ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
@@ -1462,14 +1561,14 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       if getByteSize(param_ty) > 1:
         raise CompException("Parameters can only be one scratch byte in size") # TODO FIX
 
-    first_block = True
+    is_first_block = True
     total_fn_allocated = 0
     for block in func.blocks.values():
       call_id = 0
       block_label = block.value.val
       assert isinstance(block_label, str)
 
-      if first_block:
+      if is_first_block:
         proc_name = fn_name
         localized_params = info.params
       else:
@@ -1484,131 +1583,64 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       # Get code to start the branch (procedure definition, etc)
       if block_label not in info.checked_blocks:
-        block_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
+        starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
                                                      is_counted=info.returns_to_address)
       else:
-        block_code, ctx = getCheckedProcedureStart(proc_name, localized_params, info, ctx)
+        starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params, info, ctx)
 
-      if first_block and ctx.cfg.do_debug_branch_log:
+      if is_first_block and ctx.cfg.do_debug_branch_log:
         # Increment the function counter in the log
         index = sb3.Known((info.fn_id * 2) + 1)
-        block_code.add(sb3.BlockList([
+        starting_fn_code.add(sb3.BlockList([
           sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add",
             sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
         ))]))
 
       # Store the previous stack size if necessary
-      if first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
-        block_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params))
+      if is_first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
+        starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params))
           .setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
 
       # Change stack size by the amount the function/branch allocates beforehand
       # FUTURE FIX: This could technically cause issues if we normally allocate after recursing, which could lead to
       # memory being allocated to the stack when it shouldn't, but this likely won't cause any issues
       to_allocate: int = 0
-      if first_block and info.total_alloca_size is not None:
+      if is_first_block and info.total_alloca_size is not None:
         to_allocate = info.total_alloca_size
       elif info.total_alloca_size is None:
         to_allocate = info.block_alloca_size[block_label]
 
       if to_allocate != 0 and not info.skip_stack_size_change:
-        block_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
+        starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
-      available_params: list[Variable] = info.params if first_block else []
-      bctx = BlockInfo(info, available_params, block_label, total_fn_allocated)
+      available_params: list[Variable] = info.params if is_first_block else []
+      bctx = BlockInfo(info, available_params, first_block=is_first_block,
+                       code=starting_fn_code, label=block_label,
+                       allocated=total_fn_allocated)
 
       # Translate everything except the terminator operation
       for instr_index, instr in enumerate(block.instrs[:-1]):
-        if isinstance(instr, ir.Call): # Call instructions handled here because might need to return at an address
+        assert bctx is not None
+        if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
           callee_name = instr.callee.val
           assert isinstance(callee_name, str)
           callee_info = ctx.fn_info[callee_name]
+          args = instr.args
+          result = decodeVar(instr.result, bctx)
+          following_instrs = block.instrs[instr_index + 1:]
 
-          poss_recursive = fn_name in callee_info.can_call
-
-          output = decodeVar(instr.result, bctx)
-
-          if not poss_recursive: # TODO OPTI: this can also be used if possibly recusive but we don't depend on anything after
-            arguments, arg_value_blocks = getCallArguments(instr.args, ctx, bctx)
-
-            if callee_info.returns_to_address:
-              return_proc_name = localizeCallId(call_id, block_label, fn_name)
-              return_addr_id = callee_info.return_addresses.index(return_proc_name)
-              arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
-
-              # Make sure parameters can be accessed later
-              block_code.add(assignParameters(available_params))
-
-            call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
-            block_code.add(arg_value_blocks)
-            block_code.add(call_blocks)
-
-            if not callee_info.returns_to_address:
-              block_code.add(assign_blocks)
-            else:
-              # Start new block list
-              ctx.proj.code.append(block_code)
-              first_block = False
-              bctx.available_params = []
-
-              # Add code for callback
-              block_code, ctx = getUncheckedProcedureStart(return_proc_name, [], info, ctx,
-                                                          is_counted=callee_info.returns_to_address)
-              block_code.add(assign_blocks)
-          else:
-            # Get all variables which are used later after the recursion
-            must_store: list[Variable] = []
-            # Include the return value in variables which aren't depended on
-            starting_var_use = BlockVarUse() if output is None else BlockVarUse(modifies={"%" + output.var_name})
-            for var in getBlockVarUse(block.instrs[instr_index + 1:],
-                                      info.block_var_use,
-                                      starting_var_use).depends:
-              decoded_var = decodeVar(var, bctx)
-              assert decoded_var is not None
-              must_store.append(decoded_var)
-
-            # Sort the parameters in numeric then alphabetical order for better readability
-            must_store.sort(key=lambda var: (0, int(var.var_name)) if var.var_name.isdigit() else (1, var.var_name))
-
-            if info.total_alloca_size is None and not info.skip_stack_size_change:
-              must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
-
-            if info.returns_to_address:
-              must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
-
-            if not callee_info.returns_to_address:
-              recurse_proc_name = localizeCallId(call_id, block_label, fn_name, True)
-              block_code.add(sb3.ProcedureCall(recurse_proc_name, [var.getValue() for var in must_store]))
-
-              for i, var in enumerate(must_store):
-                must_store[i].var_type = "param"
-
-              ctx.proj.code.append(block_code)
-              first_block = False
-              bctx.available_params = must_store
-              block_code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
-
-              arguments, arg_value_blocks = getCallArguments(instr.args, ctx, bctx)
-              call_blocks, assign_blocks = transCall(callee_name, arguments, output, ctx)
-              block_code.add(arg_value_blocks)
-              block_code.add(call_blocks)
-              block_code.add(assign_blocks)
-            else:
-              raise CompException("Recursive functions that may return to an address are not yet supported")
-
-          call_id += 1
+          ctx, bctx = transComplexCall(info, callee_info, args, result, following_instrs, ctx, bctx)
         else:
           instr_code, ctx, bctx = transInstr(instr, ctx, bctx)
-          block_code.add(instr_code)
+          bctx.code.add(instr_code)
 
       # TODO OPTI: work out where if statements can be placed etc
       terminator_code, ctx = transTerminatorInstr(block.instrs[-1], ctx, bctx)
-      block_code.add(terminator_code)
+      bctx.code.add(terminator_code)
+      ctx.proj.code.append(bctx.code)
 
-      ctx.proj.code.append(block_code)
-
-      first_block = False
+      is_first_block = False
       if info.total_alloca_size == None:
         total_fn_allocated = bctx.allocated
 
