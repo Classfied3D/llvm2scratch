@@ -31,6 +31,7 @@ class Config:
   opti: bool = True # If optimisations for scratch should be applied
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
   stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
+  label_stack_size: int = 512 # Max amount of labels on the recursion stack, max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before reseting
                                         # scratch's call stack via a broadcast
@@ -43,7 +44,10 @@ class Config:
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
-  debug_branch_log_var = "!!debug_branch_log" # (using underscores to avoid spaces in filename for convenience)
+  local_stack_var = "!local stack" # Name of the scratch list to store variables that will be used recursively
+  local_stack_size_var = "!local stack size" # Name of the scratch variable to store the label stack's size
+  debug_branch_log_var = "!!debug_branch_log" # Name of the scratch list to store debug info (using underscores
+                                              # to avoid spaces in exported filename for convenience)
 
   ascii_lookup_var = "!ascii lookup"
   binop_lookup_var = "!binop lookup"
@@ -51,6 +55,7 @@ class Config:
 
   return_address_local = "return address" # Name of the local variable or parameter to the id of func the return to
   previous_stack_size_local = "prev stack size" # Name of the local variable to store the previous stack size
+  special_locals = {return_address_local, previous_stack_size_local} # All special local vars
 
   tmp_prefix = "tmp " # Name of temp variables before a number is added to them
   zero_indexed_suffix = " (0 indexed)"
@@ -445,6 +450,21 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
                                      _lo=_lo,     _hi=mid))])
 
+def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
+  ptr = sb3.GetVar(stack_size_var)
+  if offset > 0:
+    ptr = sb3.Op("add", ptr, sb3.Known(offset))
+  elif offset < 0:
+    # Subtract instead... because it looks nicer lol
+    ptr = sb3.Op("sub", ptr, sb3.Known(-offset))
+  return ptr
+
+def storeOnStack(stack_var: str, stack_size_var: str, offset: int, value: sb3.Value) -> sb3.Block:
+  return sb3.EditList("replaceat", stack_var, offsetStackSize(stack_size_var, offset), value)
+
+def loadFromStack(stack_var: str, stack_size_var: str, offset: int) -> sb3.Value:
+  return sb3.GetOfList("atindex", stack_var, offsetStackSize(stack_size_var, offset))
+
 def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tuple[list[sb3.Value], sb3.BlockList]:
   arguments: list[sb3.Value] = []
   blocks = sb3.BlockList()
@@ -462,7 +482,7 @@ def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> 
     var = deepcopy(param)
     var.var_type = "var"
     # Don't assign anything we depend upon in future
-    if ("%" + var.var_name) in next_var_use_depends:
+    if var.var_name in next_var_use_depends:
       blocks.add(var.setValue(param.getValue()))
   return blocks
 
@@ -515,6 +535,23 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable],
 
   return blocks, ctx
 
+def transSimpleCall(name: str, arguments: list[sb3.Value],
+              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
+  """
+  Translates simple function calls. Deals with passing parameters and
+  return values. The first block list returned is any blocks to call
+  the function, the second any needed to assign the return value to
+  the output.
+  """
+
+  call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
+
+  set_value_blocks = sb3.BlockList()
+  if output is not None:
+    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
+
+  return call_blocks, set_value_blocks
+
 def transComplexCall(caller: FuncInfo, callee: FuncInfo,
                      args: list[ir.Value], result: Variable | None,
                      following_instrs: list[ir.Instruction],
@@ -554,16 +591,19 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
     # If we don't need to store any parameters for later we don't need to do anything special when we recurse
     poss_recursive = len(must_store) > 0
 
+  if callee.returns_to_address:
+    return_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name)
+    return_addr_id = callee.return_addresses.index(return_proc_name)
+
   if not poss_recursive: # TODO OPTI: this can also be used if possibly recusive but we don't depend on anything after
     arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
 
     if callee.returns_to_address:
-      return_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name)
-      return_addr_id = callee.return_addresses.index(return_proc_name)
-      arguments.append(sb3.Known(return_addr_id)) # Pass return address into function
-
+      # Pass return address into function
+      arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
-      bctx.code.add(assignParameters(bctx.available_params, next_var_use.depends))
+      bctx.code.add(assignParameters(bctx.available_params, {dependent[1:] for dependent in next_var_use.depends}
+                                                            | ctx.cfg.special_locals))
 
     call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
     bctx.code.add(arg_value_blocks)
@@ -603,28 +643,36 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       bctx.code.add(call_blocks)
       bctx.code.add(assign_blocks)
     else:
-      raise CompException("Recursive functions that may return to an address are not yet supported")
+      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(len(must_store))))
+
+      for i, var in enumerate(must_store):
+        bctx.code.add(storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -i, var.getValue()))
+        must_store[i].var_type = "var"
+
+      arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
+      arguments.append(sb3.Known(return_addr_id))
+
+      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+      bctx.code.add(arg_value_blocks)
+      bctx.code.add(call_blocks)
+
+      ctx.proj.code.append(bctx.code)
+      bctx.first_block = False
+      bctx.available_params = []
+
+      # Add code for callback
+      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], caller, ctx,
+                                                  is_counted=callee.returns_to_address)
+      bctx.code.add(assign_blocks)
+
+      for i, var in enumerate(must_store):
+        bctx.code.add(var.setValue(loadFromStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -i)))
+
+      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(-len(must_store))))
 
   bctx.next_call_id += 1
 
   return ctx, bctx
-
-def transSimpleCall(name: str, arguments: list[sb3.Value],
-              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
-  """
-  Translates simple function calls. Deals with passing parameters and
-  return values. The first block list returned is any blocks to call
-  the function, the second any needed to assign the return value to
-  the output.
-  """
-
-  call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
-
-  set_value_blocks = sb3.BlockList()
-  if output is not None:
-    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
-
-  return call_blocks, set_value_blocks
 
 def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
   match value:
@@ -672,15 +720,8 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
                                    # optimization because the extra add/subtract can be ignored
       bctx.allocated += size
 
-      ptr = sb3.GetVar(ctx.cfg.stack_size_var)
-      if offset > 0:
-        ptr = sb3.Op("add", ptr, sb3.Known(offset))
-      elif offset < 0:
-        # Subtract instead... because it looks nicer lol
-        ptr = sb3.Op("sub", ptr, sb3.Known(-offset))
-
       if var is not None:
-        blocks.add(var.setValue(ptr))
+        blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_size_var, offset)))
 
     case ir.Load(): # Load a value from an address on the stack
       address = decodeValue(instr.address, ctx, bctx)
@@ -1318,7 +1359,8 @@ def transTerminatorInstr(instr: ir.Instruction,
   poss_branch = set(getTerminatorInstrLabels(instr)) - {"ret"}
   poss_depends: set[str] = set()
   for branch in poss_branch:
-    poss_depends |= bctx.fn.block_var_use[branch].depends
+    poss_depends |= {dependent[1:] for dependent in bctx.fn.block_var_use[branch].depends}
+  poss_depends |= ctx.cfg.special_locals
 
   blocks = sb3.BlockList()
   match instr:
@@ -1333,6 +1375,15 @@ def transTerminatorInstr(instr: ir.Instruction,
         blocks.add(value.blocks)
         blocks.add(sb3.EditVar("set", ctx.cfg.return_var, value.value))
 
+      # Change the stack size after setting the return value because some return values might be optimized to use
+      # the stack size var
+      if not bctx.fn.skip_stack_size_change:
+        if bctx.fn.total_alloca_size is not None:
+          blocks.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(-bctx.fn.total_alloca_size)))
+        else:
+          blocks.add(sb3.EditVar("set", ctx.cfg.stack_size_var, localizeVar(ctx.cfg.previous_stack_size_local,
+                                                                            False, bctx).getValue()))
+
       if bctx.fn.returns_to_address:
         return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
         return_to_addr_code = OrderedDict()
@@ -1341,14 +1392,6 @@ def transTerminatorInstr(instr: ir.Instruction,
 
         return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
         blocks.add(return_table)
-
-      # Change the stack size after setting the return value because some return values might be optimized to use
-      # the stack size var
-      if not bctx.fn.skip_stack_size_change:
-        if bctx.fn.total_alloca_size is not None:
-          blocks.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(-bctx.fn.total_alloca_size)))
-        else:
-          blocks.add(sb3.EditVar("set", ctx.cfg.stack_size_var, localizeVar(ctx.cfg.previous_stack_size_local, False, bctx).getValue()))
 
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
@@ -1445,7 +1488,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     if func.has_no_body():
       if fn_name not in ctx.fn_info:
-        raise CompException("Externally defined function must have info about it")
+        raise CompException(f"Externally defined function {fn_name} must have info about it")
       info = ctx.fn_info[fn_name]
       call_graph[fn_name] = info.can_call, True
       block_var_use[fn_name] = info.block_var_use
@@ -1617,7 +1660,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
-        next_var_use_depends = info.block_var_use[block_label].depends
+        next_var_use_depends = {dependent[1:] for dependent in info.block_var_use[block_label].depends}
+        next_var_use_depends |= ctx.cfg.special_locals
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params,
                                                          next_var_use_depends, info, ctx)
 
@@ -1739,6 +1783,15 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   return blocks, ctx
 
+def initLocalStack(ctx: Context) -> sb3.BlockList:
+  return sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.local_stack_size_var, sb3.Known(0)),
+    sb3.EditList("deleteall", ctx.cfg.local_stack_var, None, None),
+    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.label_stack_size), sb3.BlockList([
+      sb3.EditList("addto", ctx.cfg.local_stack_var, None, sb3.Known(0)),
+    ]))
+  ])
+
 def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.BlockList, ctx: Context) -> Context:
   """
   total_alloca_size: int of how much the function allocates to the stack.
@@ -1753,7 +1806,7 @@ def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.
   ctx.next_fn_id += 1
   return ctx
 
-def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project, DebugInfo]:
+def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:
   """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
   if cfg is None: cfg = Config()
   debug_info = cfg.debug_info
@@ -1777,6 +1830,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None=None) -> tuple[sb3.Project
   # Setup stack
   globblocks, ctx = transGlobals(mod, ctx)
   initblocks.add(globblocks)
+  initblocks.add(initLocalStack(ctx))
 
   # Add foreign functions
   ascii_lookup = []

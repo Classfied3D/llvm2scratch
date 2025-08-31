@@ -23,7 +23,7 @@ int factorial_recurse(int n) {
   return factorial_recurse(n - 1) * n;
 }
 
-int sumToOneDigit(unsigned n) {
+int sum_to_one_digit(unsigned int n) {
   unsigned int sum = 0;
 
   while (n > 0) {
@@ -31,7 +31,7 @@ int sumToOneDigit(unsigned n) {
     n /= 10;
   }
 
-  if (sum >= 10) return sumToOneDigit(sum);
+  if (sum >= 10) return sum_to_one_digit(sum);
   return sum;
 }
 
@@ -79,10 +79,10 @@ int main(void) {
     default:
       puts("default");
       break;
-  }
+      }
 
   int f = factorial_recurse(10);
-  int g = sumToOneDigit(403);
+  int g = sum_to_one_digit(473);
 
   return 0;
 }
