@@ -23,6 +23,18 @@ int factorial_recurse(int n) {
   return factorial_recurse(n - 1) * n;
 }
 
+int sumToOneDigit(unsigned n) {
+  unsigned int sum = 0;
+
+  while (n > 0) {
+    sum += n % 10;
+    n /= 10;
+  }
+
+  if (sum >= 10) return sumToOneDigit(sum);
+  return sum;
+}
+
 int main(void) {
   puts("hello world");
   a += 2;
@@ -50,7 +62,7 @@ int main(void) {
     putchar(d);
   }
 
-  unsigned int e = 46;
+  unsigned int e = 21;
   switch (e) {
     case 0:
       puts("0");
@@ -70,6 +82,7 @@ int main(void) {
   }
 
   int f = factorial_recurse(10);
+  int g = sumToOneDigit(403);
 
   return 0;
 }

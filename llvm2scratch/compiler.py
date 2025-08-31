@@ -857,7 +857,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           # TODO OPTI: optimise for known values
           if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                "integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.fst_operand.ty)}")
 
           width = instr.fst_operand.ty.num_bits
           # TODO FIX: support larger values
@@ -1097,8 +1097,26 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           res_val = sb3.BoolOp("=", left, right)
         case "ne":
           res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
+        case "ugt":
+          res_val = sb3.BoolOp(">", left, right)
+        case "uge":
+          if isinstance(left, sb3.Known):
+            res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
+          elif isinstance(right, sb3.Known):
+            res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
+          else:
+            res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
+        case "ult":
+          res_val = sb3.BoolOp("<", left, right)
+        case "ule":
+          if isinstance(left, sb3.Known):
+            res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
+          elif isinstance(right, sb3.Known):
+            res_val = sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
+          else:
+            res_val = sb3.BoolOp("not", sb3.BoolOp(">", left, right))
         case _:
-          # TODO FIX: ugt, uge, ult, ule, and signed counterparts
+          # TODO FIX: signed versions
           raise CompException(f"icmp does not support comparsion mode {instr.cond}")
 
       # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
