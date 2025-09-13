@@ -79,7 +79,7 @@ int main(void) {
     default:
       puts("default");
       break;
-      }
+  }
 
   int f = factorial_recurse(10);
   int g = sum_to_one_digit(473);

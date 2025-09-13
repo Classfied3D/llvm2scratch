@@ -79,6 +79,7 @@ class FuncInfo:
   can_call: set[str] # Everything the function might call (may include itself)
   return_addresses: list[str] # Any functions that call this function
   returns_to_address: bool # If the function returns using a broadcast to an address
+  takes_return_address: bool # If the function takes a return address as a parameter
   checked_blocks: list[str] # List of label names that will contain a check to reset the stack
   block_alloca_size: defaultdict[str, int] # Amount allocated per branch
   total_alloca_size: int | None # Amount allocated total. None if this amount is not known
@@ -585,7 +586,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
     if caller.total_alloca_size is None and not caller.skip_stack_size_change:
       must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
 
-    if caller.returns_to_address:
+    if caller.takes_return_address:
       must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
 
     # If we don't need to store any parameters for later we don't need to do anything special when we recurse
@@ -599,8 +600,9 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
     arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
 
     if callee.returns_to_address:
-      # Pass return address into function
-      arguments.append(sb3.Known(return_addr_id))
+      if callee.takes_return_address:
+        # Pass return address into function
+        arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
       bctx.code.add(assignParameters(bctx.available_params, {dependent[1:] for dependent in next_var_use.depends}
                                                             | ctx.cfg.special_locals))
@@ -1385,13 +1387,21 @@ def transTerminatorInstr(instr: ir.Instruction,
                                                                             False, bctx).getValue()))
 
       if bctx.fn.returns_to_address:
-        return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
-        return_to_addr_code = OrderedDict()
-        for i, addr in enumerate(bctx.fn.return_addresses):
-          return_to_addr_code.update({i: sb3.BlockList([sb3.ProcedureCall(addr, [])])})
+        if bctx.fn.takes_return_address:
+          return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
+          return_to_addr_code = OrderedDict()
+          for i, addr in enumerate(bctx.fn.return_addresses):
+            return_to_addr_code.update({i: sb3.BlockList([sb3.ProcedureCall(addr, [])])})
 
-        return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
-        blocks.add(return_table)
+          return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
+          blocks.add(return_table)
+        elif len(bctx.fn.return_addresses) > 0:
+          # If the function doesn't take a return address then it must always return to the same place
+          assert len(bctx.fn.return_addresses) == 1
+          blocks.add(sb3.BlockList([sb3.ProcedureCall(bctx.fn.return_addresses[0], [])]))
+        else:
+          pass # TODO FIX: if a function ever returns here the stack will unwind which may be unexpected
+               # so the stop all block could be used. This happens with the main function
 
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
@@ -1600,18 +1610,23 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     skip_stack_size_change = total_alloca_size[fn_name] is not None and \
       all(total_alloca_size[call] == 0 for call in call_graph[fn_name][0])
 
+    fn_ret_addresses = return_addresses.get(fn_name, list())
+    fn_returns_to_address = returns_to_address[fn_name]
+    # If the function returns to an address and is called from multiple locations,
+    # then it must take a return address to know where to return to
+    fn_takes_ret_addr = fn_returns_to_address and len(fn_ret_addresses) > 1
+
     param_names = []
     for arg in func.args:
       assert isinstance(arg.val, str)
       assert arg.val.startswith("%")
       param_names.append(arg.val[1:])
 
-    if returns_to_address[fn_name]: param_names.append(ctx.cfg.return_address_local)
-
+    if fn_takes_ret_addr: param_names.append(ctx.cfg.return_address_local)
     params = [Variable(name, "param", fn_name) for name in param_names]
 
     ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, params, call_graph[fn_name][0],
-                                    return_addresses.get(fn_name, list()), returns_to_address[fn_name],
+                                    fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
                                     all_check_locations.get(fn_name, list()),
                                     branch_alloca_size[fn_name], total_alloca_size.get(fn_name, None),
                                     skip_stack_size_change, block_var_use[fn_name])
@@ -1802,7 +1817,7 @@ def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.
   blocks.add(contents)
   ctx.proj.code.append(blocks)
   ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, set(),
-                               list(), False, list(), defaultdict(int), 0, False, {})
+                               list(), False, False, list(), defaultdict(int), 0, False, {})
   ctx.next_fn_id += 1
   return ctx
 
@@ -1894,7 +1909,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Call main func call to init code
   if not "main" in ctx.fn_info:
     raise CompException("No main function") # TODO FIX: add libs
-  main_params_len = len(ctx.fn_info["main"].params) + int(ctx.fn_info["main"].returns_to_address)
+  main_params_len = len(ctx.fn_info["main"].params) + int(ctx.fn_info["main"].takes_return_address)
   initblocks.add(sb3.ProcedureCall("main", [sb3.Known("")] * main_params_len))
 
   # Add init code
