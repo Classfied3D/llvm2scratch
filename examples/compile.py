@@ -8,7 +8,7 @@ def main():
 
   # --target=i386-none-elf will remove standard lib, preferable when adding own
   subprocess.run(["clang", "-S", "-m32", "-O0", "-emit-llvm", "main.c"],
-                cwd=os.path.join(script_dir, "input"))
+                 cwd=os.path.join(script_dir, "input"))
 
   with open("input/main.ll", "r") as file:
     proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(opti=True))

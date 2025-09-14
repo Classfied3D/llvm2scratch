@@ -75,16 +75,28 @@ class FuncInfo:
   """Info about a LLVM function"""
   name: str
   fn_id: int
-  params: list[Variable] # The parameters the function takes (doesn't include return address)
-  can_call: set[str] # Everything the function might call (may include itself)
-  return_addresses: list[str] # Any functions that call this function
-  returns_to_address: bool # If the function returns using a broadcast to an address
-  takes_return_address: bool # If the function takes a return address as a parameter
-  checked_blocks: list[str] # List of label names that will contain a check to reset the stack
-  block_alloca_size: defaultdict[str, int] # Amount allocated per branch
-  total_alloca_size: int | None # Amount allocated total. None if this amount is not known
-  skip_stack_size_change: bool # Whether to skip increasing the stack size because other functions don't rely on it
-  block_var_use: dict[str, BlockVarUse] # What a block depends on and modifies
+  # The parameters the function takes (doesn't include return address)
+  params: list[Variable]
+  # Everything the function might call (may include itself)
+  can_call: set[str] = field(default_factory=set)
+  # Any functions that call this function
+  return_addresses: list[str] = field(default_factory=list)
+  # If the function returns using a broadcast to an address
+  returns_to_address: bool = False
+  # If the function takes a return address as a parameter
+  takes_return_address: bool = False
+  # List of label names that will contain a check to reset the stack
+  checked_blocks: list[str] = field(default_factory=list)
+  # Amount allocated per branch
+  block_alloca_size: defaultdict[str, int] = field(default_factory=lambda: defaultdict(int))
+  # Amount allocated total. None if this amount is not known
+  total_alloca_size: int | None = 0
+  # Whether to skip increasing the stack size because other functions don't rely on it
+  skip_stack_size_change: bool = False
+  # What a block depends on and modifies
+  block_var_use: dict[str, BlockVarUse] = field(default_factory=dict)
+  # If any branches in the function can go to the first block
+  branches_to_first: bool = False
 
 @dataclass
 class BlockInfo:
@@ -1491,6 +1503,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   branch_alloca_size: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
   total_alloca_size: dict[str, int | None] = {}
   block_var_use: dict[str, dict[str, BlockVarUse]] = {}
+  branches_to_first: dict[str, bool] = {}
 
   for func in mod.funcs.values():
     fn_name = func.value.val
@@ -1597,6 +1610,13 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       # difficult to gauge if it will actually have a net positive impact (will force callers
       # to return to an address, the longest path may only be taken some of the times).
 
+      fn_branches_to_first = False
+      if len(func.blocks) > 0:
+        first_block_label = list(func.blocks.values())[0].value.val
+        assert isinstance(first_block_label, str)
+        fn_branches_to_first = any([first_block_label in branch_to for branch_to in branches.values()])
+      branches_to_first[fn_name] = fn_branches_to_first
+
   for fn_name in returns_to_address:
     # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
@@ -1629,7 +1649,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
                                     fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
                                     all_check_locations.get(fn_name, list()),
                                     branch_alloca_size[fn_name], total_alloca_size.get(fn_name, None),
-                                    skip_stack_size_change, block_var_use[fn_name])
+                                    skip_stack_size_change, block_var_use[fn_name],
+                                    branches_to_first.get(fn_name, False))
     ctx.next_fn_id += 1
 
   return ctx
@@ -1664,14 +1685,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         proc_name = localizeLabel(block_label, info)
         localized_params = []
 
-      # TODO FIX: branching to first block of function. Since we assign
-      # the parameters anyway we could do this in caller function. Perhaps
-      # we could look at the var usage of each branches and decide which
-      # parameters should be passed and pass none if we ever branch to the
-      # main function.
-
       # Get code to start the branch (procedure definition, etc)
-      if block_label not in info.checked_blocks:
+      if (block_label not in info.checked_blocks) or (is_first_block and info.branches_to_first):
         starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
@@ -1693,11 +1708,37 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params))
           .setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
 
+      if is_first_block and info.branches_to_first:
+        # Work out what variables might be depended on in future
+        poss_depends = {dependent[1:] for dependent in info.block_var_use[block_label].depends}
+        poss_depends |= ctx.cfg.special_locals
+        starting_fn_code.add(assignParameters(info.params, poss_depends))
+
+        first_block_proc_name = localizeLabel(block_label, info)
+
+        starting_fn_code.add(sb3.ProcedureCall(first_block_proc_name, []))
+
+        # TODO FIX: repeat code, use helper func
+        ctx.proj.code.append(starting_fn_code)
+
+        if block_label not in info.checked_blocks:
+          starting_fn_code, ctx = getUncheckedProcedureStart(first_block_proc_name, [], info, ctx,
+                                                            is_counted=info.returns_to_address)
+        else:
+          starting_fn_code, ctx = getCheckedProcedureStart(first_block_proc_name, [],
+                                                           poss_depends, info, ctx)
+
+        is_first_block = False
+
       # Change stack size by the amount the function/branch allocates beforehand
       # FUTURE FIX: This could technically cause issues if we normally allocate after recursing, which could lead to
       # memory being allocated to the stack when it shouldn't, but this likely won't cause any issues
       to_allocate: int = 0
       if is_first_block and info.total_alloca_size is not None:
+        # We should never allocate to the stack for the whole function if we can branch the the first block because
+        # that would lead to double allocation. This could be fixed but this should never happen as we can't predict
+        # what we'd need to allocate for the entire function anyway
+        assert (info.branches_to_first is False) or (info.total_alloca_size == 0)
         to_allocate = info.total_alloca_size
       elif info.total_alloca_size is None:
         to_allocate = info.block_alloca_size[block_label]
@@ -1816,8 +1857,7 @@ def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, set(),
-                               list(), False, False, list(), defaultdict(int), 0, False, {})
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params)
   ctx.next_fn_id += 1
   return ctx
 
