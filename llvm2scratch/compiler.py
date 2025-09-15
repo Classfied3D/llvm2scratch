@@ -1210,6 +1210,34 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       if res_val is not None and res_var is not None:
         blocks.add(res_var.setValue(res_val))
 
+    case ir.Select(): # Select between two values based on a condition
+      cond = decodeValue(instr.cond, ctx, bctx)
+      true_val = decodeValue(instr.true_value, ctx, bctx)
+      false_val = decodeValue(instr.false_value, ctx, bctx)
+
+      if not all(isinstance(val.ty, ir.IntegerType) for val in \
+          (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"integers, got other type")
+      assert isinstance(instr.cond.ty, ir.IntegerType)
+      assert instr.cond.ty.num_bits == 1
+      assert isinstance(cond.value, sb3.Value)
+      assert isinstance(true_val.value, sb3.Value)
+      assert isinstance(false_val.value, sb3.Value)
+
+      res_var = decodeVar(instr.result, bctx)
+      assert res_var is None or res_var.var_type != "param"
+
+      if res_var is not None:
+        blocks.add(cond.blocks)
+        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList([
+          *true_val.blocks.blocks,
+          res_var.setValue(true_val.value)
+        ]), sb3.BlockList([
+          *false_val.blocks.blocks,
+          res_var.setValue(false_val.value)
+        ])))
+
     case _:
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx, bctx
@@ -1275,6 +1303,8 @@ def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
       vals = [instr.fst_operand, instr.snd_operand]
     case ir.Br() | ir.Switch():
       vals = [instr.cond]
+    case ir.Select():
+      vals = [instr.cond, instr.true_value, instr.false_value]
     case _:
       raise CompException(f"Unknown instruction {instr} (type {type(instr)})")
 
