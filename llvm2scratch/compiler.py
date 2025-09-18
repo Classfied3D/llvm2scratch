@@ -97,6 +97,9 @@ class FuncInfo:
   block_var_use: dict[str, BlockVarUse] = field(default_factory=dict)
   # If any branches in the function can go to the first block
   branches_to_first: bool = False
+  # Info about phi instructions in each branch
+  phi_info: defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]] = \
+    field(default_factory=lambda: defaultdict(lambda: defaultdict(lambda: list())))
 
 @dataclass
 class BlockInfo:
@@ -478,6 +481,27 @@ def storeOnStack(stack_var: str, stack_size_var: str, offset: int, value: sb3.Va
 def loadFromStack(stack_var: str, stack_size_var: str, offset: int) -> sb3.Value:
   return sb3.GetOfList("atindex", stack_var, offsetStackSize(stack_size_var, offset))
 
+def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+  for param in params:
+    var = deepcopy(param)
+    var.var_type = "var"
+    # Don't assign anything we depend upon in future
+    if var.var_name in next_var_use_depends:
+      blocks.add(var.setValue(param.getValue()))
+  return blocks
+
+def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+  for res_var, ir_val in phi_info:
+    val = decodeValue(ir_val, ctx, bctx)
+    if isinstance(val, IndexableValueAndBlocks):
+      raise CompException(f"Function argument cannot be an indexable value")
+    blocks.add(val.blocks)
+    blocks.add(res_var.setValue(val.value))
+
+  return blocks
+
 def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tuple[list[sb3.Value], sb3.BlockList]:
   arguments: list[sb3.Value] = []
   blocks = sb3.BlockList()
@@ -488,16 +512,6 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
     blocks.add(value.blocks)
     arguments.append(value.value)
   return arguments, blocks
-
-def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> sb3.BlockList:
-  blocks = sb3.BlockList()
-  for param in params:
-    var = deepcopy(param)
-    var.var_type = "var"
-    # Don't assign anything we depend upon in future
-    if var.var_name in next_var_use_depends:
-      blocks.add(var.setValue(param.getValue()))
-  return blocks
 
 def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
                                ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
@@ -580,7 +594,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
   # Include the return value in variables which aren't depended on
   starting_var_use = BlockVarUse() if result is None else BlockVarUse(modifies={"%" + result.var_name})
   # All variables that might be depended on/modified after the function is called
-  next_var_use = getBlockVarUse(following_instrs, caller.block_var_use, starting_var_use)
+  next_var_use = getBlockVarUse(following_instrs, bctx.fn.phi_info[bctx.label], caller.block_var_use, starting_var_use)
 
   poss_recursive = caller.name in callee.can_call
   if poss_recursive:
@@ -746,8 +760,7 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
       var = decodeVar(instr.result, bctx)
       if var is not None:
-        blocks.add(sb3.EditVar("set", var.getRawVarName(),
-                                      sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
+        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
 
     case ir.Store(): # Copy a value to an address on the stack
       value = decodeValue(instr.value, ctx, bctx)
@@ -1238,43 +1251,49 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           res_var.setValue(false_val.value)
         ])))
 
+    case ir.Phi():
+      pass # Phi assignments are dealt with in the brancher function
+
     case _:
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx, bctx
 
-def getTerminatorInstrLabels(instr: ir.Instruction) -> list[str]:
+def getTerminatorInstrLabels(instr: ir.Instruction) -> set[str]:
   """
   Returns every label a terminator instruction could branch to.
   Returns the string "ret" to indictate a return
   """
   match instr:
     case ir.Unreacheble():
-      return []
+      return set()
     case ir.Ret():
-      return ["ret"]
+      return {"ret"}
     case ir.Br():
       assert isinstance(instr.label_false.val, str)
-      branches = [instr.label_false.val]
+      branches = {instr.label_false.val}
       if instr.label_true is not None:
         assert isinstance(instr.label_true.val, str)
-        branches.append(instr.label_true.val)
+        branches.add(instr.label_true.val)
       return branches
     case ir.Switch():
       assert isinstance(instr.label_default.val, str)
-      branches = [instr.label_default.val]
+      branches = {instr.label_default.val}
       for _, label in instr.cases:
         assert isinstance(label.val, str)
-        branches.append(label.val)
+        branches.add(label.val)
       return branches
     case ir.CallBr():
       assert isinstance(instr.fallthrough_label.val, str)
       if instr.indirect_labels is not None:
         raise CompException("Indirect (exceptional) labels not supported")
-      return [instr.fallthrough_label.val]
+      return {instr.fallthrough_label.val}
     case _:
-      raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
+      raise CompException(f"Unsupported terminator instruction "
+                          f"opcode {instr} (type {type(instr)})")
 
-def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
+def getInstrVarUse(instr: ir.Instruction,
+    block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]]
+  ) -> tuple[set[str], set[str]]:
   """Returns what the instruction depends on and modifies"""
   depends: set[str] = set()
   modifies: set[str] = set()
@@ -1287,7 +1306,9 @@ def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
 
   vals: list[ir.Value | None]
   match instr:
-    case ir.Unreacheble() | ir.Alloca():
+    case ir.Unreacheble() | ir.Alloca() | ir.Phi():
+      # For phi, even though it might depend on a value, the
+      # branch instruction is made responsible instead
       vals = []
     case ir.Ret() | ir.Conversion():
       vals = [instr.value]
@@ -1303,6 +1324,9 @@ def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
       vals = [instr.fst_operand, instr.snd_operand]
     case ir.Br() | ir.Switch():
       vals = [instr.cond]
+      poss_labels = getTerminatorInstrLabels(instr) - {"ret"}
+      for label in poss_labels:
+        vals.extend([value for _, value in block_phi_info[label]])
     case ir.Select():
       vals = [instr.cond, instr.true_value, instr.false_value]
     case _:
@@ -1323,6 +1347,7 @@ def getInstrVarUse(instr: ir.Instruction) -> tuple[set[str], set[str]]:
   return depends, modifies
 
 def getBlockVarUse(instrs: list[ir.Instruction],
+                   block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]],
                    block_var_use: dict[str, BlockVarUse] | None = None,
                    starting_var_use: BlockVarUse | None = None) -> BlockVarUse:
   """
@@ -1335,12 +1360,12 @@ def getBlockVarUse(instrs: list[ir.Instruction],
   res = BlockVarUse() if starting_var_use is None else starting_var_use
 
   for instr in instrs:
-    instr_depends, instr_modifies = getInstrVarUse(instr)
+    instr_depends, instr_modifies = getInstrVarUse(instr, block_phi_info)
     # If we modify something before using it then we don't depend on it
     res.depends |= instr_depends - res.modifies
     res.modifies |= instr_modifies
 
-  res.branches = set(getTerminatorInstrLabels(instrs[-1])) - {"ret"}
+  res.branches = getTerminatorInstrLabels(instrs[-1]) - {"ret"}
   if block_var_use is not None:
     modified = deepcopy(res.modifies)
     for label in res.branches:
@@ -1349,9 +1374,12 @@ def getBlockVarUse(instrs: list[ir.Instruction],
 
   return res
 
-def getFuncBranchesVarUse(func: ir.Function) -> dict[str, BlockVarUse]:
+def getFuncBranchesVarUse(func: ir.Function,
+    phi_info: defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]
+  ) -> dict[str, BlockVarUse]:
+
   label_var_use: dict[str, BlockVarUse] = {
-    name: getBlockVarUse(block.instrs) for name, block in func.blocks.items()
+    name: getBlockVarUse(block.instrs, phi_info[name]) for name, block in func.blocks.items()
   }
 
   memo: dict[tuple[str, frozenset[str]], BlockVarUse] = {}
@@ -1400,11 +1428,14 @@ def getFuncBranchesVarUse(func: ir.Function) -> dict[str, BlockVarUse]:
 def transTerminatorInstr(instr: ir.Instruction,
                          ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   # Work out what variables might be depended on in future
-  poss_branch = set(getTerminatorInstrLabels(instr)) - {"ret"}
+  poss_branch = getTerminatorInstrLabels(instr) - {"ret"}
   poss_depends: set[str] = set()
   for branch in poss_branch:
     poss_depends |= {dependent[1:] for dependent in bctx.fn.block_var_use[branch].depends}
   poss_depends |= ctx.cfg.special_locals
+
+  assert bctx.label is not None
+  phi_info = bctx.fn.phi_info[bctx.label]
 
   blocks = sb3.BlockList()
   match instr:
@@ -1466,14 +1497,16 @@ def transTerminatorInstr(instr: ir.Instruction,
         assert instr.label_true is not None
         label_true, label_false = instr.label_true.val, instr.label_false.val
         assert isinstance(label_true, str) and isinstance(label_false, str)
+        phi_blocks_true = assignPhiNodes(phi_info[label_true], ctx, bctx)
+        phi_blocks_false = assignPhiNodes(phi_info[label_false], ctx, bctx)
         true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn), localizeLabel(label_false, bctx.fn)
 
         # TODO: use broadcast(join + condition) where possible
-        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList([
-          sb3.ProcedureCall(true_proc_name, [])
-        ]), sb3.BlockList([
-          sb3.ProcedureCall(false_proc_name, [])
-        ])))
+        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList(
+          phi_blocks_true.blocks + [sb3.ProcedureCall(true_proc_name, [])]
+        ), sb3.BlockList(
+          phi_blocks_false.blocks + [sb3.ProcedureCall(false_proc_name, [])]
+        )))
 
     case ir.Switch(): # Jump to many labels depending on a value
       # Allow the parameters to be accessed later
@@ -1506,9 +1539,12 @@ def transTerminatorInstr(instr: ir.Instruction,
         label_name = label.val
         assert isinstance(label_name, str)
         label_proc_name = localizeLabel(label_name, bctx.fn)
-        label_block_call = sb3.ProcedureCall(label_proc_name, [])
 
-        case_vs_label[case_val] = sb3.BlockList([label_block_call])
+        branch_blocks = sb3.BlockList()
+        branch_blocks.add(sb3.ProcedureCall(label_proc_name, []))
+        branch_blocks.add(assignPhiNodes(phi_info[label_name], ctx, bctx))
+
+        case_vs_label[case_val] = branch_blocks
 
       assert isinstance(instr.label_default.val, str)
       default_proc_name = localizeLabel(instr.label_default.val, bctx.fn)
@@ -1534,6 +1570,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   total_alloca_size: dict[str, int | None] = {}
   block_var_use: dict[str, dict[str, BlockVarUse]] = {}
   branches_to_first: dict[str, bool] = {}
+  phi_assignments: defaultdict[str, defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]] = \
+    defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: list())))
 
   for func in mod.funcs.values():
     fn_name = func.value.val
@@ -1544,7 +1582,6 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
         raise CompException(f"Externally defined function {fn_name} must have info about it")
       info = ctx.fn_info[fn_name]
       call_graph[fn_name] = info.can_call, True
-      block_var_use[fn_name] = info.block_var_use
 
     else:
       calls: set[str] = set() # What the function calls
@@ -1564,9 +1601,32 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
               call_id += 1
             case ir.Alloca():
               branch_alloca_size[fn_name][block_label] += getByteSize(instr.allocated_ty)
+            case ir.Phi():
+              res_var_name = instr.result.val
+              assert isinstance(res_var_name, str)
+              if res_var_name != "<badref>":
+                assert res_var_name.startswith("%")
+                res_var = Variable(res_var_name[1:], "var", fn_name)
+
+                to_label_name = block_label
+
+                for val, from_label in instr.vals:
+                  assert isinstance(from_label.ty, ir.LabelType)
+                  assert isinstance(from_label.val, str)
+                  from_label_name = from_label.val
+
+                  phi_assignments[fn_name][from_label_name][to_label_name].append((res_var, val))
+
       call_graph[fn_name] = calls, False
 
-      block_var_use[fn_name] = getFuncBranchesVarUse(func)
+  for func in mod.funcs.values():
+    fn_name = func.value.val
+    assert isinstance(fn_name, str)
+
+    if func.has_no_body():
+      block_var_use[fn_name] = info.block_var_use
+    else:
+      block_var_use[fn_name] = getFuncBranchesVarUse(func, phi_assignments[fn_name])
 
   for start_func in call_graph:
     if call_graph[start_func][1]: continue
@@ -1606,7 +1666,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
         assert isinstance(block_label, str)
 
         # Find what each block in the function could branch to
-        branches[block_label] = getTerminatorInstrLabels(block.instrs[-1])
+        branches[block_label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
       cycles = util.find_all_cycles(branches)
       fn_check_locations = util.select_cycle_checks(cycles)
@@ -1680,7 +1740,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
                                     all_check_locations.get(fn_name, list()),
                                     branch_alloca_size[fn_name], total_alloca_size.get(fn_name, None),
                                     skip_stack_size_change, block_var_use[fn_name],
-                                    branches_to_first.get(fn_name, False))
+                                    branches_to_first.get(fn_name, False), phi_assignments[fn_name])
     ctx.next_fn_id += 1
 
   return ctx
