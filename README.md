@@ -20,17 +20,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Installation
 
-* The following dependencies require manual installation:
-
-* **llvm2py**@0.2.0b0 (installation requires llvm@19)
-  * macOS - macports (recommended; better precompiled binary support; can save hours of compile time)
-    * `sudo port install llvm-19`
-    * `LLVM_DIR=/opt/local/libexec/llvm-19/lib/cmake/llvm/ LLVM_CONFIG=/opt/local/libexec/llvm-19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py`
-  * macOS - brew
-    * `brew install llvm@19`
-    * `LLVM_CONFIG=/usr/local/opt/llvm@19/bin/llvm-config CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" pip install llvm2py`
-
-* Then, install llvm2scratch with `pip install ` followed by the path to the project root (the folder containing the pyproject.toml and llvm2scratch folder)
+* Install llvm2scratch with `pip install ` followed by the path to the project root (the folder containing the pyproject.toml and llvm2scratch folder)
 
 ## Info
 

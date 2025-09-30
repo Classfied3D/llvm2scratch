@@ -9,7 +9,7 @@ packages = [{ include = "llvm2scratch" }]
 
 [tool.poetry.dependencies]
 python = ">=3.12"
-llvm2py = "0.2.0b0"
+llvmlite = "^0.45.0"
 
 [tool.poetry.scripts]
 llvm2scratch = "llvm2scratch.cli:main"

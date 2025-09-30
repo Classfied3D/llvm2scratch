@@ -1,6 +1,9 @@
 #include <stdio.h>
 
 static int a = 7;
+// Broken: no static ptr assignment
+//static char* message = "default";
+static char message[] = "default";
 
 int add_one(int num) {
   return num + 1;
@@ -77,12 +80,17 @@ int main(void) {
       puts("21");
       break;
     default:
-      puts("default");
+      // Broken: no getElementPtr value
+      //puts(*(&message + 1));
+      puts(message);
       break;
   }
 
   int f = factorial_recurse(10);
   int g = sum_to_one_digit(473);
+
+  //char* h = "Hello World";
+  //h[0] = 'C';
 
   return 0;
 }

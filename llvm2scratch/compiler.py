@@ -6,14 +6,14 @@ from collections import OrderedDict, defaultdict
 from typing import Literal, Callable
 from copy import deepcopy
 
-from llvm2py import parse_assembly
-from llvm2py import ir
 import random
 import math
 
+from . import graph_util as util
 from . import scratch as sb3
 from . import optimizer
-from . import util
+from . import parser
+from . import ir
 
 VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
                        # up to 53 bits, some operations require extra precision
@@ -127,7 +127,7 @@ class ValueAndBlocks:
 @dataclass
 class IndexableValue:
   """A collection of values that can be indexed over (e.g. a string)"""
-  vals: list[sb3.Value]
+  vals: list[sb3.Value | IndexableValue]
 
 @dataclass
 class IndexableValueAndBlocks:
@@ -173,93 +173,67 @@ def flatAsTuple(obj):
     raise TypeError("Expected dataclass instance")
   return tuple(getattr(obj, f.name) for f in fields(obj))
 
-def assertNoNamedTemporaries(mod: ir.Module) -> None:
-  """
-  Due to an issue with llvm2py, it is impossible to tell apart a named
-  temporary from a global var with the same name. This function ensures
-  there are no named temporaries.
-  """
-  for fn_name, fn in mod.funcs.items():
-    temporaries: set[ir.Value | None] = set()
-
-    for block_label, block in fn.blocks.items():
-      for instr in block.instrs:
-        temporaries.add(getattr(instr, "result", None))
-
-    for param in fn.args:
-      temporaries.add(param)
-
-    for temporary in temporaries:
-      if temporary is not None:
-        assert isinstance(temporary.val, str)
-        if not (temporary.val.startswith("%") or temporary.val == "<badref>"):
-          raise CompException(f"Named temporary %{temporary.val} in {fn_name} not supported due "
-                              "to llvm2py not being able to tell it apart from a global")
-
 def getByteSize(ty: ir.Type) -> int:
   match ty:
-    case ir.IntegerType():
+    case ir.IntegerTy():
       # Scratch's fp variables can store < 52 bits per variable accurately
-      return math.ceil(ty.num_bits / VARIABLE_MAX_BITS)
-    case ir.ArrayType():
-      return ty.elem_count * getByteSize(ty.elem_ty)
-    case ir.PtrType():
+      return math.ceil(ty.width / VARIABLE_MAX_BITS)
+    case ir.ArrayTy():
+      return ty.size * getByteSize(ty.inner)
+    case ir.PointerTy():
       return 1
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
-def decodeValue(val: ir.Value,
+def transValue(val: ir.Value,
                 ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IndexableValueAndBlocks:
-  match val.val:
-    case str(): # if a variable
-      var = decodeVar(val, bctx)
-      res = sb3.Known("") # this means no value - nothing in the block
-      if var is not None:
-        res = var.getValue()
-        name = var.getRawVarName()
-        if ctx.cfg.opti and name in ctx.globvar_to_ptr:
-          res = ctx.globvar_to_ptr[name]
+  match val:
+    case ir.LocalVarVal() | ir.ArgumentVal() | ir.GlobalVarVal():
+      var = transVar(val, bctx)
+      res = var.getValue()
+      name = var.getRawVarName()
+      if ctx.cfg.opti and name in ctx.globvar_to_ptr:
+        # Global variables store their address in their variable
+        # when optimizations are enabled we use this address directly
+        res = ctx.globvar_to_ptr[name]
       return ValueAndBlocks(res)
-    case int():
-      if not isinstance(val.ty, ir.IntegerType):
-        raise CompException(f"Expected {val} to be an integer, got type {type(val.ty)}")
 
+    case ir.KnownIntVal():
       # TODO FIX: allow different sizes with val.ty
-      if val.ty.num_bits > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not "
-                                                                  f"yet supported, got {val.ty.num_bits}")
+      if val.width > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not "
+                                                            f"yet supported, got {val.width}")
 
       # Calculate the two's complement version of the number
-      num = val.val
-      width = val.ty.num_bits
+      num = val.value
+      width = val.width
       if num < 0:
         num = (2 ** width) + num
       return ValueAndBlocks(sb3.Known(num))
-    case bytes():
-      if not (isinstance(val.ty, ir.ArrayType) and isinstance(val.ty.elem_ty, ir.IntegerType)):
-        raise CompException(f"Expected bytes value {val} to be assigned to ty [N x i8], got, {type(val.ty)}")
 
-      if val.ty.elem_ty.num_bits != 8:
-        raise CompException(f"Cannot assign bytes value {val} a non byte (i8)")
+    case ir.KnownArrVal():
+      values: list[sb3.Value | IndexableValue] = []
+      blocks = sb3.BlockList()
+      for element in val.values:
+        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx))
+        values.append(el_val)
+        blocks.add(el_blocks)
 
-      return IndexableValueAndBlocks(
-        IndexableValue([sb3.Known(str(int(byte))) for byte in val.val]))
+      return IndexableValueAndBlocks(IndexableValue(values), blocks)
+
     case _:
-      raise CompException(f"Unknown Value: {val.val} (type: {type(val.val)})")
+      raise CompException(f"Unknown Value {val}")
 
-def decodeVar(var: ir.Value | str, bctx: BlockInfo | None) -> Variable | None:
+def transVar(var: ir.Value | ir.ResultLocalVar | str, bctx: BlockInfo | None) -> Variable:
   """Used for getting the assigned variable of an instruction"""
-  if isinstance(var, ir.Value):
-    if not isinstance(var.val, str):
-      raise CompException(f"Expected val to be a variable, got Value: {var.val} (py type: {type(var.val)})")
-    var = var.val
-  if var == "<badref>":
-    return None
-
-  # This is the only way to tell apart a local value from a global one. llvm2py removes the % from the start of named temporaries so
-  # it is impossible to tell apart against a global with the same name, hence the assertNoNamedTemporaries
-  is_local = var.startswith("%")
-  if is_local: var = var[1:]
-  return localizeVar(var, not is_local, bctx)
+  match var:
+    case str():
+      return localizeVar(var, False, bctx)
+    case ir.LocalVarVal() | ir.ArgumentVal() | ir.ResultLocalVar():
+      return localizeVar(var.name, False, bctx)
+    case ir.GlobalVarVal():
+      return localizeVar(var.name, True, bctx)
+    case _:
+      raise CompException(f"Invalid type for var {var}: {type(var)}")
 
 def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
   if is_global:
@@ -494,7 +468,7 @@ def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
   blocks = sb3.BlockList()
   for res_var, ir_val in phi_info:
-    val = decodeValue(ir_val, ctx, bctx)
+    val = transValue(ir_val, ctx, bctx)
     if isinstance(val, IndexableValueAndBlocks):
       raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(val.blocks)
@@ -506,7 +480,7 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
   arguments: list[sb3.Value] = []
   blocks = sb3.BlockList()
   for arg in args:
-    value = decodeValue(arg, ctx, bctx)
+    value = transValue(arg, ctx, bctx)
     if isinstance(value, IndexableValueAndBlocks):
       raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(value.blocks)
@@ -581,7 +555,7 @@ def transSimpleCall(name: str, arguments: list[sb3.Value],
 
 def transComplexCall(caller: FuncInfo, callee: FuncInfo,
                      args: list[ir.Value], result: Variable | None,
-                     following_instrs: list[ir.Instruction],
+                     following_instrs: list[ir.Instr],
                      ctx: Context, bctx: BlockInfo) -> tuple[Context, BlockInfo]:
   """
   Translates a function call. Deals with functions with return
@@ -592,7 +566,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
   assert bctx.label is not None
 
   # Include the return value in variables which aren't depended on
-  starting_var_use = BlockVarUse() if result is None else BlockVarUse(modifies={"%" + result.var_name})
+  starting_var_use = BlockVarUse() if result is None else BlockVarUse(modifies={result.var_name})
   # All variables that might be depended on/modified after the function is called
   next_var_use = getBlockVarUse(following_instrs, bctx.fn.phi_info[bctx.label], caller.block_var_use, starting_var_use)
 
@@ -602,7 +576,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
     must_store: list[Variable] = []
     # Include the return value in variables which aren't depended on
     for var in next_var_use.depends:
-      decoded_var = decodeVar(var, bctx)
+      decoded_var = transVar(var, bctx)
       assert decoded_var is not None
       must_store.append(decoded_var)
 
@@ -702,40 +676,15 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
 
   return ctx, bctx
 
-def transStore(value: sb3.Value | IndexableValue, address: sb3.Value, ty: ir.Type, ctx: Context) -> sb3.BlockList:
-  match value:
-    case sb3.Value():
-      if getByteSize(ty) > 1:
-        # TODO FIX: allow storing of larger values
-        raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
-
-      return sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address, value)])
-    case IndexableValue():
-      if not (isinstance(ty, ir.ArrayType) and isinstance(ty.elem_ty, ir.IntegerType)):
-        raise CompException(f"Expected stored type {ty} to be [Y x iN]")
-
-      if getByteSize(ty.elem_ty) > 1:
-        raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
-
-      blocks = sb3.BlockList()
-      for (i, ival) in enumerate(value.vals):
-        # TODO OPTI: when adding operator blocks, calc at compile time if values are known
-        blocks.add(sb3.EditList("replaceat", ctx.cfg.stack_var,
-                                  sb3.Op("add", address, sb3.Known(i)), ival))
-
-      return blocks
-    case _:
-      raise CompException("Unmatched")
-
-def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context, BlockInfo]:
+def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context, BlockInfo]:
   blocks = sb3.BlockList()
   match instr:
     case ir.Alloca(): # Allocate space on the stack and return ptr
-      var = decodeVar(instr.result, bctx)
+      var = transVar(instr.result, bctx)
       assert var is None or var.var_type != "param"
 
       blocks = sb3.BlockList()
-      size = getByteSize(instr.allocated_ty)
+      size = getByteSize(instr.allocated_type)
 
       assert bctx.label is not None
       if bctx.fn.skip_stack_size_change:
@@ -752,38 +701,42 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_size_var, offset)))
 
     case ir.Load(): # Load a value from an address on the stack
-      address = decodeValue(instr.address, ctx, bctx)
+      address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
 
       if isinstance(address.value, IndexableValue):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
-      var = decodeVar(instr.result, bctx)
+      var = transVar(instr.result, bctx)
       if var is not None:
         blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
 
     case ir.Store(): # Copy a value to an address on the stack
-      value = decodeValue(instr.value, ctx, bctx)
+      value = transValue(instr.value, ctx, bctx)
       blocks.add(value.blocks)
 
-      address = decodeValue(instr.address, ctx, bctx)
+      address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
 
-      if isinstance(address.value, IndexableValue):
+      if isinstance(value.value, IndexableValue) or isinstance(address.value, IndexableValue):
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
-      blocks.add(transStore(value.value, address.value, instr.value.ty, ctx))
+      if getByteSize(instr.value.type) > 1:
+        # TODO FIX: allow storing of larger values
+        raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
 
-    case ir.BinOp(): # Do a calculation with two values
-      left = decodeValue(instr.fst_operand, ctx, bctx)
+      blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address.value, value.value)]))
+
+    case ir.BinaryOp(): # Do a calculation with two values
+      left = transValue(instr.left, ctx, bctx)
       blocks.add(left.blocks)
       left = left.value
 
-      right = decodeValue(instr.snd_operand, ctx, bctx)
+      right = transValue(instr.right, ctx, bctx)
       blocks.add(right.blocks)
       right = right.value
 
-      res_var = decodeVar(instr.result, bctx)
+      res_var = transVar(instr.result, bctx)
       assert res_var is None or res_var.var_type != "param"
       if res_var is not None:
         res_var_name = res_var.getRawVarName()
@@ -794,29 +747,31 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
         raise CompException(f"Indexable value not supported in binop {instr}")
 
       match instr.opcode:
-        case "add" | "sub": # Add/Sub two values
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values by using multiple vars and carrying
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
+          scratch_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+
           if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
-            res_val = sb3.Op(instr.opcode, left, right)
+            res_val = sb3.Op(scratch_opcode, left, right)
           else:
-            res_val = sb3.Op("mod", sb3.Op(instr.opcode, left, right),
+            res_val = sb3.Op("mod", sb3.Op(scratch_opcode, left, right),
                              sb3.Known(2 ** width))
 
-        case "mul": # Multiply two values
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.Mul: # Multiply two values
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
-          width = instr.fst_operand.ty.num_bits
+                                f"integers, got type {type(instr.left.type)}")
+          width = instr.left.type.width
 
           if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
             res_val = multiplyNoWrap(width, left, right)
@@ -825,13 +780,13 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
 
-        case "udiv": # Divide one value by another (unsigned)
+        case ir.BinaryOpcode.UDiv: # Divide one value by another (unsigned)
           # TODO OPTI: optimise for known values
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
@@ -843,11 +798,11 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           else:
             res_val = sb3.Op("div", left, right) # Value is poison if one is not a multiple of another
 
-        case "sdiv": # Divide one value by another (signed)
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.SDiv: # Divide one value by another (signed)
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
-          width = instr.fst_operand.ty.num_bits
+                                f"integers, got type {type(instr.left.type)}")
+          width = instr.left.type.width
 
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
@@ -907,12 +862,12 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
               ])
             res_val = False # We set res_var ourselves
 
-        case "urem": # Calculate remainder (unsigned)
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.URem: # Calculate remainder (unsigned)
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports"
@@ -921,13 +876,13 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           # mod 0 is UB, can ignore
           res_val = sb3.Op("mod", left, right)
 
-        case "srem": # Calculate remainder (signed)
+        case ir.BinaryOpcode.SRem: # Calculate remainder (signed)
           # TODO OPTI: optimise for known values
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
@@ -1002,12 +957,12 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           res_val = False # We set res_var ourselves
 
-        case "shl": # Calculate left shift
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.Shl: # Calculate left shift
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
@@ -1016,12 +971,12 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           can_shift_out = not (instr.is_nsw and instr.is_nuw)
           res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
 
-        case "lshr": # Calculate right shift (unsigned)
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.LShr: # Calculate right shift (unsigned)
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
@@ -1030,12 +985,12 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           can_shift_out = not instr.is_exact
           res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
 
-        case "ashr": # Calculate right shift (signed)
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.AShr: # Calculate right shift (signed)
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
@@ -1065,18 +1020,18 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
           res_val = False # We set res_var ourselves
 
-        case "and" | "or" | "xor": # Calculate binary operation
-          if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+        case ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor: # Calculate binary operation
+          if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
-                                f"integers, got type {type(instr.fst_operand.ty)}")
+                                f"integers, got type {type(instr.left.type)}")
 
-          width = instr.fst_operand.ty.num_bits
+          width = instr.left.type.width
           # TODO FIX: support larger values
           if width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-          if instr.opcode == "or" and instr.is_disjoint:
+          if instr.opcode == ir.BinaryOpcode.Or and instr.is_disjoint:
             # If there would be no carry
             res_val = sb3.Op("add", left, right)
           else:
@@ -1093,14 +1048,13 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
 
             if name not in ctx.proj.lists:
               lookup: list[int | float | str | bool] = []
-              if instr.opcode == "and":
-                lookup = [l & r for l in range(lookup_size) for r in range(lookup_size)]
-              elif instr.opcode == "or":
-                lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
-              elif instr.opcode == "xor":
-                lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
-              else:
-                raise CompException(f"Unknown opcode {instr.opcode}")
+              match instr.opcode:
+                case ir.BinaryOpcode.And:
+                  lookup = [l & r for l in range(lookup_size) for r in range(lookup_size)]
+                case ir.BinaryOpcode.Or:
+                  lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
+                case ir.BinaryOpcode.Xor:
+                  lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
               ctx.proj.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
 
             results = []
@@ -1137,46 +1091,76 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
           if not ctx.cfg.opti: # Values have no effect on state in scratch, only state has effect on values
             blocks.add(sb3.EditVar("set", ctx.cfg.unused_var, res_val))
 
+    case ir.Conversion(): # Convert a value from one type to another
+      value = transValue(instr.value, ctx, bctx)
+      blocks.add(value.blocks)
+      value = value.value
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var is None or res_var.var_type != "param"
+
+      if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"integers, got type {type(instr.value.type)}")
+      assert isinstance(value, sb3.Value)
+
+      width = instr.value.type.width
+      # TODO FIX: support larger values
+      if width > VARIABLE_MAX_BITS:
+        raise CompException(f"Instruction icmp currently supports "
+                            f"integers with <= {VARIABLE_MAX_BITS} bits")
+
+      res_val = None
+
+      match instr.opcode:
+        case ir.ConversionOpcode.ZExt:
+          res_val = value
+        case _:
+          raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
+
+      if res_val is not None and res_var is not None:
+        blocks.add(res_var.setValue(res_val))
+
     case ir.ICmp(): # Compare two values
-      left = decodeValue(instr.fst_operand, ctx, bctx)
+      left = transValue(instr.left, ctx, bctx)
       blocks.add(left.blocks)
       left = left.value
 
-      right = decodeValue(instr.snd_operand, ctx, bctx)
+      right = transValue(instr.right, ctx, bctx)
       blocks.add(right.blocks)
       right = right.value
 
-      res_var = decodeVar(instr.result, bctx)
+      res_var = transVar(instr.result, bctx)
       assert res_var is None or res_var.var_type != "param"
 
-      if not isinstance(instr.fst_operand.ty, ir.IntegerType): # TODO: add vector support
+      if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports "
-                            f"integers, got type {type(instr.fst_operand.ty)}")
+                            f"integers, got type {type(instr.left.type)}")
       assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
 
-      width = instr.fst_operand.ty.num_bits
+      width = instr.left.type.width
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
       match instr.cond:
-        case "eq":
+        case ir.ICmpCond.Eq:
           res_val = sb3.BoolOp("=", left, right)
-        case "ne":
+        case ir.ICmpCond.Ne:
           res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
-        case "ugt":
+        case ir.ICmpCond.Ugt:
           res_val = sb3.BoolOp(">", left, right)
-        case "uge":
+        case ir.ICmpCond.Uge:
           if isinstance(left, sb3.Known):
             res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
           elif isinstance(right, sb3.Known):
             res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
           else:
             res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
-        case "ult":
+        case ir.ICmpCond.Ult:
           res_val = sb3.BoolOp("<", left, right)
-        case "ule":
+        case ir.ICmpCond.Ule:
           if isinstance(left, sb3.Known):
             res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
           elif isinstance(right, sb3.Known):
@@ -1193,52 +1177,22 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       if res_var is not None:
         blocks.add(res_var.setValue(res_val))
 
-    case ir.Conversion(): # Convert a value from one type to another
-      value = decodeValue(instr.value, ctx, bctx)
-      blocks.add(value.blocks)
-      value = value.value
-
-      res_var = decodeVar(instr.result, bctx)
-      assert res_var is None or res_var.var_type != "param"
-
-      if not isinstance(instr.value.ty, ir.IntegerType): # TODO: add vector support
-        raise CompException(f"Instruction {instr} with opcode add only supports "
-                            f"integers, got type {type(instr.value.ty)}")
-      assert isinstance(value, sb3.Value)
-
-      width = instr.value.ty.num_bits
-      # TODO FIX: support larger values
-      if width > VARIABLE_MAX_BITS:
-        raise CompException(f"Instruction icmp currently supports "
-                            f"integers with <= {VARIABLE_MAX_BITS} bits")
-
-      res_val = None
-
-      match instr.opcode:
-        case "zext":
-          res_val = value
-        case _:
-          raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
-
-      if res_val is not None and res_var is not None:
-        blocks.add(res_var.setValue(res_val))
-
     case ir.Select(): # Select between two values based on a condition
-      cond = decodeValue(instr.cond, ctx, bctx)
-      true_val = decodeValue(instr.true_value, ctx, bctx)
-      false_val = decodeValue(instr.false_value, ctx, bctx)
+      cond = transValue(instr.cond, ctx, bctx)
+      true_val = transValue(instr.true_value, ctx, bctx)
+      false_val = transValue(instr.false_value, ctx, bctx)
 
-      if not all(isinstance(val.ty, ir.IntegerType) for val in \
+      if not all(isinstance(val.type, ir.IntegerTy) for val in \
           (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"integers, got other type")
-      assert isinstance(instr.cond.ty, ir.IntegerType)
-      assert instr.cond.ty.num_bits == 1
+      assert isinstance(instr.cond.type, ir.IntegerTy)
+      assert instr.cond.type.width == 1
       assert isinstance(cond.value, sb3.Value)
       assert isinstance(true_val.value, sb3.Value)
       assert isinstance(false_val.value, sb3.Value)
 
-      res_var = decodeVar(instr.result, bctx)
+      res_var = transVar(instr.result, bctx)
       assert res_var is None or res_var.var_type != "param"
 
       if res_var is not None:
@@ -1258,55 +1212,43 @@ def transInstr(instr: ir.Instruction, ctx: Context, bctx: BlockInfo) -> tuple[sb
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx, bctx
 
-def getTerminatorInstrLabels(instr: ir.Instruction) -> set[str]:
+def getTerminatorInstrLabels(instr: ir.Instr) -> set[str]:
   """
   Returns every label a terminator instruction could branch to.
   Returns the string "ret" to indictate a return
   """
   match instr:
-    case ir.Unreacheble():
+    case ir.Unreachable():
       return set()
     case ir.Ret():
       return {"ret"}
-    case ir.Br():
-      assert isinstance(instr.label_false.val, str)
-      branches = {instr.label_false.val}
-      if instr.label_true is not None:
-        assert isinstance(instr.label_true.val, str)
-        branches.add(instr.label_true.val)
-      return branches
+    case ir.UncondBr():
+      return {instr.branch.label}
+    case ir.CondBr():
+      return {instr.branch_true.label, instr.branch_false.label}
     case ir.Switch():
-      assert isinstance(instr.label_default.val, str)
-      branches = {instr.label_default.val}
-      for _, label in instr.cases:
-        assert isinstance(label.val, str)
-        branches.add(label.val)
+      branches = {instr.branch_default.label}
+      for _, label in instr.branch_table:
+        branches.add(label.label)
       return branches
-    case ir.CallBr():
-      assert isinstance(instr.fallthrough_label.val, str)
-      if instr.indirect_labels is not None:
-        raise CompException("Indirect (exceptional) labels not supported")
-      return {instr.fallthrough_label.val}
     case _:
       raise CompException(f"Unsupported terminator instruction "
                           f"opcode {instr} (type {type(instr)})")
 
-def getInstrVarUse(instr: ir.Instruction,
+def getInstrVarUse(instr: ir.Instr,
     block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]]
   ) -> tuple[set[str], set[str]]:
   """Returns what the instruction depends on and modifies"""
   depends: set[str] = set()
   modifies: set[str] = set()
 
-  result = getattr(instr, "result", None)
-  if result is not None:
-    assert isinstance(result.val, str)
-    if result.val.startswith("%"):
-      modifies.add(result.val)
+  if isinstance(instr, (ir.HasResult, ir.MaybeHasResult)):
+    if instr.result is not None:
+      modifies.add(instr.result.name)
 
   vals: list[ir.Value | None]
   match instr:
-    case ir.Unreacheble() | ir.Alloca() | ir.Phi():
+    case ir.Unreachable() | ir.Alloca() | ir.Phi():
       # For phi, even though it might depend on a value, the
       # branch instruction is made responsible instead
       vals = []
@@ -1317,36 +1259,37 @@ def getInstrVarUse(instr: ir.Instruction,
     case ir.Store():
       vals = [instr.address, instr.value]
     case ir.Call():
-      vals = [v for v in instr.args]
-    case ir.BinOp():
-      vals = [instr.fst_operand, instr.snd_operand]
+      vals = [a for a in instr.args]
+    case ir.BinaryOp():
+      vals = [instr.left, instr.right]
     case ir.ICmp():
-      vals = [instr.fst_operand, instr.snd_operand]
+      vals = [instr.left, instr.right]
     case ir.Br() | ir.Switch():
-      vals = [instr.cond]
+      vals = [instr.cond] if isinstance(instr, (ir.CondBr, ir.Switch)) else []
       poss_labels = getTerminatorInstrLabels(instr) - {"ret"}
       for label in poss_labels:
         vals.extend([value for _, value in block_phi_info[label]])
     case ir.Select():
       vals = [instr.cond, instr.true_value, instr.false_value]
+    case ir.GetElementPtr():
+      vals = [] # TODO FIX: add actual implementation
     case _:
       raise CompException(f"Unknown instruction {instr} (type {type(instr)})")
 
   for val in vals:
     if val is not None:
-      match val.val:
+      match val:
         # TODO FIX: special handling for getElementPtr etc
-        case str() | int() | bytes():
+        case ir.ArgumentVal() | ir.LocalVarVal():
+          depends.add(val.name)
+        case ir.GlobalVarVal() | ir.KnownVal():
           pass
         case _:
-          raise CompException(f"Unknown Value: {val.val} (type: {type(val.val)})")
-
-      if isinstance(val.val, str) and val.val.startswith("%"):
-        depends.add(val.val)
+          raise CompException(f"Unknown Value: {val}")
 
   return depends, modifies
 
-def getBlockVarUse(instrs: list[ir.Instruction],
+def getBlockVarUse(instrs: list[ir.Instr],
                    block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]],
                    block_var_use: dict[str, BlockVarUse] | None = None,
                    starting_var_use: BlockVarUse | None = None) -> BlockVarUse:
@@ -1425,7 +1368,7 @@ def getFuncBranchesVarUse(func: ir.Function,
 
   return res
 
-def transTerminatorInstr(instr: ir.Instruction,
+def transTerminatorInstr(instr: ir.Instr,
                          ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   # Work out what variables might be depended on in future
   poss_branch = getTerminatorInstrLabels(instr) - {"ret"}
@@ -1439,12 +1382,12 @@ def transTerminatorInstr(instr: ir.Instruction,
 
   blocks = sb3.BlockList()
   match instr:
-    case ir.Unreacheble(): # Never reached if not UB
+    case ir.Unreachable(): # Never reached if not UB
       pass
 
     case ir.Ret(): # Return from a func
       if instr.value is not None:
-        value = decodeValue(instr.value, ctx, bctx)
+        value = transValue(instr.value, ctx, bctx)
         if isinstance(value.value, IndexableValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
@@ -1479,65 +1422,61 @@ def transTerminatorInstr(instr: ir.Instruction,
       # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
 
-    case ir.Br(): # Jump to a label, either known or dependent on a condition
+    case ir.UncondBr():
+      # Allow the parameters to be accessed later
+      blocks.add(assignParameters(bctx.available_params, poss_depends))
+      proc_name = localizeLabel(instr.branch.label, bctx.fn)
+      blocks.add(sb3.ProcedureCall(proc_name, []))
+
+    case ir.CondBr(): # Jump to a label, either known or dependent on a condition
       # Allow the parameters to be accessed later
       blocks.add(assignParameters(bctx.available_params, poss_depends))
 
-      if instr.cond is None:
-        label = instr.label_false.val
-        assert isinstance(label, str)
-        proc_name = localizeLabel(label, bctx.fn)
-        blocks.add(sb3.ProcedureCall(proc_name, []))
-      else:
-        cond = decodeValue(instr.cond, ctx, bctx)
-        if isinstance(cond.value, IndexableValue):
-          raise CompException(f"Indexable value not supported for brach condition {instr}")
-        blocks.add(cond.blocks)
+      cond = transValue(instr.cond, ctx, bctx)
+      if isinstance(cond.value, IndexableValue):
+        raise CompException(f"Indexable value not supported for brach condition {instr}")
+      blocks.add(cond.blocks)
 
-        assert instr.label_true is not None
-        label_true, label_false = instr.label_true.val, instr.label_false.val
-        assert isinstance(label_true, str) and isinstance(label_false, str)
-        phi_blocks_true = assignPhiNodes(phi_info[label_true], ctx, bctx)
-        phi_blocks_false = assignPhiNodes(phi_info[label_false], ctx, bctx)
-        true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn), localizeLabel(label_false, bctx.fn)
+      label_true, label_false = instr.branch_true.label, instr.branch_false.label
+      phi_blocks_true = assignPhiNodes(phi_info[label_true], ctx, bctx)
+      phi_blocks_false = assignPhiNodes(phi_info[label_false], ctx, bctx)
+      true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn), localizeLabel(label_false, bctx.fn)
 
-        # TODO: use broadcast(join + condition) where possible
-        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList(
-          phi_blocks_true.blocks + [sb3.ProcedureCall(true_proc_name, [])]
-        ), sb3.BlockList(
-          phi_blocks_false.blocks + [sb3.ProcedureCall(false_proc_name, [])]
-        )))
+      blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList(
+        phi_blocks_true.blocks + [sb3.ProcedureCall(true_proc_name, [])]
+      ), sb3.BlockList(
+        phi_blocks_false.blocks + [sb3.ProcedureCall(false_proc_name, [])]
+      )))
 
     case ir.Switch(): # Jump to many labels depending on a value
       # Allow the parameters to be accessed later
       blocks.add(assignParameters(bctx.available_params, poss_depends))
 
-      assert isinstance(instr.cond.ty, ir.IntegerType)
-      width = instr.cond.ty.num_bits
-      if getByteSize(instr.cond.ty) > 1:
-        raise CompException("Cannot currently switch with an integer more "
-                           f"than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
+      assert isinstance(instr.cond.type, ir.IntegerTy)
+      width = instr.cond.type.width
+      if getByteSize(instr.cond.type) > 1:
+        raise CompException(f"Cannot currently switch with an integer more "
+                            f"than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
 
-      val, val_blocks = flatAsTuple(decodeValue(instr.cond, ctx, bctx))
+      val, val_blocks = flatAsTuple(transValue(instr.cond, ctx, bctx))
       blocks.add(val_blocks)
-      if len(instr.cases) > 1:
-        val, opti_val_blocks = flatAsTuple(optimizeValueUse(val, math.log2(len(instr.cases)), ctx))
+      if len(instr.branch_table) > 1:
+        val, opti_val_blocks = flatAsTuple(optimizeValueUse(val, math.log2(len(instr.branch_table)), ctx))
         blocks.add(opti_val_blocks)
 
       case_vs_label: OrderedDict[int, sb3.BlockList] = OrderedDict()
-      for case, label in instr.cases:
-        case_val = decodeValue(case, ctx, bctx)
+      for case, label in instr.branch_table:
+        case_val = transValue(case, ctx, bctx)
         # Switch cases should be constant and unique
         assert isinstance(case_val, ValueAndBlocks)
         assert len(case_val.blocks.blocks) == 0
         assert isinstance(case_val.value, sb3.Known)
         assert isinstance(case_val.value.known, float)
-        assert case_val.value.known == int(case_val.value.known)
+        assert case_val.value.known.is_integer()
         assert int(case_val.value.known) not in case_vs_label
         case_val = int(case_val.value.known)
 
-        label_name = label.val
-        assert isinstance(label_name, str)
+        label_name = label.label
         label_proc_name = localizeLabel(label_name, bctx.fn)
 
         branch_blocks = sb3.BlockList()
@@ -1546,8 +1485,7 @@ def transTerminatorInstr(instr: ir.Instruction,
 
         case_vs_label[case_val] = branch_blocks
 
-      assert isinstance(instr.label_default.val, str)
-      default_proc_name = localizeLabel(instr.label_default.val, bctx.fn)
+      default_proc_name = localizeLabel(instr.branch_default.label, bctx.fn)
       default_label_call = sb3.BlockList([sb3.ProcedureCall(default_proc_name, [])])
 
       lowest_poss = 0
@@ -1573,11 +1511,10 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   phi_assignments: defaultdict[str, defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]] = \
     defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: list())))
 
-  for func in mod.funcs.values():
-    fn_name = func.value.val
-    assert isinstance(fn_name, str)
+  for func in mod.functions.values():
+    fn_name = func.name
 
-    if func.has_no_body():
+    if len(func.blocks) == 0: # If function has no body
       if fn_name not in ctx.fn_info:
         raise CompException(f"Externally defined function {fn_name} must have info about it")
       info = ctx.fn_info[fn_name]
@@ -1587,43 +1524,35 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       calls: set[str] = set() # What the function calls
       for block in func.blocks.values():
         # Find every function the function could call
-        block_label = block.value.val
-        assert isinstance(block_label, str)
         call_id = 0
         for instr in block.instrs:
           match instr:
-            case ir.Call() | ir.CallBr(): # TODO FIX: tail recursion treated differently?
-              called_name = instr.callee.val
-              assert isinstance(called_name, str)
+            case ir.Call():
+              called_name = instr.func.name
               calls.add(called_name)
               return_addresses.setdefault(called_name, list())
-              return_addresses[called_name].append(localizeCallId(call_id, block_label, fn_name))
+              return_addresses[called_name].append(localizeCallId(call_id, block.label, fn_name))
               call_id += 1
             case ir.Alloca():
-              branch_alloca_size[fn_name][block_label] += getByteSize(instr.allocated_ty)
+              branch_alloca_size[fn_name][block.label] += getByteSize(instr.allocated_type)
             case ir.Phi():
-              res_var_name = instr.result.val
-              assert isinstance(res_var_name, str)
-              if res_var_name != "<badref>":
-                assert res_var_name.startswith("%")
-                res_var = Variable(res_var_name[1:], "var", fn_name)
+              res_var_name = instr.result.name
+              res_var = Variable(res_var_name, "var", fn_name)
 
-                to_label_name = block_label
+              to_label_name = block.label
 
-                for val, from_label in instr.vals:
-                  assert isinstance(from_label.ty, ir.LabelType)
-                  assert isinstance(from_label.val, str)
-                  from_label_name = from_label.val
+              for val, from_label in instr.incoming:
+                assert isinstance(from_label.type, ir.LabelTy)
+                from_label_name = from_label.label
 
-                  phi_assignments[fn_name][from_label_name][to_label_name].append((res_var, val))
+                phi_assignments[fn_name][from_label_name][to_label_name].append((res_var, val))
 
       call_graph[fn_name] = calls, False
 
-  for func in mod.funcs.values():
-    fn_name = func.value.val
-    assert isinstance(fn_name, str)
+  for func in mod.functions.values():
+    fn_name = func.name
 
-    if func.has_no_body():
+    if len(func.blocks) == 0: # If function has no body
       block_var_use[fn_name] = info.block_var_use
     else:
       block_var_use[fn_name] = getFuncBranchesVarUse(func, phi_assignments[fn_name])
@@ -1647,26 +1576,21 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     call_graph[start_func] = visited, True
 
-  for func in mod.funcs.values():
-    fn_name = func.value.val
-    assert isinstance(fn_name, str)
+  for func in mod.functions.values():
+    fn_name = func.name
 
-    if func.has_no_body():
+    if len(func.blocks) == 0: # If function has no body
       info = ctx.fn_info[fn_name]
       returns_to_address[fn_name] = info.returns_to_address
       all_check_locations[fn_name] = info.checked_blocks
       total_alloca_size[fn_name] = info.total_alloca_size
     else:
-      first_label = list(func.blocks.values())[0].value.val
-      assert isinstance(first_label, str)
+      first_label = list(func.blocks.values())[0].label
       branches: dict[str, list[str]] = {"ret": []} # Where different branches could lead
       for block in func.blocks.values():
         # Find every function the function could call
-        block_label = block.value.val
-        assert isinstance(block_label, str)
-
         # Find what each block in the function could branch to
-        branches[block_label] = list(getTerminatorInstrLabels(block.instrs[-1]))
+        branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
       cycles = util.find_all_cycles(branches)
       fn_check_locations = util.select_cycle_checks(cycles)
@@ -1702,8 +1626,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
       fn_branches_to_first = False
       if len(func.blocks) > 0:
-        first_block_label = list(func.blocks.values())[0].value.val
-        assert isinstance(first_block_label, str)
+        first_block_label = list(func.blocks.values())[0].label
         fn_branches_to_first = any([first_block_label in branch_to for branch_to in branches.values()])
       branches_to_first[fn_name] = fn_branches_to_first
 
@@ -1711,9 +1634,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
 
-  for func in mod.funcs.values():
-    fn_name = func.value.val
-    assert isinstance(fn_name, str)
+  for func in mod.functions.values():
+    fn_name = func.name
 
     # If we know the total size a function allocates and that it doesn't call any functions
     # that rely on the stack size, we don't need to increase the stack size
@@ -1728,9 +1650,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     param_names = []
     for arg in func.args:
-      assert isinstance(arg.val, str)
-      assert arg.val.startswith("%")
-      param_names.append(arg.val[1:])
+      param_names.append(arg.name)
 
     if fn_takes_ret_addr: param_names.append(ctx.cfg.return_address_local)
     params = [Variable(name, "param", fn_name) for name in param_names]
@@ -1748,39 +1668,35 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 def transFuncs(mod: ir.Module, ctx: Context) -> Context:
   ctx = getFnInfo(mod, ctx)
 
-  for func in mod.funcs.values():
-    if func.has_no_body(): continue
+  for func in mod.functions.values():
+    # If function has no body
+    if len(func.blocks) == 0: continue
 
-    assert isinstance(func.value.ty, ir.FunctionType)
-    fn_name = func.value.val
-    assert isinstance(fn_name, str)
-
+    fn_name = func.name
     info = ctx.fn_info[fn_name]
 
-    for param_ty in func.value.ty.param_tys:
-      if getByteSize(param_ty) > 1:
+    for arg in func.args:
+      if getByteSize(arg.type) > 1:
         raise CompException("Parameters can only be one scratch byte in size") # TODO FIX
 
     is_first_block = True
     total_fn_allocated = 0
     for block in func.blocks.values():
       call_id = 0
-      block_label = block.value.val
-      assert isinstance(block_label, str)
 
       if is_first_block:
         proc_name = fn_name
         localized_params = info.params
       else:
-        proc_name = localizeLabel(block_label, info)
+        proc_name = localizeLabel(block.label, info)
         localized_params = []
 
       # Get code to start the branch (procedure definition, etc)
-      if (block_label not in info.checked_blocks) or (is_first_block and info.branches_to_first):
+      if (block.label not in info.checked_blocks) or (is_first_block and info.branches_to_first):
         starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
-        next_var_use_depends = {dependent[1:] for dependent in info.block_var_use[block_label].depends}
+        next_var_use_depends = {dependent[1:] for dependent in info.block_var_use[block.label].depends}
         next_var_use_depends |= ctx.cfg.special_locals
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params,
                                                          next_var_use_depends, info, ctx)
@@ -1800,18 +1716,18 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       if is_first_block and info.branches_to_first:
         # Work out what variables might be depended on in future
-        poss_depends = {dependent[1:] for dependent in info.block_var_use[block_label].depends}
+        poss_depends = {dependent[1:] for dependent in info.block_var_use[block.label].depends}
         poss_depends |= ctx.cfg.special_locals
         starting_fn_code.add(assignParameters(info.params, poss_depends))
 
-        first_block_proc_name = localizeLabel(block_label, info)
+        first_block_proc_name = localizeLabel(block.label, info)
 
         starting_fn_code.add(sb3.ProcedureCall(first_block_proc_name, []))
 
         # TODO FIX: repeat code, use helper func
         ctx.proj.code.append(starting_fn_code)
 
-        if block_label not in info.checked_blocks:
+        if block.label not in info.checked_blocks:
           starting_fn_code, ctx = getUncheckedProcedureStart(first_block_proc_name, [], info, ctx,
                                                             is_counted=info.returns_to_address)
         else:
@@ -1831,7 +1747,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         assert (info.branches_to_first is False) or (info.total_alloca_size == 0)
         to_allocate = info.total_alloca_size
       elif info.total_alloca_size is None:
-        to_allocate = info.block_alloca_size[block_label]
+        to_allocate = info.block_alloca_size[block.label]
 
       if to_allocate != 0 and not info.skip_stack_size_change:
         starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
@@ -1839,18 +1755,17 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       # After the first block we can no longer access the parameters in the function
       available_params: list[Variable] = info.params if is_first_block else []
       bctx = BlockInfo(info, available_params, first_block=is_first_block,
-                       code=starting_fn_code, label=block_label,
+                       code=starting_fn_code, label=block.label,
                        allocated=total_fn_allocated)
 
       # Translate everything except the terminator operation
       for instr_index, instr in enumerate(block.instrs[:-1]):
         assert bctx is not None
         if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
-          callee_name = instr.callee.val
-          assert isinstance(callee_name, str)
+          callee_name = instr.func.name
           callee_info = ctx.fn_info[callee_name]
           args = instr.args
-          result = decodeVar(instr.result, bctx)
+          result = None if instr.result is None else transVar(instr.result, bctx)
           following_instrs = block.instrs[instr_index + 1:]
 
           ctx, bctx = transComplexCall(info, callee_info, args, result, following_instrs, ctx, bctx)
@@ -1884,41 +1799,43 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   for glob in mod.global_vars.values():
     # TODO OPTI: Don't use allocate and store and set to the var, instead just remember the
     # ptr value in the decoder and replace any uses of the variable with it (only when opti=true)
-    globvar = decodeVar(glob.value, None)
+    globvar = localizeVar(glob.name, True, None)
     if globvar is None:
       raise CompException(f"Expected static var {glob} to be named")
-
-    blocks_and_value = decodeValue(glob.initializer, ctx, None)
-    unknown = len(blocks_and_value.blocks) > 0
-    value = blocks_and_value.value
-
-    if isinstance(value, IndexableValue):
-      unknown |= not all([isinstance(val, sb3.Known) for val in value.vals])
-    else:
-      unknown |= not isinstance(value, sb3.Known)
-
-    if unknown: raise CompException(f"Expected static value {glob} to have a compile time known value")
-
-    total_size = getByteSize(glob.initializer.ty)
-    values = []
-    match value:
-      case sb3.Known():
-        size = total_size
-        values.append(value)
-      case IndexableValue():
-        assert isinstance(glob.initializer.ty, ir.ArrayType)
-        size = getByteSize(glob.initializer.ty.elem_ty)
-        values.extend(value.vals)
-
-    if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
 
     globvar_name = globvar.getRawVarName()
     ctx.globvar_to_ptr[globvar_name] = sb3.Known(ptr)
     if not ctx.cfg.opti:
-      blocks.add(sb3.EditVar("set", globvar_name, sb3.Known(ptr)))
-    for value in values:
-      blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
+      globvar.setValue(sb3.Known(ptr))
+    total_size = getByteSize(glob.type)
     ptr += total_size
+
+    if glob.init is not None:
+      blocks_and_value = transValue(glob.init, ctx, None)
+      unknown = len(blocks_and_value.blocks) > 0
+      value = blocks_and_value.value
+
+      if isinstance(value, IndexableValue):
+        unknown |= not all([isinstance(val, sb3.Known) for val in value.vals])
+      else:
+        unknown |= not isinstance(value, sb3.Known)
+
+      if unknown: raise CompException(f"Expected static value {glob} to have a compile time known value")
+
+      values = []
+      match value:
+        case sb3.Known():
+          size = total_size
+          values.append(value)
+        case IndexableValue():
+          assert isinstance(glob.type, ir.ArrayTy)
+          size = getByteSize(glob.type.inner)
+          values.extend(value.vals)
+
+      if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
+
+      for value in values:
+        blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
 
   blocks.add(sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.stack_size_var, sb3.Known(ptr)),
@@ -1961,10 +1878,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx = Context(sb3.Project(scfg), cfg)
 
   # Parse llvm
-  mod: ir.Module = parse_assembly(llvm) if isinstance(llvm, str) else llvm
-
-  # Due to an issue with llvm2py, it is impossible to tell apart a named temporary from a global var with the same name
-  assertNoNamedTemporaries(mod)
+  mod: ir.Module = parser.parseAssembly(llvm) if isinstance(llvm, str) else llvm
 
   # Starting code
   initblocks = sb3.BlockList([sb3.OnStartFlag()])
