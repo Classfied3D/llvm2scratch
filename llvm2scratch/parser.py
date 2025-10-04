@@ -308,10 +308,8 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
       assert result is not None
 
       incoming: list[tuple[Value, LabelVal]] = []
-      for val in instr.operands:
-        label = next(instr.incoming_blocks)
+      for val, label in zip(instr.operands, instr.incoming_blocks):
         incoming.append((decodeValue(val), decodeLabel(label)))
-
       return Phi(result, incoming)
 
     case "select":
