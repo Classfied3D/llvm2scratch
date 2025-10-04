@@ -680,6 +680,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
   blocks = sb3.BlockList()
   match instr:
     case ir.Alloca(): # Allocate space on the stack and return ptr
+      assert isinstance(instr.num_elements, ir.KnownIntVal)
+      assert instr.num_elements.value == 1
+
       var = transVar(instr.result, bctx)
       assert var is None or var.var_type != "param"
 

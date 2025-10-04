@@ -1,12 +1,31 @@
 from typing import Any
-from . ir import *
 import re
+
+from . ir import *
 
 # Regexes used
 _FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
 _INT_IN_TYPE_RE = re.compile(r"\b[iI]\d+\s+(-?\d+)\b")
 _CSTRING_RE = re.compile(r"c\"((?:[^\"\\]|\\.)*)\"")
 _INITLINE_RE = re.compile(r"=\s*(?:global|constant)\s*(.+)$")
+
+_RETURN_ATTRS = [
+  "zeroext", "signext", "noext", "inreg",
+  "sret", "byval", "byref", "preallocated",
+  "inalloca", "elementtype", "alignstack",
+  "allocalign", "allocptr", "returned",
+  "nonnull", "dereferenceable", "dereferenceable_or_null",
+  "nofpclass", "range", "align", "captures",
+  "nofree", "nest", "swiftself", "swiftasync",
+  "swifterror", "immarg", "noundef", "readnone",
+  "readonly", "writeonly", "writable",
+  "initializes", "dead_on_unwind", "dead_on_return"
+]
+
+# Build regex that matches any of them, optionally with (<...>) or <n> arguments
+_ATTR_RE = re.compile(
+  r"^(?:" + "|".join(map(re.escape, _RETURN_ATTRS)) + r")(\s*\([^)]*\))?\s+"
+)
 
 # ---------- Helpers ----------
 
@@ -40,6 +59,15 @@ def findMatchingBracket(s, start) -> int:
         j += 1
     i += 1
   raise ValueError("No matching closing bracket for {} at pos {}".format(open_ch, start))
+
+def stripReturnAttrs(rest: str) -> str:
+  s = rest.strip()
+  while True:
+    m = _ATTR_RE.match(s)
+    if not m:
+      break
+    s = s[m.end():].lstrip()
+  return s
 
 def extractBracketContent(s, start) -> tuple[str, int]:
   """Return (content_string, end_index_plus_one).

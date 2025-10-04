@@ -1,7 +1,7 @@
 from __future__ import annotations
 from llvmlite import binding as llvm
 from dataclasses import dataclass
-from .parser_util import valueFromInitializerText, extractFirstType, extractTypedValue
+from .parser_util import valueFromInitializerText, extractFirstType, extractTypedValue, stripReturnAttrs
 from .ir import *
 
 def decodeTypeStr(type_str: str) -> Type:
@@ -71,6 +71,7 @@ def decodeValue(value: llvm.ValueRef) -> Value:
       while not (rest.startswith("declare ") or rest.startswith("define ")):
         rest = rest.split("\n", 1)[-1]
       rest = rest.removeprefix("declare ").removeprefix("define ").strip()
+      rest = stripReturnAttrs(rest).strip()
       func_ret_type_str, _ = extractFirstType(rest)
       func_ret_type = decodeTypeStr(func_ret_type_str)
 
