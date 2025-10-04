@@ -604,8 +604,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
         # Pass return address into function
         arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
-      bctx.code.add(assignParameters(bctx.available_params, {dependent[1:] for dependent in next_var_use.depends}
-                                                            | ctx.cfg.special_locals))
+      bctx.code.add(assignParameters(bctx.available_params, next_var_use.depends | ctx.cfg.special_locals))
 
     call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
     bctx.code.add(arg_value_blocks)
@@ -1377,7 +1376,7 @@ def transTerminatorInstr(instr: ir.Instr,
   poss_branch = getTerminatorInstrLabels(instr) - {"ret"}
   poss_depends: set[str] = set()
   for branch in poss_branch:
-    poss_depends |= {dependent[1:] for dependent in bctx.fn.block_var_use[branch].depends}
+    poss_depends |= bctx.fn.block_var_use[branch].depends
   poss_depends |= ctx.cfg.special_locals
 
   assert bctx.label is not None
@@ -1428,6 +1427,11 @@ def transTerminatorInstr(instr: ir.Instr,
     case ir.UncondBr():
       # Allow the parameters to be accessed later
       blocks.add(assignParameters(bctx.available_params, poss_depends))
+
+      # Assign phi nodes
+      blocks.add(assignPhiNodes(phi_info[instr.branch.label], ctx, bctx))
+
+      # Jump to label
       proc_name = localizeLabel(instr.branch.label, bctx.fn)
       blocks.add(sb3.ProcedureCall(proc_name, []))
 
@@ -1699,7 +1703,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
-        next_var_use_depends = {dependent[1:] for dependent in info.block_var_use[block.label].depends}
+        next_var_use_depends = info.block_var_use[block.label].depends
         next_var_use_depends |= ctx.cfg.special_locals
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params,
                                                          next_var_use_depends, info, ctx)
@@ -1719,7 +1723,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       if is_first_block and info.branches_to_first:
         # Work out what variables might be depended on in future
-        poss_depends = {dependent[1:] for dependent in info.block_var_use[block.label].depends}
+        poss_depends = info.block_var_use[block.label].depends
         poss_depends |= ctx.cfg.special_locals
         starting_fn_code.add(assignParameters(info.params, poss_depends))
 
