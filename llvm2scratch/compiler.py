@@ -40,7 +40,6 @@ class Config:
                                                            # future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
-  unused_var = "!unused" # Name of the scratch variable for unused values
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
@@ -699,8 +698,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                    # optimization because the extra add/subtract can be ignored
       bctx.allocated += size
 
-      if var is not None:
-        blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_size_var, offset)))
+      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_size_var, offset)))
 
     case ir.Load(): # Load a value from an address on the stack
       address = transValue(instr.address, ctx, bctx)
@@ -710,8 +708,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
       var = transVar(instr.result, bctx)
-      if var is not None:
-        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
+      blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
 
     case ir.Store(): # Copy a value to an address on the stack
       value = transValue(instr.value, ctx, bctx)
@@ -739,9 +736,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       right = right.value
 
       res_var = transVar(instr.result, bctx)
-      assert res_var is None or res_var.var_type != "param"
-      if res_var is not None:
-        res_var_name = res_var.getRawVarName()
+      assert res_var.var_type != "param"
       res_val = None
 
       if isinstance(left, IndexableValue) or \
@@ -818,51 +813,50 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
             res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
           else:
-            if res_var is not None:
-              left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
-              right, rblocks = flatAsTuple(optimizeValueUse(right, 2, ctx))
-              blocks.add(lblocks)
-              blocks.add(rblocks)
+            left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
+            right, rblocks = flatAsTuple(optimizeValueUse(right, 2, ctx))
+            blocks.add(lblocks)
+            blocks.add(rblocks)
 
-              point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
-              change = 2 ** width
+            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+            change = 2 ** width
 
-              # TODO: optimise for known values
+            # TODO: optimise for known values
 
-              # Undo two's complement, divide, round towards zero using floor or ceiling and calculate two's complement
-              blocks.add([
-                sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-                  sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
-                    # If left + right are pos
-                    sb3.EditVar("set", res_var_name, sb3.Op("floor", sb3.Op("div", left, right))),
-                  ]), sb3.BlockList([
-                    # If left is pos and right is neg
-                    sb3.EditVar("set", res_var_name, sb3.Op("add",
-                                                      sb3.Op("ceiling",
-                                                        sb3.Op("div",
-                                                          left,
-                                                          sb3.Op("sub", right, sb3.Known(change)))),
-                                                      sb3.Known(change))),
-                  ]))
+            # Undo two's complement, divide, round towards zero using floor or ceiling and calculate two's complement
+            blocks.add([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                  # If left + right are pos
+                  res_var.setValue(sb3.Op("floor", sb3.Op("div", left, right))),
                 ]), sb3.BlockList([
-                  sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
-                    # If left is neg and right is pos
-                    sb3.EditVar("set", res_var_name, sb3.Op("add",
-                                                      sb3.Op("ceiling",
-                                                        sb3.Op("div",
-                                                          sb3.Op("sub", left, sb3.Known(change)),
-                                                          right)),
-                                                      sb3.Known(change))),
-                  ]), sb3.BlockList([
-                    # If left + right are neg
-                    sb3.EditVar("set", res_var_name, sb3.Op("floor",
-                                                      sb3.Op("div",
-                                                        sb3.Op("sub", left, sb3.Known(change)),
-                                                        sb3.Op("sub", right, sb3.Known(change))))),
-                  ]))
+                  # If left is pos and right is neg
+                  res_var.setValue(sb3.Op("add",
+                                          sb3.Op("ceiling",
+                                            sb3.Op("div",
+                                              left,
+                                              sb3.Op("sub", right, sb3.Known(change)))),
+                                          sb3.Known(change))),
                 ]))
-              ])
-            res_val = False # We set res_var ourselves
+              ]), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                  # If left is neg and right is pos
+                  res_var.setValue(sb3.Op("add",
+                                          sb3.Op("ceiling",
+                                            sb3.Op("div",
+                                              sb3.Op("sub", left, sb3.Known(change)),
+                                              right)),
+                                          sb3.Known(change))),
+                ]), sb3.BlockList([
+                  # If left + right are neg
+                  res_var.setValue(sb3.Op("floor",
+                                          sb3.Op("div",
+                                            sb3.Op("sub", left, sb3.Known(change)),
+                                            sb3.Op("sub", right, sb3.Known(change))))),
+                ]))
+              ]))
+            ])
+          res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.URem: # Calculate remainder (unsigned)
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
@@ -890,72 +884,71 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} currently supports "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-          if res_var is not None:
-            # TODO: Reuse if statement to work out if a / b > 0
-            left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
-            right_is_temp = shouldOptimiseValueUse(right, 3)
-            right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
-            if right_is_temp:
-              assert isinstance(right, sb3.GetVar)
-            blocks.add(lblocks)
-            blocks.add(rblocks)
+          # TODO: Reuse if statement to work out if a / b > 0
+          left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
+          right_is_temp = shouldOptimiseValueUse(right, 3)
+          right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
+          if right_is_temp:
+            assert isinstance(right, sb3.GetVar)
+          blocks.add(lblocks)
+          blocks.add(rblocks)
 
-            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
-            change = 2 ** width
+          point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+          change = 2 ** width
 
-            if not right_is_temp:
-              # Undo Two's Complement
-              right_sub_change = sb3.Op("sub", right, sb3.Known(change))
+          if not right_is_temp:
+            # Undo Two's Complement
+            right_sub_change = sb3.Op("sub", right, sb3.Known(change))
 
-              right_sub_change, pos_neg_block = flatAsTuple(optimizeValueUse(right, 2, ctx))
-              pos_neg_block.add(sb3.BlockList([
+            right_sub_change, pos_neg_block = flatAsTuple(optimizeValueUse(right, 2, ctx))
+            pos_neg_block.add(sb3.BlockList([
+              # If left is pos and right is neg - remainder = (l mod r) - r
+              res_var.setValue(sb3.Op("sub",
+                                      sb3.Op("mod",
+                                        left,
+                                        right_sub_change),
+                                      right_sub_change))]))
+          else:
+            # Re-use the generated temp var
+            pos_neg_block = sb3.BlockList([
+              sb3.EditVar("change", right.var_name, sb3.Known(-change)),
+              res_var.setValue(sb3.Op("sub",
+                                      sb3.Op("mod",
+                                        left,
+                                        right),
+                                      right))])
+
+          # Undo two's complement, calculate modulo, then adjust for differences with llvm's remainder operation
+          # (different when one side is negative)
+          blocks.add([
+            sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                  # Modulus and remainder operations do the same
+                  res_var.setValue(sb3.Op("mod", left, right)),
+                ]),
                 # If left is pos and right is neg - remainder = (l mod r) - r
-                sb3.EditVar("set", res_var_name, sb3.Op("sub",
-                                                  sb3.Op("mod",
-                                                    left,
-                                                    right_sub_change),
-                                                  right_sub_change))]))
-            else:
-              # Re-use the generated temp var
-              pos_neg_block = sb3.BlockList([
-                sb3.EditVar("change", right.var_name, sb3.Known(-change)),
-                sb3.EditVar("set", res_var_name, sb3.Op("sub",
-                                                  sb3.Op("mod",
-                                                    left,
-                                                    right),
-                                                  right))])
-
-            # Undo two's complement, calculate modulo, then adjust for differences with llvm's remainder operation
-            # (different when one side is negative)
-            blocks.add([
-              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
-                    # Modulus and remainder operations do the same
-                    sb3.EditVar("set", res_var_name, sb3.Op("mod", left, right)),
-                  ]),
-                  # If left is pos and right is neg - remainder = (l mod r) - r
-                  pos_neg_block
-                )
+                pos_neg_block
+              )
+            ]), sb3.BlockList([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                # If left is neg and right is pos - remainder = (l mod r) - r
+               res_var.setValue(sb3.Op("add",
+                                       sb3.Op("sub",
+                                         sb3.Op("mod",
+                                           sb3.Op("sub", left, sb3.Known(change)),
+                                           right),
+                                         right),
+                                       sb3.Known(change))),
               ]), sb3.BlockList([
-                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
-                  # If left is neg and right is pos - remainder = (l mod r) - r
-                  sb3.EditVar("set", res_var_name, sb3.Op("add",
-                                                    sb3.Op("sub",
-                                                      sb3.Op("mod",
-                                                        sb3.Op("sub", left, sb3.Known(change)),
-                                                        right),
-                                                      right),
-                                                    sb3.Known(change))),
-                ]), sb3.BlockList([
-                  # If left + right are neg
-                  sb3.EditVar("set", res_var_name, sb3.Op("add",
-                                                    sb3.Op("mod",
-                                                      sb3.Op("sub", left, sb3.Known(change)),
-                                                      sb3.Op("sub", right, sb3.Known(change))),
-                                                    sb3.Known(change))),
-                ]))
+                # If left + right are neg
+               res_var.setValue(sb3.Op("add",
+                                       sb3.Op("mod",
+                                         sb3.Op("sub", left, sb3.Known(change)),
+                                         sb3.Op("sub", right, sb3.Known(change))),
+                                       sb3.Known(change))),
               ]))
-            ])
+            ]))
+          ])
 
           res_val = False # We set res_var ourselves
 
@@ -998,27 +991,26 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} currently supports "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-          if res_var is not None:
-            point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
-            change = 2 ** width
+          point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
+          change = 2 ** width
 
-            right_mul, ctx = intPow2(right, width, ctx)
+          right_mul, ctx = intPow2(right, width, ctx)
 
-            unwrapped_pos = sb3.Op("div", left, right_mul)
-            val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
+          unwrapped_pos = sb3.Op("div", left, right_mul)
+          val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
 
-            unwrapped_neg = sb3.Op("div", sb3.Op("sub", left, sb3.Known(change)), right_mul)
-            val_neg = sb3.Op("add",
-                        unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg),
-                        sb3.Known(change))
+          unwrapped_neg = sb3.Op("div", sb3.Op("sub", left, sb3.Known(change)), right_mul)
+          val_neg = sb3.Op("add",
+                      unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg),
+                      sb3.Known(change))
 
-            blocks.add([
-              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-                sb3.EditVar("set", res_var_name, val_pos),
-              ]), sb3.BlockList([
-                sb3.EditVar("set", res_var_name, val_neg),
-              ])),
-            ])
+          blocks.add([
+            sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+              res_var.setValue(val_pos),
+            ]), sb3.BlockList([
+              res_var.setValue(val_neg),
+            ])),
+          ])
 
           res_val = False # We set res_var ourselves
 
@@ -1087,11 +1079,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")
 
       if res_val is not False: # If the binop sets res_var itself
-        if res_var is not None:
-          blocks.add(res_var.setValue(res_val))
-        else:
-          if not ctx.cfg.opti: # Values have no effect on state in scratch, only state has effect on values
-            blocks.add(sb3.EditVar("set", ctx.cfg.unused_var, res_val))
+        blocks.add(res_var.setValue(res_val))
 
     case ir.Conversion(): # Convert a value from one type to another
       value = transValue(instr.value, ctx, bctx)
@@ -1099,7 +1087,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       value = value.value
 
       res_var = transVar(instr.result, bctx)
-      assert res_var is None or res_var.var_type != "param"
+      assert res_var.var_type != "param"
 
       if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -1120,8 +1108,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
 
-      if res_val is not None and res_var is not None:
-        blocks.add(res_var.setValue(res_val))
+      assert res_val is not None
+      blocks.add(res_var.setValue(res_val))
 
     case ir.ICmp(): # Compare two values
       left = transValue(instr.left, ctx, bctx)
@@ -1195,20 +1183,67 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(false_val.value, sb3.Value)
 
       res_var = transVar(instr.result, bctx)
-      assert res_var is None or res_var.var_type != "param"
+      assert res_var.var_type != "param"
 
-      if res_var is not None:
-        blocks.add(cond.blocks)
-        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList([
-          *true_val.blocks.blocks,
-          res_var.setValue(true_val.value)
-        ]), sb3.BlockList([
-          *false_val.blocks.blocks,
-          res_var.setValue(false_val.value)
-        ])))
+      blocks.add(cond.blocks)
+      blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList([
+        *true_val.blocks.blocks,
+        res_var.setValue(true_val.value)
+      ]), sb3.BlockList([
+        *false_val.blocks.blocks,
+        res_var.setValue(false_val.value)
+      ])))
 
     case ir.Phi():
       pass # Phi assignments are dealt with in the brancher function
+
+    case ir.GetElementPtr(): # Offset a pointer to get an address in an array/struct
+      base_ptr = transValue(instr.base_ptr, ctx, bctx)
+      assert isinstance(base_ptr, ValueAndBlocks)
+      blocks.add(base_ptr.blocks)
+
+      known_offset = 0
+      unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
+
+      inner_type = instr.base_ptr_type
+      for i, index_val in enumerate(instr.indices):
+        if i != 0:
+          assert isinstance(inner_type, ir.ArrayTy)
+          inner_type = inner_type.inner
+
+        offset_size = getByteSize(inner_type)
+        if isinstance(index_val, ir.KnownIntVal):
+          known_offset += index_val.value * offset_size
+        else:
+          index = transValue(index_val, ctx, bctx)
+          assert isinstance(index, ValueAndBlocks)
+          blocks.add(index.blocks)
+
+          unknown_offsets[offset_size].append(index.value)
+
+      offsets: list[sb3.Value] = []
+      if known_offset != 0:
+        offsets.append(sb3.Known(known_offset))
+
+      for offset_size, sized_offsets in unknown_offsets.items():
+        assert len(sized_offsets) > 0 # Shouldn't happen with default dict
+        total_sized_offsets = sized_offsets[0]
+        for sized_offset in sized_offsets[1:]:
+          total_sized_offsets = sb3.Op("add", total_sized_offsets, sized_offset)
+
+        if offset_size > 1:
+          offsets.append(sb3.Op("mul", sb3.Known(offset_size), total_sized_offsets))
+        else:
+          # Crazy optimization right here
+          offsets.append(total_sized_offsets)
+
+      offset_ptr = base_ptr.value
+      for offset in offsets:
+        offset_ptr = sb3.Op("add", offset_ptr, offset)
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var.var_type != "param"
+      blocks.add(res_var.setValue(offset_ptr))
 
     case _:
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
@@ -1274,7 +1309,8 @@ def getInstrVarUse(instr: ir.Instr,
     case ir.Select():
       vals = [instr.cond, instr.true_value, instr.false_value]
     case ir.GetElementPtr():
-      vals = [] # TODO FIX: add actual implementation
+      vals = [instr.base_ptr]
+      vals.extend([i for i in instr.indices])
     case _:
       raise CompException(f"Unknown instruction {instr} (type {type(instr)})")
 
@@ -1794,7 +1830,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
 
-  # TODO: not necessary if done beforehand (only need to change stack size)
   blocks.add(sb3.EditList("deleteall", ctx.cfg.stack_var, None, None))
 
   if ctx.cfg.stack_size > SCRATCH_LIST_LIMIT:
@@ -1804,8 +1839,6 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   # Set up static values
   for glob in mod.global_vars.values():
-    # TODO OPTI: Don't use allocate and store and set to the var, instead just remember the
-    # ptr value in the decoder and replace any uses of the variable with it (only when opti=true)
     globvar = localizeVar(glob.name, True, None)
     if globvar is None:
       raise CompException(f"Expected static var {glob} to be named")
@@ -1875,6 +1908,43 @@ def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.
   ctx.next_fn_id += 1
   return ctx
 
+def addForeignFunctions(ctx: Context) -> Context:
+  ascii_lookup = []
+  for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
+    char = chr(x)
+    if char.encode("unicode_escape").decode("ascii").startswith("\\") and char != "\\":
+      ascii_lookup.append(f"\\{x:02X}")
+    else:
+      ascii_lookup.append(char)
+  ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
+
+  ctx = addFunc("puts", ["input"], 0, sb3.BlockList([
+    sb3.EditVar("set", "buffer", sb3.Known("")),
+    sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
+    sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+    sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
+      sb3.EditVar("set", "buffer",
+        sb3.Op("join",
+          sb3.GetVar("buffer"),
+          sb3.GetOfList("atindex",
+            (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+            sb3.GetVar("char")))),
+      sb3.EditVar("change", "ptr", sb3.Known(1)),
+      sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+    ])),
+    sb3.Say(sb3.GetVar("buffer")),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+  ]), ctx)
+
+  ctx = addFunc("putchar", ["input"], 0, sb3.BlockList([
+    sb3.Say(sb3.GetOfList("atindex",
+      (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+      sb3.GetParameter(localizeParameter("input")))),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+  ]), ctx)
+
+  return ctx
+
 def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:
   """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
   if cfg is None: cfg = Config()
@@ -1899,39 +1969,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   initblocks.add(initLocalStack(ctx))
 
   # Add foreign functions
-  ascii_lookup = []
-  for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
-    char = chr(x)
-    if char.encode("unicode_escape").decode("ascii").startswith("\\") and char != "\\":
-      ascii_lookup.append(f"\\{x:02X}")
-    else:
-      ascii_lookup.append(char)
-  ctx.proj.lists[cfg.ascii_lookup_var + cfg.zero_indexed_suffix] = ascii_lookup
-
-  ctx = addFunc("puts", ["input"], 0, sb3.BlockList([
-    sb3.EditVar("set", "buffer", sb3.Known("")),
-    sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
-    sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
-    sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
-      sb3.EditVar("set", "buffer",
-        sb3.Op("join",
-          sb3.GetVar("buffer"),
-          sb3.GetOfList("atindex",
-            (cfg.ascii_lookup_var + cfg.zero_indexed_suffix),
-            sb3.GetVar("char")))),
-      sb3.EditVar("change", "ptr", sb3.Known(1)),
-      sb3.EditVar("set", "char", sb3.GetOfList("atindex", cfg.stack_var, sb3.GetVar("ptr"))),
-    ])),
-    sb3.Say(sb3.GetVar("buffer")),
-    sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
-  ]), ctx)
-
-  ctx = addFunc("putchar", ["input"], 0, sb3.BlockList([
-    sb3.Say(sb3.GetOfList("atindex",
-      (cfg.ascii_lookup_var + cfg.zero_indexed_suffix),
-      sb3.GetParameter(localizeParameter("input")))),
-    sb3.EditVar("set", cfg.return_var, sb3.Known(0)),
-  ]), ctx)
+  ctx = addForeignFunctions(ctx)
 
   # Translate functions
   ctx = transFuncs(mod, ctx)

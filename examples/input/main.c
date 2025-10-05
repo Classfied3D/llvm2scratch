@@ -89,8 +89,9 @@ int main(void) {
   int f = factorial_recurse(10);
   int g = sum_to_one_digit(473);
 
-  //char* h = "Hello World";
-  //h[0] = 'C';
+  char* h = "Hell0 W0rld";
+  h[4] = 'o';
+  h[7] = 'o';
 
   return 0;
 }
