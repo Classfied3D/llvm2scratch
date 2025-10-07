@@ -4,6 +4,7 @@ static int a = 7;
 // Broken: no static ptr assignment
 //static char* message = "default";
 static char message[] = "default";
+static char str[] = "hello world";
 
 int add_one(int num) {
   return num + 1;
@@ -38,8 +39,26 @@ int sum_to_one_digit(unsigned int n) {
   return sum;
 }
 
+void numberize(char* str) {
+  for (int i = 0; str[i] != '\0'; i++) {
+    switch (str[i]) {
+      case 'a':
+        str[i] = '4';
+        break;
+      case 'e':
+        str[i] = '3';
+        break;
+      case 'l':
+        str[i] = '1';
+        break;
+      case 'o':
+        str[i] = '0';
+        break;
+    }
+  }
+}
+
 int main(void) {
-  puts("hello world");
   a += 2;
   a -= 4;
   a *= 2;
@@ -89,9 +108,8 @@ int main(void) {
   int f = factorial_recurse(10);
   int g = sum_to_one_digit(473);
 
-  char* h = "Hell0 W0rld";
-  h[4] = 'o';
-  h[7] = 'o';
+  numberize(str);
+  puts(str);
 
   return 0;
 }

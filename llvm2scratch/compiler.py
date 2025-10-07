@@ -308,7 +308,7 @@ def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Cont
       raise CompException("Cannot calculate pow2 of a known non-integer")
   else:
     lookup, ctx = makePow2LookupTable(max_val, True, ctx) # Any value above the width will be treated as a zero
-                                                        # which has no effect on the result
+                                                          # which has no effect on the result
     return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(1))), ctx
 
 def bitShift(direction: Literal["left", "right"],
@@ -406,23 +406,20 @@ def binarySearch(value: sb3.Value,
   mid = (_lo + _hi) // 2
   mid_val = list(branches.keys())[mid]
 
-  if _lo != 0: min_poss_value = list(branches.keys())[_lo]
-  if _hi != len(branches) - 1: max_poss_value = list(branches.keys())[_hi]
-
   if _lo == _hi:
     if default_branch is not None:
       check_below = check_above = True
 
       if mid != len(branches) - 1:
         # If the value above the one being checked for, there is no need to check for a default above it
-        check_above = not list(branches.keys())[mid + 1] == mid_val + 1
-      if mid_val == max_poss_value: # If the value is the highest, we don't need to check below
+        check_above = list(branches.keys())[mid + 1] != mid_val + 1
+      if max_poss_value is not None and mid_val == max_poss_value: # If the value is the highest, we don't need to check below
         check_above = False
 
       # Vice versa
       if mid != 0:
-        check_below = not list(branches.keys())[mid - 1] == mid_val - 1
-      if mid_val == min_poss_value:
+        check_below = list(branches.keys())[mid - 1] != mid_val - 1
+      if min_poss_value is not None and mid_val == min_poss_value:
         check_below = False
 
       if check_below or check_above:
@@ -434,9 +431,9 @@ def binarySearch(value: sb3.Value,
   cond = sb3.BoolOp(">", value, sb3.Known(mid_val))
   return sb3.BlockList([sb3.ControlFlow("if_else", cond,
                         # Sorting already taken care of
-                        binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
+                        binarySearch(value, branches, default_branch, mid_val + 1, max_poss_value, True,
                                      _lo=mid + 1, _hi=_hi),
-                        binarySearch(value, branches, default_branch, min_poss_value, max_poss_value, True,
+                        binarySearch(value, branches, default_branch, min_poss_value, mid_val, True,
                                      _lo=_lo,     _hi=mid))])
 
 def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
@@ -1086,6 +1083,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       blocks.add(value.blocks)
       value = value.value
 
+      from_ty, to_ty = instr.value.type, instr.res_type
+
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
@@ -1094,9 +1093,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                             f"integers, got type {type(instr.value.type)}")
       assert isinstance(value, sb3.Value)
 
-      width = instr.value.type.width
       # TODO FIX: support larger values
-      if width > VARIABLE_MAX_BITS:
+      if instr.value.type.width > VARIABLE_MAX_BITS:
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
@@ -1105,6 +1103,17 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       match instr.opcode:
         case ir.ConversionOpcode.ZExt:
           res_val = value
+        case ir.ConversionOpcode.SExt:
+          assert isinstance(from_ty, ir.IntegerTy) and isinstance(to_ty, ir.IntegerTy)
+          from_bits, to_bits = from_ty.width, to_ty.width
+
+          # Two's complement
+          limit = 2 ** (from_bits - 1) - 1
+          is_neg = sb3.BoolOp(">", value, sb3.Known(limit))
+
+          # e.g. i2 -> i4: 1111 - 0011 = 1100
+          diff = (2 ** to_bits - 1) - (2 ** from_bits - 1)
+          res_val = sb3.Op("add", value, sb3.Op("mul", sb3.Known(diff), is_neg))
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
 
