@@ -6,6 +6,11 @@ static int a = 7;
 static char message[] = "default";
 static char str[] = "hello world";
 
+typedef struct SensorData {
+  int temp;
+  int humidity;
+} SensorData;
+
 int add_one(int num) {
   return num + 1;
 }
@@ -110,6 +115,9 @@ int main(void) {
 
   numberize(str);
   puts(str);
+
+  SensorData h[5];
+  h[0] = (SensorData){1, 2};
 
   return 0;
 }

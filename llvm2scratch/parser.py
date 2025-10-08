@@ -1,13 +1,15 @@
 from __future__ import annotations
 from llvmlite import binding as llvm
 from dataclasses import dataclass
+from typing import cast
 from .parser_util import valueFromInitializerText, extractFirstType, extractTypedValue, stripReturnAttrs
 from .ir import *
 
-def decodeTypeStr(type_str: str) -> Type:
+def decodeTypeStr(type_str: str, mod: llvm.ModuleRef) -> Type:
   if type_str == "void":
     return VoidTy()
-  ir = f"""
+  ir = "".join(str(struct) for struct in mod.struct_types) \
+    + f"""
   declare void @dummy({type_str})
   """
   mod = llvm.parse_assembly(ir)
@@ -50,13 +52,20 @@ def decodeType(type: llvm.TypeRef) -> Type:
 
     case llvm.TypeKind.array:
       inner_type = decodeType(next(type.elements))
-      assert isinstance(inner_type, ArrTargetTy)
+      assert isinstance(inner_type, AggTargetTy)
       return ArrayTy(inner_type, type.element_count)
+
+    case llvm.TypeKind.struct:
+      name = type.name
+      members = [decodeType(ty) for ty in type.elements]
+      assert all(isinstance(mem, AggTargetTy) for mem in members)
+      members = cast(list[AggTargetTy], members)
+      return StructTy(name, members)
 
     case _:
       raise ValueError(f"Unknown type: {type.type_kind.name}")
 
-def decodeValue(value: llvm.ValueRef) -> Value:
+def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
   type = decodeType(value.type)
 
   match value.value_kind:
@@ -73,7 +82,7 @@ def decodeValue(value: llvm.ValueRef) -> Value:
       rest = rest.removeprefix("declare ").removeprefix("define ").strip()
       rest = stripReturnAttrs(rest).strip()
       func_ret_type_str, _ = extractFirstType(rest)
-      func_ret_type = decodeTypeStr(func_ret_type_str)
+      func_ret_type = decodeTypeStr(func_ret_type_str, mod)
 
       return FunctionVal(type, value.name, func_ret_type)
 
@@ -108,12 +117,12 @@ def decodeValue(value: llvm.ValueRef) -> Value:
     case _:
       raise ValueError(f"Unknown value type: {value.value_kind.name}")
 
-def decodeLabel(value: llvm.ValueRef) -> LabelVal:
-  res = decodeValue(value)
+def decodeLabel(value: llvm.ValueRef, mod: llvm.ModuleRef) -> LabelVal:
+  res = decodeValue(value, mod)
   assert isinstance(res, LabelVal)
   return res
 
-def decodeInstr(instr: llvm.ValueRef) -> Instr:
+def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
   result = getResultLocalVar(instr)
   raw_instr_no_res = str(instr)
   if result is not None:
@@ -122,15 +131,15 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
   match instr.opcode:
     case "ret":
       if len(list(instr.operands)) > 0:
-        value = decodeValue(next(instr.operands))
+        value = decodeValue(next(instr.operands), mod)
         return Ret(value)
       return Ret(None)
 
     case "br":
       if len(list(instr.operands)) > 1:
         cond, branch_false, branch_true, *_ = instr.operands
-        return CondBr(decodeValue(cond), decodeLabel(branch_true), decodeLabel(branch_false))
-      return UncondBr(decodeLabel(next(instr.operands)))
+        return CondBr(decodeValue(cond, mod), decodeLabel(branch_true, mod), decodeLabel(branch_false, mod))
+      return UncondBr(decodeLabel(next(instr.operands), mod))
 
     case "switch":
       value, default_label, *rest = instr.operands
@@ -138,11 +147,11 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
 
       branch_table: list[tuple[KnownIntVal, LabelVal]] = []
       for i in range(0, len(rest), 2):
-        case_val, label = decodeValue(rest[i]), decodeLabel(rest[i+1])
+        case_val, label = decodeValue(rest[i], mod), decodeLabel(rest[i+1], mod)
         assert isinstance(case_val, KnownIntVal)
         branch_table.append((case_val, label))
 
-      return Switch(decodeValue(value), decodeLabel(default_label), branch_table)
+      return Switch(decodeValue(value, mod), decodeLabel(default_label, mod), branch_table)
 
     case "unreachable":
       return Unreachable()
@@ -150,7 +159,7 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
     case "fneg":
       assert result is not None
       operand, *_ = instr.operands
-      return UnaryOp(result, UnaryOpcode.FNeg, decodeValue(operand))
+      return UnaryOp(result, UnaryOpcode.FNeg, decodeValue(operand, mod))
 
     case "add" | "fadd" | "sub" | "fsub" | "mul" | "fmul" | "udiv" | "sdiv" | "fdiv" | \
          "urem" | "srem" | "frem" | "shl" | "lshr" | "ashr" | "and" | "or" | "xor":
@@ -172,17 +181,17 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
 
       return BinaryOp(
         result, opcode,
-        decodeValue(left), decodeValue(right),
+        decodeValue(left, mod), decodeValue(right, mod),
         flags["nuw"], flags["nsw"], flags["exact"], flags["disjoint"])
 
     case "extractelement":
       assert result is not None
       vec, index, *_ = instr.operands
-      return ExtractElement(result, decodeValue(vec), decodeValue(index))
+      return ExtractElement(result, decodeValue(vec, mod), decodeValue(index, mod))
 
     case "insertelement":
       vec, item, index, *_ = instr.operands
-      return InsertElement(decodeValue(vec), decodeValue(item), decodeValue(index))
+      return InsertElement(decodeValue(vec, mod), decodeValue(item, mod), decodeValue(index, mod))
 
     case "shufflevector":
       assert result is not None
@@ -207,33 +216,33 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
       instr = next(block.instructions)
       mask = next(instr.operands)
 
-      return ShuffleVector(result, decodeValue(vec1), decodeValue(vec2), decodeValue(mask))
+      return ShuffleVector(result, decodeValue(vec1, mod), decodeValue(vec2, mod), decodeValue(mask, mod))
 
     case "alloca":
       assert result is not None
 
-      num_elements = decodeValue(next(instr.operands))
+      num_elements = decodeValue(next(instr.operands), mod)
 
       rest = raw_instr_no_res.split("alloca ", 1)[1].strip().removeprefix("inalloca ")
       allocated_type_str, _ = extractFirstType(rest)
-      allocated_type = decodeTypeStr(allocated_type_str)
+      allocated_type = decodeTypeStr(allocated_type_str, mod)
 
       return Alloca(result, allocated_type, num_elements)
 
     case "load":
       assert result is not None
       value, *_ = instr.operands
-      return Load(result, decodeValue(value))
+      return Load(result, decodeValue(value, mod))
 
     case "store":
       value, addr, *_ = instr.operands
-      return Store(decodeValue(value), decodeValue(addr))
+      return Store(decodeValue(value, mod), decodeValue(addr, mod))
 
     case "getelementptr":
       assert result is not None
       base_ptr, *indices = instr.operands
 
-      index_values = [decodeValue(idx) for idx in indices]
+      index_values = [decodeValue(idx, mod) for idx in indices]
 
       rest = raw_instr_no_res.split("getelementptr ", 1)[1].strip()
       keywords = ["inbounds", "inrange", "nusw", "nsw"]
@@ -249,9 +258,9 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
             has_keyword = True
 
       ptr_type_str, _ = extractFirstType(rest)
-      ptr_type = decodeTypeStr(ptr_type_str)
+      ptr_type = decodeTypeStr(ptr_type_str, mod)
 
-      return GetElementPtr(result, ptr_type, decodeValue(base_ptr), index_values)
+      return GetElementPtr(result, ptr_type, decodeValue(base_ptr, mod), index_values)
 
     case "trunc" | "zext" | "sext" | "fptrunc" | "fpext" | "fptoui" | "fptosi" | \
          "uitofp" | "sitofp" | "ptrtoint" | "ptrtoaddr" | "inttoptr" | "bitcast" | \
@@ -261,7 +270,7 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
       value, *_ = instr.operands
 
       conv_type_str, _ = extractFirstType(raw_instr_no_res.split(" to ", 1)[-1].strip())
-      conv_type = decodeTypeStr(conv_type_str)
+      conv_type = decodeTypeStr(conv_type_str, mod)
 
       flags = {"nuw": False, "nsw": False}
       if instr.opcode == "trunc":
@@ -276,7 +285,7 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
           else:
             break
 
-      return Conversion(result, opcode, decodeValue(value), conv_type, flags["nuw"], flags["nsw"])
+      return Conversion(result, opcode, decodeValue(value, mod), conv_type, flags["nuw"], flags["nsw"])
 
     case "icmp":
       assert result is not None
@@ -287,7 +296,7 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
       rest = rest.removeprefix("samesign ")
 
       cond = ICmpCond(rest.split(" ", 1)[0])
-      return ICmp(result, cond, decodeValue(left), decodeValue(right), samesign)
+      return ICmp(result, cond, decodeValue(left, mod), decodeValue(right, mod), samesign)
 
     case "fcmp":
       assert result is not None
@@ -302,26 +311,26 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
           cond_found = True
           cond = FCmpCond(cond_str)
 
-      return FCmp(result, cond, decodeValue(left), decodeValue(right))
+      return FCmp(result, cond, decodeValue(left, mod), decodeValue(right, mod))
 
     case "phi":
       assert result is not None
 
       incoming: list[tuple[Value, LabelVal]] = []
       for val, label in zip(instr.operands, instr.incoming_blocks):
-        incoming.append((decodeValue(val), decodeLabel(label)))
+        incoming.append((decodeValue(val, mod), decodeLabel(label, mod)))
       return Phi(result, incoming)
 
     case "select":
       assert result is not None
       cond, true_val, false_val, *_ = instr.operands
-      return Select(result, decodeValue(cond), decodeValue(true_val), decodeValue(false_val))
+      return Select(result, decodeValue(cond, mod), decodeValue(true_val, mod), decodeValue(false_val, mod))
 
     case "call":
       *args, callee = instr.operands
-      func_val = decodeValue(callee)
+      func_val = decodeValue(callee, mod)
       assert isinstance(func_val, FunctionVal)
-      arg_vals = [decodeValue(arg) for arg in args]
+      arg_vals = [decodeValue(arg, mod) for arg in args]
 
       tail_kind = CallTailKind.NoTail
       if raw_instr_no_res.startswith("tail "):
@@ -335,6 +344,8 @@ def decodeInstr(instr: llvm.ValueRef) -> Instr:
       raise ValueError(f"Opcode {instr.opcode} not implemented")
 
 def decodeModule(mod: llvm.ModuleRef) -> Module:
+  print(decodeType(list(mod.struct_types)[0]))
+
   glob_vars: dict[str, GlobalVar] = {}
   for glob in mod.global_variables:
     glob_name = glob.name
@@ -347,7 +358,7 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
       glob_constant = False
       rest = rest.split("global", 1)[-1].strip()
     type_str, rest = extractFirstType(rest)
-    type = decodeTypeStr(type_str)
+    type = decodeTypeStr(type_str, mod)
     rest = rest.strip()
     if len(rest) == 0 or rest.startswith(","):
       glob_init = None
@@ -361,26 +372,26 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
 
   for func in mod.functions:
     fn_name = func.name
-    fn_return_type = decodeValue(func)
+    fn_return_type = decodeValue(func, mod)
     assert isinstance(fn_return_type, FunctionVal)
     fn_ret_type = fn_return_type.return_type
 
     fn_args: list[ArgumentVal] = []
     for arg in func.arguments:
-      arg_val = decodeValue(arg)
+      arg_val = decodeValue(arg, mod)
       assert isinstance(arg_val, ArgumentVal)
       fn_args.append(arg_val)
 
     fn_blocks: dict[str, Block] = {}
 
     for block in func.blocks:
-      block_val = decodeValue(block)
+      block_val = decodeValue(block, mod)
       assert isinstance(block_val, LabelVal)
       block_name = block_val.label
 
       instructions: list[Instr] = []
       for inst in block.instructions:
-        instructions.append(decodeInstr(inst))
+        instructions.append(decodeInstr(inst, mod))
       fn_blocks.update({block_name: Block(block_name, instructions)})
 
     functions.update({fn_name: Function(fn_name, fn_ret_type, fn_args, fn_blocks)})

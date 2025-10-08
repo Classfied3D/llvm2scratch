@@ -83,7 +83,7 @@ class ResultLocalVar:
 class Type:
   pass
 
-class ArrTargetTy(Type):
+class AggTargetTy(Type):
   pass
 
 class VecTargetTy(Type):
@@ -93,10 +93,10 @@ class VoidTy(Type):
   pass
 
 @dataclass
-class IntegerTy(VecTargetTy, ArrTargetTy):
+class IntegerTy(VecTargetTy, AggTargetTy):
   width: int
 
-class FloatingPointTy(VecTargetTy, ArrTargetTy):
+class FloatingPointTy(VecTargetTy, AggTargetTy):
   pass
 
 class HalfTy(FloatingPointTy):
@@ -115,7 +115,7 @@ class PointerTy(VecTargetTy):
   pass
 
 @dataclass
-class VecTy(ArrTargetTy):
+class VecTy(AggTargetTy):
   inner: VecTargetTy
   size: int
 
@@ -123,9 +123,14 @@ class LabelTy(Type):
   pass
 
 @dataclass
-class ArrayTy(ArrTargetTy):
-  inner: ArrTargetTy
+class ArrayTy(AggTargetTy):
+  inner: AggTargetTy
   size: int
+
+@dataclass
+class StructTy(AggTargetTy):
+  name: str
+  members: list[AggTargetTy]
 
 @dataclass
 class Value:
