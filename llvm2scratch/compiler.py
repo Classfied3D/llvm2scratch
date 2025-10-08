@@ -80,7 +80,7 @@ class FuncInfo:
   can_call: set[str] = field(default_factory=set)
   # Any functions that call this function
   return_addresses: list[str] = field(default_factory=list)
-  # If the function returns using a broadcast to an address
+  # If the function returns using an id to an address
   returns_to_address: bool = False
   # If the function takes a return address as a parameter
   takes_return_address: bool = False
@@ -408,21 +408,10 @@ def binarySearch(value: sb3.Value,
 
   if _lo == _hi:
     if default_branch is not None:
-      check_below = check_above = True
+      # If there is only one possible value in the range then skip the equality check
+      skip_check = min_poss_value is not None and min_poss_value == max_poss_value
 
-      if mid != len(branches) - 1:
-        # If the value above the one being checked for, there is no need to check for a default above it
-        check_above = list(branches.keys())[mid + 1] != mid_val + 1
-      if max_poss_value is not None and mid_val == max_poss_value: # If the value is the highest, we don't need to check below
-        check_above = False
-
-      # Vice versa
-      if mid != 0:
-        check_below = list(branches.keys())[mid - 1] != mid_val - 1
-      if min_poss_value is not None and mid_val == min_poss_value:
-        check_below = False
-
-      if check_below or check_above:
+      if not skip_check:
         cond = sb3.BoolOp("=", value, sb3.Known(mid_val))
         return sb3.BlockList([sb3.ControlFlow("if_else", cond, list(branches.values())[mid], default_branch)])
 
