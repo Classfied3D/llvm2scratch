@@ -344,8 +344,6 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
       raise ValueError(f"Opcode {instr.opcode} not implemented")
 
 def decodeModule(mod: llvm.ModuleRef) -> Module:
-  print(decodeType(list(mod.struct_types)[0]))
-
   glob_vars: dict[str, GlobalVar] = {}
   for glob in mod.global_variables:
     glob_name = glob.name

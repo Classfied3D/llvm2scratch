@@ -179,6 +179,8 @@ def getByteSize(ty: ir.Type) -> int:
       return math.ceil(ty.width / VARIABLE_MAX_BITS)
     case ir.ArrayTy():
       return ty.size * getByteSize(ty.inner)
+    case ir.StructTy():
+      return sum(getByteSize(mem) for mem in ty.members)
     case ir.PointerTy():
       return 1
     case _:
