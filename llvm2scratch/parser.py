@@ -122,6 +122,19 @@ def decodeLabel(value: llvm.ValueRef, mod: llvm.ModuleRef) -> LabelVal:
   assert isinstance(res, LabelVal)
   return res
 
+def decodeIntrinsic(name: str) -> Intrinsic | None:
+  if not name.startswith("llvm."):
+    return None
+  name = name.removeprefix("llvm.")
+
+  if name.startswith("memcpy"):
+    if name.startswith("memcpy.inline"):
+      return Intrinsic.MemCpyInline
+    return Intrinsic.MemCpy
+  elif name.startswith("memmove"):
+    return Intrinsic.MemMove
+  raise ValueError(f"Unknown intrinsic {name}")
+
 def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
   result = getResultLocalVar(instr)
   raw_instr_no_res = str(instr)
@@ -338,7 +351,9 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
       elif raw_instr_no_res.startswith("musttail "):
         tail_kind = CallTailKind.MustTail
 
-      return Call(result, func_val, arg_vals, tail_kind)
+      intrinsic = decodeIntrinsic(func_val.name)
+
+      return Call(result, func_val, intrinsic, arg_vals, tail_kind)
 
     case _:
       raise ValueError(f"Opcode {instr.opcode} not implemented")

@@ -76,6 +76,11 @@ class CallTailKind(Enum):
   Tail = "tail"
   MustTail = "musttail"
 
+class Intrinsic(Enum):
+  MemCpy = "llvm.memcpy"
+  MemCpyInline = "llvm.memcpy.inline"
+  MemMove = "llvm.memmove"
+
 @dataclass
 class ResultLocalVar:
   name: str
@@ -306,6 +311,7 @@ class Select(Instr, HasResult):
 @dataclass
 class Call(Instr, MaybeHasResult):
   func: FunctionVal
+  intrinsic: Intrinsic | None
   args: list[Value]
   tail_kind: CallTailKind
 
