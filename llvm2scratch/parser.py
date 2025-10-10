@@ -84,7 +84,10 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
       func_ret_type_str, _ = extractFirstType(rest)
       func_ret_type = decodeTypeStr(func_ret_type_str, mod)
 
-      return FunctionVal(type, value.name, func_ret_type)
+      name = value.name
+      intrinsic = decodeIntrinsic(name)
+
+      return FunctionVal(type, name, func_ret_type, intrinsic)
 
     case llvm.ValueKind.instruction:
       # An instruction of which the SSA value is set from
@@ -279,7 +282,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
          "uitofp" | "sitofp" | "ptrtoint" | "ptrtoaddr" | "inttoptr" | "bitcast" | \
          "addrspacecast":
       assert result is not None
-      opcode = ConversionOpcode(instr.opcode)
+      opcode = ConvOpcode(instr.opcode)
       value, *_ = instr.operands
 
       conv_type_str, _ = extractFirstType(raw_instr_no_res.split(" to ", 1)[-1].strip())
@@ -351,9 +354,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
       elif raw_instr_no_res.startswith("musttail "):
         tail_kind = CallTailKind.MustTail
 
-      intrinsic = decodeIntrinsic(func_val.name)
-
-      return Call(result, func_val, intrinsic, arg_vals, tail_kind)
+      return Call(result, func_val, arg_vals, tail_kind)
 
     case _:
       raise ValueError(f"Opcode {instr.opcode} not implemented")
@@ -407,7 +408,9 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
         instructions.append(decodeInstr(inst, mod))
       fn_blocks.update({block_name: Block(block_name, instructions)})
 
-    functions.update({fn_name: Function(fn_name, fn_ret_type, fn_args, fn_blocks)})
+    intrinsic = decodeIntrinsic(fn_name)
+
+    functions.update({fn_name: Function(fn_name, fn_ret_type, fn_args, intrinsic, fn_blocks)})
 
   return Module(mod.name, functions, glob_vars)
 

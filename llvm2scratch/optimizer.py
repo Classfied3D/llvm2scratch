@@ -84,6 +84,15 @@ def setInputs(block: sb3.Block, inputs: list[sb3.Value]) -> sb3.Block:
       assert len(inputs) == 0
   return block
 
+# Returns None if not an unknown and known else [the known, the unknown, and if the left was known]
+def getKnownAndUnknown(value: sb3.Op) -> tuple[sb3.Known, sb3.Value, bool] | None:
+  if value.right is None: return None
+  if isinstance(value.left, sb3.Known):
+    return value.left, value.right, True
+  elif isinstance(value.right, sb3.Known):
+    return value.right, value.left, False
+  return None
+
 def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
   """Optimise a value by using context"""
   did_opti_total = False
@@ -191,21 +200,54 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
             value = sb3.Known(math.ceil(left))
           case _:
             did_opti_total = False
-      elif (isinstance(value.left, sb3.Known) or isinstance(value.right, sb3.Known)) and value.right is not None:
-        left_known = isinstance(value.left, sb3.Known)
-        unknown = value.right
-        if left_known:
-          assert isinstance(value.left, sb3.Known) # why do I have to assert this lol
-          known = sb3.scratchCastToNum(value.left)
-        else:
-          assert isinstance(value.right, sb3.Known)
-          known = sb3.scratchCastToNum(value.right)
-          unknown = value.left
+
+      elif isinstance(value.left, sb3.Known) and isinstance(value.right, sb3.Known) and value.right is not None:
+        left = sb3.scratchCastToNum(value.left)
+        right = sb3.scratchCastToNum(value.right)
         match value.op:
-          case "add" | "sub":
-            if known == 0: value = unknown
           case "mul":
-            if known == 0: value = sb3.Known(0)
+            if left == 0 or right == 0: value = sb3.Known(0)
+            did_opti_total = True
+
+      if not did_opti_total:
+        assert isinstance(value, sb3.Op)
+        known_and_unknown = getKnownAndUnknown(value)
+        if known_and_unknown is not None:
+          known, unknown, left_is_known = known_and_unknown
+          known = sb3.scratchCastToNum(known)
+
+          match value.op:
+            case "add" | "sub":
+              if known == 0:
+                value = unknown
+                did_opti_total = True
+              elif isinstance(unknown, sb3.Op) and unknown.op in ["add", "sub"] and \
+                   getKnownAndUnknown(unknown) is not None:
+                # Combine known terms into one operation
+
+                inner_known_and_unknown = getKnownAndUnknown(unknown)
+                assert inner_known_and_unknown is not None
+                inner_known, inner_unknown, inner_left_is_known = inner_known_and_unknown
+                inner_known = sb3.scratchCastToNum(inner_known)
+
+                # e.g. 1 - (a + 3) should be simplified to -2 - a
+                sub_inner_value = (value.op == "sub" and left_is_known) ^ (unknown.op == "sub" and inner_left_is_known)
+
+                combined_known =  known * (-1 if value.op == "sub" and not left_is_known else 1)
+                combined_known += inner_known * (-1 if unknown.op == "sub" and not inner_left_is_known else 1) * \
+                  (-1 if value.op == "sub" and left_is_known else 1)
+
+                if not sub_inner_value:
+                  if combined_known == 0:
+                    value = unknown
+                  elif combined_known > 0:
+                    value = sb3.Op("add", inner_unknown, sb3.Known(combined_known))
+                  else:
+                    value = sb3.Op("sub", inner_unknown, sb3.Known(-combined_known))
+                else:
+                  value = sb3.Op("sub", sb3.Known(combined_known), inner_unknown)
+
+                did_opti_total = True
 
     case sb3.GetOfList():
       value.value, did_opti = simplifyValue(value.value)

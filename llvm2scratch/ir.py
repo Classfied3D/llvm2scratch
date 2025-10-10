@@ -25,7 +25,7 @@ class BinaryOpcode(Enum):
   Or = "or"
   Xor = "xor"
 
-class ConversionOpcode(Enum):
+class ConvOpcode(Enum):
   Trunc = "trunc"
   ZExt = "zext"
   SExt = "sext"
@@ -158,6 +158,7 @@ class ArgumentVal(Value):
 class FunctionVal(Value):
   name: str
   return_type: Type
+  intrinsic: Intrinsic | None
 
 @dataclass
 class LocalVarVal(Value):
@@ -279,7 +280,7 @@ class GetElementPtr(Instr, HasResult):
 
 @dataclass
 class Conversion(Instr, HasResult):
-  opcode: ConversionOpcode
+  opcode: ConvOpcode
   value: Value
   res_type: Type
   is_nuw: bool
@@ -311,7 +312,6 @@ class Select(Instr, HasResult):
 @dataclass
 class Call(Instr, MaybeHasResult):
   func: FunctionVal
-  intrinsic: Intrinsic | None
   args: list[Value]
   tail_kind: CallTailKind
 
@@ -325,6 +325,7 @@ class Function():
   name: str
   return_type: Type
   args: list[ArgumentVal]
+  intrinsic: Intrinsic | None
   blocks: dict[str, Block]
 
 @dataclass

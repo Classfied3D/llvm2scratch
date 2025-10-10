@@ -117,7 +117,8 @@ int main(void) {
   puts(str);
 
   SensorData h[5];
-  h[0] = (SensorData){1, 2};
+  h[2] = (SensorData){7, 2};
+  putchar('0' + h[2].temp);
 
   return 0;
 }

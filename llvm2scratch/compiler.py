@@ -1079,22 +1079,36 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
-      if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
-        raise CompException(f"Instruction {instr} with opcode add only supports "
-                            f"integers, got type {type(instr.value.type)}")
       assert isinstance(value, sb3.Value)
 
-      # TODO FIX: support larger values
-      if instr.value.type.width > VARIABLE_MAX_BITS:
-        raise CompException(f"Instruction icmp currently supports "
-                            f"integers with <= {VARIABLE_MAX_BITS} bits")
+      match instr.opcode:
+        case ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt:
+          if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+              f"integers, got type {type(instr.value.type)}")
+
+          # TODO FIX: support larger values
+          if instr.value.type.width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction icmp currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
+
+        case ir.ConvOpcode.BitCast:
+          if isinstance(instr.value.type, ir.IntegerTy):
+            assert isinstance(instr.res_type, ir.IntegerTy)
+            if instr.value.type.width > VARIABLE_MAX_BITS:
+              raise CompException(f"Instruction icmp currently supports "
+                                  f"integers with <= {VARIABLE_MAX_BITS} bits")
+          elif isinstance(instr.value.type, ir.PointerTy):
+            assert isinstance(instr.res_type, ir.PointerTy)
+          # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
+          # representation in bits
 
       res_val = None
 
       match instr.opcode:
-        case ir.ConversionOpcode.ZExt:
+        case ir.ConvOpcode.ZExt:
           res_val = value
-        case ir.ConversionOpcode.SExt:
+        case ir.ConvOpcode.SExt:
           assert isinstance(from_ty, ir.IntegerTy) and isinstance(to_ty, ir.IntegerTy)
           from_bits, to_bits = from_ty.width, to_ty.width
 
@@ -1105,6 +1119,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           # e.g. i2 -> i4: 1111 - 0011 = 1100
           diff = (2 ** to_bits - 1) - (2 ** from_bits - 1)
           res_val = sb3.Op("add", value, sb3.Op("mul", sb3.Known(diff), is_neg))
+        case ir.ConvOpcode.BitCast:
+          res_val = value
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
 
@@ -1205,21 +1221,34 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       known_offset = 0
       unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
 
+      is_arr_offset = True
       inner_type = instr.base_ptr_type
       for i, index_val in enumerate(instr.indices):
-        if i != 0:
-          assert isinstance(inner_type, ir.ArrayTy)
-          inner_type = inner_type.inner
+        if is_arr_offset:
+          # An array offset
+          if i != 0:
+            assert isinstance(inner_type, ir.ArrayTy)
+            inner_type = inner_type.inner
 
-        offset_size = getByteSize(inner_type)
-        if isinstance(index_val, ir.KnownIntVal):
-          known_offset += index_val.value * offset_size
+          offset_size = getByteSize(inner_type)
+          if isinstance(index_val, ir.KnownIntVal):
+            known_offset += index_val.value * offset_size
+          else:
+            index = transValue(index_val, ctx, bctx)
+            assert isinstance(index, ValueAndBlocks)
+            blocks.add(index.blocks)
+
+            unknown_offsets[offset_size].append(index.value)
         else:
-          index = transValue(index_val, ctx, bctx)
-          assert isinstance(index, ValueAndBlocks)
-          blocks.add(index.blocks)
+          # A struct offset
+          assert isinstance(inner_type, ir.StructTy)
+          assert isinstance(index_val, ir.KnownIntVal)
+          members = inner_type.members
+          member_offset = index_val.value
+          for member in members[:member_offset]:
+            known_offset += getByteSize(member)
 
-          unknown_offsets[offset_size].append(index.value)
+        is_arr_offset = isinstance(inner_type, ir.ArrayTy)
 
       offsets: list[sb3.Value] = []
       if known_offset != 0:
@@ -1541,6 +1570,43 @@ def transTerminatorInstr(instr: ir.Instr,
       raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
   return blocks, ctx
 
+def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, \
+                   bctx: BlockInfo) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+
+  values: list[sb3.Value] = []
+  for arg in args:
+    val = transValue(arg, ctx, bctx)
+    assert isinstance(val, ValueAndBlocks)
+    blocks.add(val.blocks)
+    values.append(val.value)
+
+  match intrinsic:
+    case ir.Intrinsic.MemCpy:
+      dest, src, length, volatile = values
+
+      # If the length is unknown and large, we'll use a loop like when it is known
+      known_length = isinstance(length, sb3.Known) and \
+        (isinstance(length.known, (int, float)) and length.known < 15)
+
+      if known_length:
+        assert isinstance(length, sb3.Known)
+        assert isinstance(length.known, (int, float))
+        for offset in range(int(length.known)):
+          offset_val = sb3.Known(offset)
+
+          get_ptr = sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", src, offset_val))
+          set_ptr = sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", dest, offset_val), get_ptr)
+
+          blocks.add(set_ptr)
+      else:
+        raise CompException("Unknown memcpy length not supported") # TODO FIX
+
+    case _:
+      raise CompException(f"Unsupported intrinsic {intrinsic}")
+
+  return blocks
+
 def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   """Get info about a function needed to translate it's instructions"""
   call_graph: dict[str, tuple[set[str], bool]] = {}
@@ -1554,51 +1620,43 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   phi_assignments: defaultdict[str, defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]] = \
     defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: list())))
 
-  for func in mod.functions.values():
-    fn_name = func.name
+  for fn in mod.functions.values():
+    if len(fn.blocks) == 0: # If function has no body, ignore it
+      call_graph[fn.name] = set(), False
+      total_alloca_size[fn.name] = 0
+      continue
 
-    if len(func.blocks) == 0: # If function has no body
-      if fn_name not in ctx.fn_info:
-        raise CompException(f"Externally defined function {fn_name} must have info about it")
-      info = ctx.fn_info[fn_name]
-      call_graph[fn_name] = info.can_call, True
+    calls: set[str] = set() # What the function calls
+    for block in fn.blocks.values():
+      # Find every function the function could call
+      call_id = 0
+      for instr in block.instrs:
+        match instr:
+          case ir.Call():
+            called_name = instr.func.name
+            calls.add(called_name)
+            return_addresses.setdefault(called_name, list())
+            return_addresses[called_name].append(localizeCallId(call_id, block.label, fn.name))
+            call_id += 1
+          case ir.Alloca():
+            branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type)
+          case ir.Phi():
+            res_var_name = instr.result.name
+            res_var = Variable(res_var_name, "var", fn.name)
 
-    else:
-      calls: set[str] = set() # What the function calls
-      for block in func.blocks.values():
-        # Find every function the function could call
-        call_id = 0
-        for instr in block.instrs:
-          match instr:
-            case ir.Call():
-              called_name = instr.func.name
-              calls.add(called_name)
-              return_addresses.setdefault(called_name, list())
-              return_addresses[called_name].append(localizeCallId(call_id, block.label, fn_name))
-              call_id += 1
-            case ir.Alloca():
-              branch_alloca_size[fn_name][block.label] += getByteSize(instr.allocated_type)
-            case ir.Phi():
-              res_var_name = instr.result.name
-              res_var = Variable(res_var_name, "var", fn_name)
+            to_label_name = block.label
 
-              to_label_name = block.label
+            for val, from_label in instr.incoming:
+              assert isinstance(from_label.type, ir.LabelTy)
+              from_label_name = from_label.label
 
-              for val, from_label in instr.incoming:
-                assert isinstance(from_label.type, ir.LabelTy)
-                from_label_name = from_label.label
+              phi_assignments[fn.name][from_label_name][to_label_name].append((res_var, val))
 
-                phi_assignments[fn_name][from_label_name][to_label_name].append((res_var, val))
+    call_graph[fn.name] = calls, False
 
-      call_graph[fn_name] = calls, False
-
-  for func in mod.functions.values():
-    fn_name = func.name
-
-    if len(func.blocks) == 0: # If function has no body
-      block_var_use[fn_name] = info.block_var_use
-    else:
-      block_var_use[fn_name] = getFuncBranchesVarUse(func, phi_assignments[fn_name])
+  for fn in mod.functions.values():
+    if len(fn.blocks) == 0: continue
+    block_var_use[fn.name] = getFuncBranchesVarUse(fn, phi_assignments[fn.name])
 
   for start_func in call_graph:
     if call_graph[start_func][1]: continue
@@ -1619,91 +1677,87 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     call_graph[start_func] = visited, True
 
-  for func in mod.functions.values():
-    fn_name = func.name
+  for fn in mod.functions.values():
+    if len(fn.blocks) == 0: continue
 
-    if len(func.blocks) == 0: # If function has no body
-      info = ctx.fn_info[fn_name]
-      returns_to_address[fn_name] = info.returns_to_address
-      all_check_locations[fn_name] = info.checked_blocks
-      total_alloca_size[fn_name] = info.total_alloca_size
-    else:
-      first_label = list(func.blocks.values())[0].label
-      branches: dict[str, list[str]] = {"ret": []} # Where different branches could lead
-      for block in func.blocks.values():
-        # Find every function the function could call
-        # Find what each block in the function could branch to
-        branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
+    first_label = list(fn.blocks.values())[0].label
+    branches: dict[str, list[str]] = {"ret": []} # Where different branches could lead
+    for block in fn.blocks.values():
+      # Find every function the function could call
+      # Find what each block in the function could branch to
+      branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
-      cycles = util.find_all_cycles(branches)
-      fn_check_locations = util.select_cycle_checks(cycles)
-      could_recurse = len(fn_check_locations) > 0
-      # If the branches could create a loop, we must place stack checks, so we should return to an
-      # address. Furthermore, a binary search and a call is usually faster than potentially
-      # hundreds of recursions backward.
-      returns_to_address[fn_name] = could_recurse
-      all_check_locations[fn_name] = fn_check_locations
+    cycles = util.find_all_cycles(branches)
+    fn_check_locations = util.select_cycle_checks(cycles)
+    could_recurse = len(fn_check_locations) > 0
+    # If the branches could create a loop, we must place stack checks, so we should return to an
+    # address. Furthermore, a binary search and a call is usually faster than potentially
+    # hundreds of recursions backward.
+    returns_to_address[fn.name] = could_recurse
+    all_check_locations[fn.name] = fn_check_locations
 
-      # Any branch that may be called more than once
-      repeating_branches: set[str] = set().union(*[set(branch) for branch in cycles])
-      # Branches that are unavoidable
-      unavoidable_branches: set[str] = util.unavoidable_nodes(branches, first_label, "ret")
-      # Branches that are always ran once per func call
-      ran_once_branches = unavoidable_branches - repeating_branches
+    # Any branch that may be called more than once
+    repeating_branches: set[str] = set().union(*[set(branch) for branch in cycles])
+    # Branches that are unavoidable
+    unavoidable_branches: set[str] = util.unavoidable_nodes(branches, first_label, "ret")
+    # Branches that are always ran once per func call
+    ran_once_branches = unavoidable_branches - repeating_branches
 
-      known_alloc_size = True
-      alloc_size = 0
-      for block_label in branches.keys():
-        if block_label in ran_once_branches:
-          alloc_size += branch_alloca_size[fn_name][block_label]
-        elif branch_alloca_size[fn_name][block_label] != 0:
-          known_alloc_size = False
-          break
+    known_alloc_size = True
+    alloc_size = 0
+    for block_label in branches.keys():
+      if block_label in ran_once_branches:
+        alloc_size += branch_alloca_size[fn.name][block_label]
+      elif branch_alloca_size[fn.name][block_label] != 0:
+        known_alloc_size = False
+        break
 
-      total_alloca_size[fn_name] = alloc_size if known_alloc_size else None
+    total_alloca_size[fn.name] = alloc_size if known_alloc_size else None
 
-      # FUTURE OPTI: could check to see if in a non-recursive environment, there are enough
-      # branches that it is faster to recurse backward. However this happens rarely, it is
-      # difficult to gauge if it will actually have a net positive impact (will force callers
-      # to return to an address, the longest path may only be taken some of the times).
+    # FUTURE OPTI: could check to see if in a non-recursive environment, there are enough
+    # branches that it is faster to recurse backward. However this happens rarely, it is
+    # difficult to gauge if it will actually have a net positive impact (will force callers
+    # to return to an address, the longest path may only be taken some of the times).
 
-      fn_branches_to_first = False
-      if len(func.blocks) > 0:
-        first_block_label = list(func.blocks.values())[0].label
-        fn_branches_to_first = any([first_block_label in branch_to for branch_to in branches.values()])
-      branches_to_first[fn_name] = fn_branches_to_first
+    fn_branches_to_first = False
+    if len(fn.blocks) > 0:
+      first_block_label = list(fn.blocks.values())[0].label
+      fn_branches_to_first = any([first_block_label in branch_to for branch_to in branches.values()])
+    branches_to_first[fn.name] = fn_branches_to_first
 
   for fn_name in returns_to_address:
+    if len(fn.blocks) == 0: continue
+
     # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
 
-  for func in mod.functions.values():
-    fn_name = func.name
+  for fn in mod.functions.values():
+    if len(fn.blocks) == 0: continue
 
     # If we know the total size a function allocates and that it doesn't call any functions
     # that rely on the stack size, we don't need to increase the stack size
-    skip_stack_size_change = total_alloca_size[fn_name] is not None and \
-      all(total_alloca_size[call] == 0 for call in call_graph[fn_name][0])
+    skip_stack_size_change = total_alloca_size[fn.name] is not None and \
+      all(total_alloca_size[call] == 0 for call in call_graph[fn.name][0])
 
-    fn_ret_addresses = return_addresses.get(fn_name, list())
-    fn_returns_to_address = returns_to_address[fn_name]
+    fn_ret_addresses = return_addresses.get(fn.name, list())
+    fn_returns_to_address = returns_to_address[fn.name]
     # If the function returns to an address and is called from multiple locations,
     # then it must take a return address to know where to return to
     fn_takes_ret_addr = fn_returns_to_address and len(fn_ret_addresses) > 1
 
     param_names = []
-    for arg in func.args:
+    for arg in fn.args:
       param_names.append(arg.name)
 
     if fn_takes_ret_addr: param_names.append(ctx.cfg.return_address_local)
-    params = [Variable(name, "param", fn_name) for name in param_names]
+    params = [Variable(name, "param", fn.name) for name in param_names]
 
-    ctx.fn_info[fn_name] = FuncInfo(fn_name, ctx.next_fn_id, params, call_graph[fn_name][0],
+    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, call_graph[fn.name][0],
                                     fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
-                                    all_check_locations.get(fn_name, list()),
-                                    branch_alloca_size[fn_name], total_alloca_size.get(fn_name, None),
-                                    skip_stack_size_change, block_var_use[fn_name],
-                                    branches_to_first.get(fn_name, False), phi_assignments[fn_name])
+                                    all_check_locations.get(fn.name, list()),
+                                    branch_alloca_size[fn.name], total_alloca_size.get(fn.name, None),
+                                    skip_stack_size_change, block_var_use[fn.name],
+                                    branches_to_first.get(fn.name, False), phi_assignments[fn.name])
     ctx.next_fn_id += 1
 
   return ctx
@@ -1712,7 +1766,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
   ctx = getFnInfo(mod, ctx)
 
   for func in mod.functions.values():
-    # If function has no body
+    # If function has no body, ignore it
     if len(func.blocks) == 0: continue
 
     fn_name = func.name
@@ -1806,12 +1860,16 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         assert bctx is not None
         if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
           callee_name = instr.func.name
-          callee_info = ctx.fn_info[callee_name]
           args = instr.args
-          result = None if instr.result is None else transVar(instr.result, bctx)
-          following_instrs = block.instrs[instr_index + 1:]
+          if instr.func.intrinsic is not None:
+            instr_code = transIntrinsic(instr.func.intrinsic, args, ctx, bctx)
+            bctx.code.add(instr_code)
+          else:
+            callee_info = ctx.fn_info[callee_name]
+            result = None if instr.result is None else transVar(instr.result, bctx)
+            following_instrs = block.instrs[instr_index + 1:]
 
-          ctx, bctx = transComplexCall(info, callee_info, args, result, following_instrs, ctx, bctx)
+            ctx, bctx = transComplexCall(info, callee_info, args, result, following_instrs, ctx, bctx)
         else:
           instr_code, ctx, bctx = transInstr(instr, ctx, bctx)
           bctx.code.add(instr_code)
