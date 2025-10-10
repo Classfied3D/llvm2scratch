@@ -8,7 +8,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 * 🔃 Functions + Return Values + Recursion
 * 🔀 Branch + Switch Instructions
 * 🔁 Loops (Which unwind the call stack when necessary)
-* #️⃣ Arrays and Structs (getelementptr support)
+* ⏺ Arrays and Structs (getelementptr support)
 * 🔡 Static Variables
 * ⚡ Optimizations (Known Value Propagation, Assignment Elision)
 * 📝 Sprite3 file output
