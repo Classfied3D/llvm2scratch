@@ -1248,6 +1248,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           for member in members[:member_offset]:
             known_offset += getByteSize(member)
 
+          inner_type = inner_type.members[member_offset]
+
         is_arr_offset = isinstance(inner_type, ir.ArrayTy)
 
       offsets: list[sb3.Value] = []
