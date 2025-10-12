@@ -2,8 +2,8 @@
 
 static int a = 7;
 // Broken: no static ptr assignment
-//static char* message = "default";
-static char message[] = "default";
+//static char* message = "loldefault";
+static char message[] = "loldefault";
 static char str[] = "hello world";
 
 typedef struct SensorData {
@@ -104,9 +104,7 @@ int main(void) {
       puts("21");
       break;
     default:
-      // Broken: no getElementPtr value
-      //puts(*(&message + 1));
-      puts(message);
+      puts(message + 3);
       break;
   }
 

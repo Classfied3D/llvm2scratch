@@ -1,3 +1,4 @@
+from __future__ import annotations
 from llvmlite import binding as llvm
 from dataclasses import dataclass
 from enum import Enum
@@ -188,6 +189,10 @@ class KnownArrVal(KnownVal, KnownArrTargetVal):
 @dataclass
 class LabelVal(Value):
   label: str
+
+@dataclass
+class ConstExprVal(KnownVal):
+  expr: GetElementPtr
 
 class Instr:
   pass

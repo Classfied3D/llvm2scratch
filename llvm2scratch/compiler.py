@@ -66,7 +66,7 @@ class Context:
   proj: sb3.Project
   cfg: Config
   fn_info: dict[str, FuncInfo] = field(default_factory=dict)
-  globvar_to_ptr: dict[str, sb3.Known] = field(default_factory=dict)
+  globvar_to_ptr: dict[str, int] = field(default_factory=dict)
   next_fn_id: int = 0
 
 @dataclass
@@ -186,17 +186,55 @@ def getByteSize(ty: ir.Type) -> int:
     case _:
       raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
 
+def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
+  known_offset: int = 0
+  unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
+
+  is_arr_offset = True
+  inner_type = base_ptr_type
+  for i, index_val in enumerate(indices):
+    if is_arr_offset:
+      # An array offset
+      if i != 0:
+        assert isinstance(inner_type, ir.ArrayTy)
+        inner_type = inner_type.inner
+
+      offset_size = getByteSize(inner_type)
+      if isinstance(index_val, sb3.Known):
+        assert isinstance(index_val.known, int) or \
+              (isinstance(index_val.known, float) and index_val.known.is_integer())
+        known_offset += int(index_val.known) * offset_size
+      else:
+        unknown_offsets[offset_size].append(index_val)
+    else:
+      # A struct offset
+      assert isinstance(inner_type, ir.StructTy)
+      assert isinstance(index_val, sb3.Known)
+      assert isinstance(index_val.known, int) or \
+            (isinstance(index_val.known, float) and index_val.known.is_integer())
+
+      members = inner_type.members
+      member_offset = int(index_val.known)
+      for member in members[:member_offset]:
+        known_offset += getByteSize(member)
+
+      inner_type = inner_type.members[member_offset]
+
+    is_arr_offset = isinstance(inner_type, ir.ArrayTy)
+
+  return known_offset, unknown_offsets
+
 def transValue(val: ir.Value,
                 ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IndexableValueAndBlocks:
   match val:
     case ir.LocalVarVal() | ir.ArgumentVal() | ir.GlobalVarVal():
       var = transVar(val, bctx)
       res = var.getValue()
-      name = var.getRawVarName()
-      if ctx.cfg.opti and name in ctx.globvar_to_ptr:
-        # Global variables store their address in their variable
-        # when optimizations are enabled we use this address directly
-        res = ctx.globvar_to_ptr[name]
+      if isinstance(val, ir.GlobalVarVal):
+        if ctx.cfg.opti and val.name in ctx.globvar_to_ptr:
+          # Global variables store their address in their variable
+          # when optimizations are enabled we use this address directly
+          res = sb3.Known(ctx.globvar_to_ptr[val.name])
       return ValueAndBlocks(res)
 
     case ir.KnownIntVal():
@@ -220,6 +258,24 @@ def transValue(val: ir.Value,
         blocks.add(el_blocks)
 
       return IndexableValueAndBlocks(IndexableValue(values), blocks)
+
+    case ir.ConstExprVal():
+      gep = val.expr
+      assert isinstance(gep.base_ptr, ir.GlobalVarVal)
+
+      indices = []
+      for index_val in gep.indices:
+        index = transValue(index_val, ctx, bctx)
+        assert isinstance(index, ValueAndBlocks)
+        assert len(index.blocks) == 0
+        indices.append(index.value)
+
+      known_offset, unknown_offsets = getGepOffset(gep.base_ptr_type, indices)
+      assert len(unknown_offsets) == 0
+
+      base_ptr = ctx.globvar_to_ptr[gep.base_ptr.name]
+
+      return ValueAndBlocks(sb3.Known(base_ptr + known_offset))
 
     case _:
       raise CompException(f"Unknown Value {val}")
@@ -1218,39 +1274,14 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(base_ptr, ValueAndBlocks)
       blocks.add(base_ptr.blocks)
 
-      known_offset = 0
-      unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
+      indices: list[sb3.Value] = []
+      for index_val in instr.indices:
+        index = transValue(index_val, ctx, bctx)
+        assert isinstance(index, ValueAndBlocks)
+        blocks.add(index.blocks)
+        indices.append(index.value)
 
-      is_arr_offset = True
-      inner_type = instr.base_ptr_type
-      for i, index_val in enumerate(instr.indices):
-        if is_arr_offset:
-          # An array offset
-          if i != 0:
-            assert isinstance(inner_type, ir.ArrayTy)
-            inner_type = inner_type.inner
-
-          offset_size = getByteSize(inner_type)
-          if isinstance(index_val, ir.KnownIntVal):
-            known_offset += index_val.value * offset_size
-          else:
-            index = transValue(index_val, ctx, bctx)
-            assert isinstance(index, ValueAndBlocks)
-            blocks.add(index.blocks)
-
-            unknown_offsets[offset_size].append(index.value)
-        else:
-          # A struct offset
-          assert isinstance(inner_type, ir.StructTy)
-          assert isinstance(index_val, ir.KnownIntVal)
-          members = inner_type.members
-          member_offset = index_val.value
-          for member in members[:member_offset]:
-            known_offset += getByteSize(member)
-
-          inner_type = inner_type.members[member_offset]
-
-        is_arr_offset = isinstance(inner_type, ir.ArrayTy)
+      known_offset, unknown_offsets = getGepOffset(instr.base_ptr_type, indices)
 
       offsets: list[sb3.Value] = []
       if known_offset != 0:
@@ -1926,8 +1957,7 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
     if globvar is None:
       raise CompException(f"Expected static var {glob} to be named")
 
-    globvar_name = globvar.getRawVarName()
-    ctx.globvar_to_ptr[globvar_name] = sb3.Known(ptr)
+    ctx.globvar_to_ptr[glob.name] = ptr
     if not ctx.cfg.opti:
       globvar.setValue(sb3.Known(ptr))
     total_size = getByteSize(glob.type)

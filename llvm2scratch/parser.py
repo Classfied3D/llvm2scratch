@@ -8,7 +8,7 @@ from .ir import *
 def decodeTypeStr(type_str: str, mod: llvm.ModuleRef) -> Type:
   if type_str == "void":
     return VoidTy()
-  ir = "".join(str(struct) for struct in mod.struct_types) \
+  ir = "\n".join(str(struct) for struct in mod.struct_types) \
     + f"""
   declare void @dummy({type_str})
   """
@@ -116,6 +116,56 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
     case llvm.ValueKind.constant_data_vector:
       # A constant vector (e.g. <4 x i32> <i32 1, i32 2, i32 3, i32 4>)
       return valueFromInitializerText(str(value), type)
+
+    case llvm.ValueKind.constant_expr:
+      # A constant expression (e.g. getelementptr)
+      rest = str(value)
+      expr_ty_str, rest = extractFirstType(rest)
+      expr_ty = decodeTypeStr(expr_ty_str, mod)
+
+      if rest.startswith("getelementptr"):
+        assert isinstance(expr_ty, PointerTy)
+        rest = rest.removeprefix("getelementptr").strip()
+        keywords = ["inbounds", "inrange", "nusw", "nsw"]
+        has_keyword = True
+        while has_keyword:
+          has_keyword = False
+          for kw in keywords:
+            if rest.startswith(kw):
+              if kw != "inrange":
+                rest = rest.removeprefix(kw + " ")
+              else:
+                kw = kw.split(")", 1)[-1]
+              has_keyword = True
+
+        rest = rest.strip()
+
+        # Remove brackets that are present in only getelementptr
+        # constant expressions for some reason
+        if rest.startswith("("):
+          rest = rest[1:-1]
+
+        gep_str = "getelementptr " + rest
+
+        ir = "\n".join(str(struct) for struct in mod.struct_types) + \
+             "\n".join(str(glob) for glob in mod.global_variables) + \
+        f"""
+        define void @dummy() {{
+          {gep_str}
+          ret void
+        }}
+        """
+
+        mod = llvm.parse_assembly(ir)
+        func = next(mod.functions)
+        block = next(func.blocks)
+        instr = next(block.instructions)
+        parsed_instr = decodeInstr(instr, mod)
+        assert isinstance(parsed_instr, GetElementPtr)
+
+        return ConstExprVal(expr_ty, parsed_instr)
+      else:
+        raise ValueError(f"Unknown constant expression: {rest}")
 
     case _:
       raise ValueError(f"Unknown value type: {value.value_kind.name}")
