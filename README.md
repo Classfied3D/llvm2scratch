@@ -18,6 +18,8 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 * [Math](https://scratch.mit.edu/projects/1206058442/)
 * [Old Branching](https://scratch.mit.edu/projects/1206466346/)
 * [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
+* [Recursion](https://scratch.mit.edu/projects/1211169662/)
+* [Arrays + Structs](https://scratch.mit.edu/projects/1226122280/)
 
 ## Installation
 
