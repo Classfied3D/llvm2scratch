@@ -1882,6 +1882,10 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
           callee_name = instr.func.name
           args = instr.args
+
+          if instr.tail_kind == ir.CallTailKind.MustTail:
+            raise CompException("Tail calls not supported")
+
           if instr.func.intrinsic is not None:
             instr_code = transIntrinsic(instr.func.intrinsic, args, ctx, bctx)
             bctx.code.add(instr_code)

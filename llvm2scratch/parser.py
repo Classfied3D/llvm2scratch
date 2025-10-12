@@ -140,7 +140,7 @@ def decodeIntrinsic(name: str) -> Intrinsic | None:
 
 def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
   result = getResultLocalVar(instr)
-  raw_instr_no_res = str(instr)
+  raw_instr_no_res = str(instr).strip()
   if result is not None:
     raw_instr_no_res = raw_instr_no_res.split("=", 1)[1].strip()
 
