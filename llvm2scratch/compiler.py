@@ -1594,6 +1594,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, 
       if known_length:
         assert isinstance(length, sb3.Known)
         assert isinstance(length.known, (int, float))
+        assert length.known.is_integer()
         for offset in range(int(length.known)):
           offset_val = sb3.Known(offset)
 
@@ -1602,7 +1603,25 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, 
 
           blocks.add(set_ptr)
       else:
-        raise CompException("Unknown memcpy length not supported") # TODO FIX
+        uses = 40 # Reasonable default for unknown lengths
+        if isinstance(length, sb3.Known) and isinstance(length.known, (int, float)):
+          uses = int(length.known)
+        src, src_blocks = flatAsTuple(optimizeValueUse(src, uses, ctx))
+        dest, dest_blocks = flatAsTuple(optimizeValueUse(dest, uses, ctx))
+
+        ptr_offset = genTempVar(ctx)
+
+        blocks.add(src_blocks)
+        blocks.add(dest_blocks)
+        blocks.add(sb3.BlockList([
+          sb3.EditVar("set", ptr_offset, sb3.Known(0)),
+          sb3.ControlFlow("reptimes", length, sb3.BlockList([
+            sb3.EditList("insertat", ctx.cfg.stack_var,
+              sb3.Op("add", dest, sb3.GetVar(ptr_offset)),
+              sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", src, sb3.GetVar(ptr_offset)))),
+            sb3.EditVar("change", ptr_offset, sb3.Known(1))
+          ]))
+        ]))
 
     case _:
       raise CompException(f"Unsupported intrinsic {intrinsic}")
