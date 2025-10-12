@@ -130,10 +130,9 @@ def _decodeLLVMCStringLiteral(inner) -> list[int]:
   Returns a list of integer byte values (0..255) instead of bytes.
   """
   # convert octal escapes \NNN to \xHH sequences
-  def octal_to_x(m):
-    val = int(m.group(1), 8)
-    return "\\x" + format(val, "02x")
-  s = re.sub(r"\\([0-7]{1,3})", octal_to_x, inner)
+  def hex_to_x(m):
+    return "\\x" + m.group(1)
+  s = re.sub(r"\\([0-F]{2})", hex_to_x, inner)
   # Now interpret standard backslash escapes and \xHH
   # We'll decode via 'unicode_escape' then map to bytes (latin-1) and convert to ints.
   try:
