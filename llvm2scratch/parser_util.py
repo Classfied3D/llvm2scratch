@@ -165,12 +165,19 @@ def parseScalarToken(tok) -> int | float | None | str | list[int]:
     - "undef" -> None (keeps as None)
     - "null" -> None
   """
+
   t = tok.strip()
+
+  if t.startswith("getelementptr"):
+    raise NotImplementedError("getelementptr initializers not supported in parseInitializer")
+
   if not t:
     return t
   # c"..." handled elsewhere
   if t == "undef" or t == "zeroinitializer" or t == "null":
     return None
+  if t.startswith("@"):
+    return t
   # match c"..." pattern
   m = _CSTRING_RE.search(t)
   if m:
@@ -321,6 +328,7 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
   elif isinstance(typ, PointerTy):
     if parsed is None:
       raise NotImplementedError("Null pointer initializers not implemented yet")
+
     # If parsed is a string (e.g., "@globalname") we could return GlobalVarVal
     if isinstance(parsed, str) and parsed.startswith("@"):
       # name without @

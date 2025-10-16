@@ -225,13 +225,14 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int,
   return known_offset, unknown_offsets
 
 def transValue(val: ir.Value,
-                ctx: Context, bctx: BlockInfo | None) -> ValueAndBlocks | IndexableValueAndBlocks:
+                ctx: Context, bctx: BlockInfo | None,
+                is_global_init: bool=False) -> ValueAndBlocks | IndexableValueAndBlocks:
   match val:
     case ir.LocalVarVal() | ir.ArgumentVal() | ir.GlobalVarVal():
       var = transVar(val, bctx)
       res = var.getValue()
       if isinstance(val, ir.GlobalVarVal):
-        if ctx.cfg.opti and val.name in ctx.globvar_to_ptr:
+        if (ctx.cfg.opti or is_global_init) and val.name in ctx.globvar_to_ptr:
           # Global variables store their address in their variable
           # when optimizations are enabled we use this address directly
           res = sb3.Known(ctx.globvar_to_ptr[val.name])
@@ -253,7 +254,7 @@ def transValue(val: ir.Value,
       values: list[sb3.Value | IndexableValue] = []
       blocks = sb3.BlockList()
       for element in val.values:
-        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx))
+        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init))
         values.append(el_val)
         blocks.add(el_blocks)
 
@@ -265,7 +266,7 @@ def transValue(val: ir.Value,
 
       indices = []
       for index_val in gep.indices:
-        index = transValue(index_val, ctx, bctx)
+        index = transValue(index_val, ctx, bctx, is_global_init)
         assert isinstance(index, ValueAndBlocks)
         assert len(index.blocks) == 0
         indices.append(index.value)
@@ -1949,22 +1950,22 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   if ctx.cfg.stack_size > SCRATCH_LIST_LIMIT:
     raise CompException("Stack is too large to fit in one list, multiple lists not implemented")
 
-  ptr = 1
-
   # Set up static values
+  ptr = 1
   for glob in mod.global_vars.values():
-    globvar = localizeVar(glob.name, True, None)
-    if globvar is None:
-      raise CompException(f"Expected static var {glob} to be named")
-
     ctx.globvar_to_ptr[glob.name] = ptr
+    ptr += getByteSize(glob.type)
+
+  ptr = 1
+  for glob in mod.global_vars.values():
     if not ctx.cfg.opti:
-      globvar.setValue(sb3.Known(ptr))
+      globvar = localizeVar(glob.name, True, None)
+      blocks.add(globvar.setValue(sb3.Known(ptr)))
+
     total_size = getByteSize(glob.type)
-    ptr += total_size
 
     if glob.init is not None:
-      blocks_and_value = transValue(glob.init, ctx, None)
+      blocks_and_value = transValue(glob.init, ctx, None, is_global_init=True)
       unknown = len(blocks_and_value.blocks) > 0
       value = blocks_and_value.value
 
@@ -1989,6 +1990,8 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
       for value in values:
         blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
+
+      ptr += total_size
 
   blocks.add(sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.stack_size_var, sb3.Known(ptr)),

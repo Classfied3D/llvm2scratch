@@ -1,9 +1,8 @@
 #include <stdio.h>
 
 static int a = 7;
-// Broken: no static ptr assignment
-//static char* message = "loldefault";
-static char message[] = "loldefault";
+static char* message = "loldefault";
+//static char message[] = "loldefault";
 static char str[] = "hello world";
 
 typedef struct SensorData {
@@ -89,7 +88,7 @@ int main(void) {
     putchar(d);
   }
 
-  unsigned int e = 21;
+  unsigned int e = 221;
   switch (e) {
     case 0:
       puts("0");
@@ -112,11 +111,11 @@ int main(void) {
   int g = sum_to_one_digit(473);
 
   numberize(str);
-  puts(str);
+  //puts(str);
 
   SensorData h[5];
   h[2] = (SensorData){7, 2};
-  putchar('0' + h[2].temp);
+  //putchar('0' + h[2].temp);
 
   return 0;
 }

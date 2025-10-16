@@ -22,6 +22,49 @@ def getResultLocalVar(instr: llvm.ValueRef) -> ResultLocalVar | None:
     return ResultLocalVar(str(instr).split("=")[0].strip()[1:])
   return None
 
+def getGEPConstExprStr(gep_str: str) -> GetElementPtr:
+  rest = gep_str
+
+  rest = rest.removeprefix("getelementptr").strip()
+  keywords = ["inbounds", "inrange", "nusw", "nsw"]
+  has_keyword = True
+  while has_keyword:
+    has_keyword = False
+    for kw in keywords:
+      if rest.startswith(kw):
+        if kw != "inrange":
+          rest = rest.removeprefix(kw + " ")
+        else:
+          kw = kw.split(")", 1)[-1]
+        has_keyword = True
+
+  rest = rest.strip()
+
+  # Remove brackets that are present in only getelementptr
+  # constant expressions for some reason
+  if rest.startswith("("):
+    rest = rest[1:-1]
+
+  gep_str = "getelementptr " + rest
+
+  ir = "\n".join(str(struct) for struct in mod.struct_types) + \
+        "\n".join(str(glob) for glob in mod.global_variables) + \
+  f"""
+  define void @dummy() {{
+    {gep_str}
+    ret void
+  }}
+  """
+
+  mod = llvm.parse_assembly(ir)
+  func = next(mod.functions)
+  block = next(func.blocks)
+  instr = next(block.instructions)
+  parsed_instr = decodeInstr(instr, mod)
+  assert isinstance(parsed_instr, GetElementPtr)
+
+  return parsed_instr
+
 def decodeType(type: llvm.TypeRef) -> Type:
   match type.type_kind:
     case llvm.TypeKind.void:
@@ -125,45 +168,7 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
 
       if rest.startswith("getelementptr"):
         assert isinstance(expr_ty, PointerTy)
-        rest = rest.removeprefix("getelementptr").strip()
-        keywords = ["inbounds", "inrange", "nusw", "nsw"]
-        has_keyword = True
-        while has_keyword:
-          has_keyword = False
-          for kw in keywords:
-            if rest.startswith(kw):
-              if kw != "inrange":
-                rest = rest.removeprefix(kw + " ")
-              else:
-                kw = kw.split(")", 1)[-1]
-              has_keyword = True
-
-        rest = rest.strip()
-
-        # Remove brackets that are present in only getelementptr
-        # constant expressions for some reason
-        if rest.startswith("("):
-          rest = rest[1:-1]
-
-        gep_str = "getelementptr " + rest
-
-        ir = "\n".join(str(struct) for struct in mod.struct_types) + \
-             "\n".join(str(glob) for glob in mod.global_variables) + \
-        f"""
-        define void @dummy() {{
-          {gep_str}
-          ret void
-        }}
-        """
-
-        mod = llvm.parse_assembly(ir)
-        func = next(mod.functions)
-        block = next(func.blocks)
-        instr = next(block.instructions)
-        parsed_instr = decodeInstr(instr, mod)
-        assert isinstance(parsed_instr, GetElementPtr)
-
-        return ConstExprVal(expr_ty, parsed_instr)
+        return ConstExprVal(expr_ty, getGEPConstExprStr(rest))
       else:
         raise ValueError(f"Unknown constant expression: {rest}")
 
@@ -428,7 +433,7 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
       glob_init = None
     else:
       glob_init = valueFromInitializerText(rest.split(",", 1)[0].strip(), type)
-      assert isinstance(glob_init, KnownVal)
+      assert isinstance(glob_init, (KnownVal, GlobalVarVal, ConstExprVal))
 
     glob_vars.update({glob_name: GlobalVar(glob_name, type, glob_constant, glob_init)})
 
