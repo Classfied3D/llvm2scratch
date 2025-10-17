@@ -155,7 +155,7 @@ def _decodeLLVMCStringLiteral(inner) -> list[int]:
 
 # ---------- Core parsing ----------
 
-def parseScalarToken(tok) -> int | float | None | str | list[int]:
+def parseScalarToken(tok: str, decode_gep_str_func) -> int | float | None | str | list[int] | GetElementPtr:
   """
   Parse a scalar token like:
     - "float 1.000000e+00" -> float
@@ -169,7 +169,7 @@ def parseScalarToken(tok) -> int | float | None | str | list[int]:
   t = tok.strip()
 
   if t.startswith("getelementptr"):
-    raise NotImplementedError("getelementptr initializers not supported in parseInitializer")
+    return decode_gep_str_func(t)
 
   if not t:
     return t
@@ -207,7 +207,7 @@ def parseScalarToken(tok) -> int | float | None | str | list[int]:
   return t
 
 
-def parseInitializer(init_text) -> float | int | list[int] | list[Any] | str | None:
+def parseInitializer(init_text, decode_gep_str_func) -> float | int | list[int] | list[Any] | str | GetElementPtr | None:
   """
   Parse the initializer string and return Python structure:
     - list[int] for c"..." style constant-data arrays
@@ -216,6 +216,9 @@ def parseInitializer(init_text) -> float | int | list[int] | list[Any] | str | N
     - string fallback otherwise
   """
   s = init_text.strip()
+
+  if s.startswith("getelementptr"):
+    return parseScalarToken(s, decode_gep_str_func)
 
   # 1) c"..." immediate -> list[int]
   m = _CSTRING_RE.search(s)
@@ -229,7 +232,7 @@ def parseInitializer(init_text) -> float | int | list[int] | list[Any] | str | N
       first_content, pos_after_first = extractBracketContent(s, 0)
     except ValueError:
       # can't parse bracket; fallback to scalar parse
-      return parseScalarToken(s)
+      return parseScalarToken(s, decode_gep_str_func)
 
     # decide if the first group is a type-spec (contains 'x' and a type)
     if re.search(r"\b\d+\s*x\b", first_content) or re.search(r"\bx\b", first_content):
@@ -239,7 +242,7 @@ def parseInitializer(init_text) -> float | int | list[int] | list[Any] | str | N
         # parse the next bracketed part as the real data
         data_content, pos_after_data = extractBracketContent(rest, 0)
         elems = splitTopLevelCommas(data_content)
-        return [parseInitializer(elem) for elem in elems]
+        return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
       # NEW: if rest contains a c"..." constant-data string, decode it
       m_c = _CSTRING_RE.search(rest)
       if m_c:
@@ -247,32 +250,33 @@ def parseInitializer(init_text) -> float | int | list[int] | list[Any] | str | N
       else:
         # no separate data bracket and no c"..." — maybe the first bracket included elements
         elems = splitTopLevelCommas(first_content)
-        return [parseInitializer(elem) for elem in elems]
+        return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
     else:
       # first bracket likely contains actual data elements
       elems = splitTopLevelCommas(first_content)
-      return [parseInitializer(elem) for elem in elems]
+      return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
 
-  # 3) If it looks like an array/vector printed without an outer bracket (rare),
+  # 3) If it looks like an array/vector without an outer bracket (rare),
   #    split top-level commas directly.
   top_elems = splitTopLevelCommas(s)
   if len(top_elems) > 1:
-    return [parseInitializer(elem) for elem in top_elems]
+    return [parseInitializer(elem, decode_gep_str_func) for elem in top_elems]
 
   # 4) Else try scalar
-  return parseScalarToken(s)
+  return parseScalarToken(s, decode_gep_str_func)
 
 # ---------- Convenience wrapper ----------
 
-def decodeGlobalInitializerText(global_str):
+def decodeGlobalInitializerText(global_str, decode_gep_str_func):
   """Given str(gv) or initializer string, extract initializer fragment and parse."""
+
   m = _INITLINE_RE.search(global_str.strip())
   if m:
     init_text = m.group(1).strip()
-    return parseInitializer(init_text)
+    return parseInitializer(init_text, decode_gep_str_func)
   else:
     # If not a full global line, assume the whole string is the initializer itself
-    return parseInitializer(global_str)
+    return parseInitializer(global_str, decode_gep_str_func)
 
 def valueFromParsed(parsed: Any, typ: Type) -> Value:
   """
@@ -333,6 +337,11 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
     if isinstance(parsed, str) and parsed.startswith("@"):
       # name without @
       return GlobalVarVal(typ, parsed[1:])
+
+    if isinstance(parsed, GetElementPtr):
+      # GEP value
+      return ConstExprVal(typ, parsed)
+
     # otherwise fallback: raise
     raise ValueError(f"PointerTy initializer unrecognized: {parsed!r}")
 
@@ -349,13 +358,12 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
   # Fallback for unknown types
   raise NotImplementedError(f"value_from_parsed not implemented for type {type(typ).__name__}")
 
-def valueFromInitializerText(init_text: str, typ: Type) -> Value:
+def valueFromInitializerText(init_text: str, typ: Type, decode_gep_str_func) -> Value:
   """
   Convenience wrapper: parse initializer text (via parse_initializer),
   then convert into a Value using value_from_parsed.
   """
-  # parse_initializer must be defined in the module (from your earlier parser)
-  parsed = parseInitializer(init_text)
+  parsed = parseInitializer(init_text, decode_gep_str_func)
   return valueFromParsed(parsed, typ)
 
 def extractFirstType(s: str) -> tuple[str, str]:

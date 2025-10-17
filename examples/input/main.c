@@ -2,7 +2,6 @@
 
 static int a = 7;
 static char* message = "loldefault";
-//static char message[] = "loldefault";
 static char str[] = "hello world";
 
 typedef struct SensorData {

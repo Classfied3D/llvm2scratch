@@ -22,7 +22,7 @@ def getResultLocalVar(instr: llvm.ValueRef) -> ResultLocalVar | None:
     return ResultLocalVar(str(instr).split("=")[0].strip()[1:])
   return None
 
-def getGEPConstExprStr(gep_str: str) -> GetElementPtr:
+def getGEPConstExprStr(gep_str: str, mod: llvm.ModuleRef) -> GetElementPtr:
   rest = gep_str
 
   rest = rest.removeprefix("getelementptr").strip()
@@ -158,7 +158,7 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
 
     case llvm.ValueKind.constant_data_vector:
       # A constant vector (e.g. <4 x i32> <i32 1, i32 2, i32 3, i32 4>)
-      return valueFromInitializerText(str(value), type)
+      return valueFromInitializerText(str(value), type, lambda string: getGEPConstExprStr(string, mod))
 
     case llvm.ValueKind.constant_expr:
       # A constant expression (e.g. getelementptr)
@@ -168,7 +168,7 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
 
       if rest.startswith("getelementptr"):
         assert isinstance(expr_ty, PointerTy)
-        return ConstExprVal(expr_ty, getGEPConstExprStr(rest))
+        return ConstExprVal(expr_ty, getGEPConstExprStr(rest, mod))
       else:
         raise ValueError(f"Unknown constant expression: {rest}")
 
@@ -432,7 +432,7 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
     if len(rest) == 0 or rest.startswith(","):
       glob_init = None
     else:
-      glob_init = valueFromInitializerText(rest.split(",", 1)[0].strip(), type)
+      glob_init = valueFromInitializerText(rest.rsplit(",", 1)[0].strip(), type, lambda string: getGEPConstExprStr(string, mod))
       assert isinstance(glob_init, (KnownVal, GlobalVarVal, ConstExprVal))
 
     glob_vars.update({glob_name: GlobalVar(glob_name, type, glob_constant, glob_init)})
