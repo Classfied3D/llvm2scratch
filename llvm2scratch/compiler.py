@@ -347,7 +347,7 @@ def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
   """Undoes two's complement on a value."""
 
   # Weird formula but works
-  return sb3.Op("add", sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 2)), sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
+  return sb3.Op("add", sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
 
 def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
   if isinstance(val, sb3.Known):
@@ -1197,22 +1197,31 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
       match instr.cond:
+        case ir.ICmpCond.Sgt | ir.ICmpCond.Sge | ir.ICmpCond.Slt | ir.ICmpCond.Sle:
+          # Like undoTwosComplement but can remove the extra addition at the end because algebra
+          # Simplify because instructions are optimized for known values
+          reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
+            sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))))
+          left = reverse_twos_complement(left)
+          right = reverse_twos_complement(right)
+
+      match instr.cond:
         case ir.ICmpCond.Eq:
           res_val = sb3.BoolOp("=", left, right)
         case ir.ICmpCond.Ne:
           res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
-        case ir.ICmpCond.Ugt:
+        case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
           res_val = sb3.BoolOp(">", left, right)
-        case ir.ICmpCond.Uge:
+        case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
           if isinstance(left, sb3.Known):
             res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
           elif isinstance(right, sb3.Known):
             res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
           else:
             res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
-        case ir.ICmpCond.Ult:
+        case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
           res_val = sb3.BoolOp("<", left, right)
-        case ir.ICmpCond.Ule:
+        case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
           if isinstance(left, sb3.Known):
             res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
           elif isinstance(right, sb3.Known):
@@ -1220,7 +1229,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           else:
             res_val = sb3.BoolOp("not", sb3.BoolOp(">", left, right))
         case _:
-          # TODO FIX: signed versions
           raise CompException(f"icmp does not support comparsion mode {instr.cond}")
 
       # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')

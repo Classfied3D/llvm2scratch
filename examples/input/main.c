@@ -29,8 +29,8 @@ int factorial_recurse(int n) {
   return factorial_recurse(n - 1) * n;
 }
 
-int sum_to_one_digit(unsigned int n) {
-  unsigned int sum = 0;
+int sum_to_one_digit(int n) {
+  int sum = 0;
 
   while (n > 0) {
     sum += n % 10;

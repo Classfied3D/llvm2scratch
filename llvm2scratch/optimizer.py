@@ -258,6 +258,12 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
       did_opti_total |= False
   return value, did_opti_total
 
+def completeSimplifyValue(value: sb3.Value) -> sb3.Value:
+  did_opti = True
+  while did_opti:
+    value, did_opti = simplifyValue(value)
+  return value
+
 def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList, bool]:
   """Optimise a code block by evaluating known values or general optimisation"""
   did_opti_total = False
