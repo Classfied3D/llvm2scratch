@@ -581,7 +581,7 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable],
   return blocks, ctx
 
 def transSimpleCall(name: str, arguments: list[sb3.Value],
-              output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
+                    output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
   """
   Translates simple function calls. Deals with passing parameters and
   return values. The first block list returned is any blocks to call
@@ -1921,6 +1921,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           if instr.func.intrinsic is not None:
             instr_code = transIntrinsic(instr.func.intrinsic, args, ctx, bctx)
             bctx.code.add(instr_code)
+            bctx.next_call_id += 1
           else:
             callee_info = ctx.fn_info[callee_name]
             result = None if instr.result is None else transVar(instr.result, bctx)

@@ -2,7 +2,6 @@
 
 static int a = 7;
 static char* message = "loldefault";
-static char str[] = "hello world";
 
 typedef struct SensorData {
   int temp;
@@ -109,8 +108,10 @@ int main(void) {
   int f = factorial_recurse(10);
   int g = sum_to_one_digit(473);
 
+  char str[] = "hello world";
+
   numberize(str);
-  //puts(str);
+  puts(str);
 
   SensorData h[5];
   h[2] = (SensorData){7, 2};
