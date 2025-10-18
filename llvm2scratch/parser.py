@@ -142,6 +142,10 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
       # A global variable reference
       return GlobalVarVal(type, value.name)
 
+    case llvm.ValueKind.undef_value:
+      # An undef value
+      return UndefVal(type)
+
     case llvm.ValueKind.constant_int:
       # An constant integer (e.g. 5)
       val = value.get_constant_value()
@@ -191,6 +195,10 @@ def decodeIntrinsic(name: str) -> Intrinsic | None:
     return Intrinsic.MemCpy
   elif name.startswith("memmove"):
     return Intrinsic.MemMove
+  elif name.startswith("lifetime.start"):
+    return Intrinsic.LifetimeStart
+  elif name.startswith("lifetime.end"):
+    return Intrinsic.LifetimeEnd
   raise ValueError(f"Unknown intrinsic {name}")
 
 def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:

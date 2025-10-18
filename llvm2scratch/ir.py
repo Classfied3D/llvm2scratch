@@ -81,6 +81,8 @@ class Intrinsic(Enum):
   MemCpy = "llvm.memcpy"
   MemCpyInline = "llvm.memcpy.inline"
   MemMove = "llvm.memmove"
+  LifetimeStart = "llvm.lifetime.start"
+  LifetimeEnd = "llvm.lifetime.end"
 
 @dataclass
 class ResultLocalVar:
@@ -168,6 +170,10 @@ class LocalVarVal(Value):
 @dataclass
 class GlobalVarVal(Value):
   name: str
+
+@dataclass
+class UndefVal(KnownVal, KnownVecTargetVal, KnownArrTargetVal):
+  pass
 
 @dataclass
 class KnownIntVal(KnownVal, KnownVecTargetVal, KnownArrTargetVal):

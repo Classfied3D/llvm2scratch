@@ -512,6 +512,7 @@ def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
   blocks = sb3.BlockList()
   for res_var, ir_val in phi_info:
+    if isinstance(ir_val, ir.UndefVal): continue # Undef values do not need to be assigned
     val = transValue(ir_val, ctx, bctx)
     if isinstance(val, IndexableValueAndBlocks):
       raise CompException(f"Function argument cannot be an indexable value")
@@ -1608,6 +1609,11 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, 
                    bctx: BlockInfo) -> sb3.BlockList:
   blocks = sb3.BlockList()
 
+  # For some intrinsics, they are no-op, etc and we don't need to translate args
+  match intrinsic:
+    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd:
+      return blocks
+
   values: list[sb3.Value] = []
   for arg in args:
     val = transValue(arg, ctx, bctx)
@@ -1621,7 +1627,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, 
 
       # If the length is unknown and large, we'll use a loop like when it is known
       known_length = isinstance(length, sb3.Known) and \
-        (isinstance(length.known, (int, float)) and length.known < 15)
+        (isinstance(length.known, (int, float)) and length.known < 12)
 
       if known_length:
         assert isinstance(length, sb3.Known)
