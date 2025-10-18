@@ -343,21 +343,11 @@ def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[
 def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
-def undoTwosComplement(width: int, val: sb3.Value, return_var: bool, ctx: Context) -> ValueAndBlocks:
-  """Calculates two's compilment on a value. If the returned value is used multiple times, it is
-  prefered to be a var, which can be done with return_var=True"""
-  limit = int(((2 ** width) / 2) - 1)
-  decrease = 2 ** width
+def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
+  """Undoes two's complement on a value."""
 
-  if shouldOptimiseValueUse(val, 2) or return_var:
-    tmp = genTempVar(ctx)
-    return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([
-      sb3.EditVar("set", tmp, val),
-      sb3.ControlFlow("if", sb3.BoolOp(">", sb3.GetVar(tmp), sb3.Known(limit)), sb3.BlockList([
-        sb3.EditVar("change", tmp, sb3.Known(-decrease)),
-      ])),
-    ]))
-  return ValueAndBlocks(sb3.Op("sub", val, sb3.Op("mul", sb3.Known(decrease), sb3.BoolOp(">", val, sb3.Known(limit)))))
+  # Weird formula but works
+  return sb3.Op("add", sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 2)), sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
 
 def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
   if isinstance(val, sb3.Known):
@@ -852,10 +842,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_exact:
-            signed_left, lblocks = flatAsTuple(undoTwosComplement(width, left, False, ctx))
-            signed_right, rblocks = flatAsTuple(undoTwosComplement(width, right, False, ctx))
-            blocks.add(lblocks)
-            blocks.add(rblocks)
+            signed_left = undoTwosComplement(width, left)
+            signed_right = undoTwosComplement(width, right)
 
             res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
           else:
@@ -978,7 +966,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             ]), sb3.BlockList([
               sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
                 # If left is neg and right is pos - remainder = (l mod r) - r
-               res_var.setValue(sb3.Op("add",
+                res_var.setValue(sb3.Op("add",
                                        sb3.Op("sub",
                                          sb3.Op("mod",
                                            sb3.Op("sub", left, sb3.Known(change)),
