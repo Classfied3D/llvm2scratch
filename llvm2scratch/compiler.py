@@ -1196,46 +1196,64 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-      match instr.cond:
-        case ir.ICmpCond.Sgt | ir.ICmpCond.Sge | ir.ICmpCond.Slt | ir.ICmpCond.Sle:
-          # Like undoTwosComplement but can remove the extra addition at the end because algebra
-          # Simplify because instructions are optimized for known values
-          reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
-            sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))))
+      special_signed_handling = ctx.cfg.opti and \
+                                instr.cond in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
+                                not isinstance(left, sb3.Known) and \
+                                not isinstance(right, sb3.Known)
+
+      modulus = -(2 ** width)
+
+      # Like undoTwosComplement but can remove the extra addition at the end because algebra
+      # Simplify because instructions are optimized for known values
+      reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
+        sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(modulus)))
+
+      # Subtracting half the modulus after reversing two's complement
+      reverse_twos_complement_and_sub_half = lambda val: \
+        sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 0.5)), sb3.Known(modulus))
+
+      if not special_signed_handling:
+        if instr.cond in {ir.ICmpCond.Sgt, ir.ICmpCond.Sge, ir.ICmpCond.Slt, ir.ICmpCond.Sle}:
           left = reverse_twos_complement(left)
           right = reverse_twos_complement(right)
 
-      match instr.cond:
-        case ir.ICmpCond.Eq:
-          res_val = sb3.BoolOp("=", left, right)
-        case ir.ICmpCond.Ne:
-          res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
-        case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
-          res_val = sb3.BoolOp(">", left, right)
-        case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
-          if isinstance(left, sb3.Known):
-            res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
-          elif isinstance(right, sb3.Known):
-            res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
-          else:
-            res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
-        case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
-          res_val = sb3.BoolOp("<", left, right)
-        case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
-          if isinstance(left, sb3.Known):
-            res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
-          elif isinstance(right, sb3.Known):
-            res_val = sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
-          else:
-            res_val = sb3.BoolOp("not", sb3.BoolOp(">", left, right))
-        case _:
-          raise CompException(f"icmp does not support comparsion mode {instr.cond}")
+        match instr.cond:
+          case ir.ICmpCond.Eq:
+            res_val = sb3.BoolOp("=", left, right)
+          case ir.ICmpCond.Ne:
+            res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
+          case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
+            res_val = sb3.BoolOp(">", left, right)
+          case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
+            res_val = sb3.BoolOp("<", left, right)
+          case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
+            if isinstance(left, sb3.Known):
+              res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
+            elif isinstance(right, sb3.Known):
+              res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
+            else:
+              res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
+          case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
+            if isinstance(left, sb3.Known):
+              res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
+            elif isinstance(right, sb3.Known):
+              res_val = sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
+            else:
+              res_val = sb3.BoolOp("not", sb3.BoolOp(">", left, right))
+          case _:
+            raise CompException(f"icmp does not support comparsion mode {instr.cond}")
+      else:
+        # We can skip adding a number for greater equal/less equal by adjusting the values
+        # of the two's complement reversal
+        if instr.cond is ir.ICmpCond.Sge:
+          res_val = sb3.BoolOp(">", reverse_twos_complement(left), reverse_twos_complement_and_sub_half(right))
+        else:
+          res_val = sb3.BoolOp("<", reverse_twos_complement_and_sub_half(left), reverse_twos_complement(right))
 
       # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
       res_val = sb3.Op("bool_as_int", res_val)
 
-      if res_var is not None:
-        blocks.add(res_var.setValue(res_val))
+      blocks.add(res_var.setValue(res_val))
 
     case ir.Select(): # Select between two values based on a condition
       cond = transValue(instr.cond, ctx, bctx)
