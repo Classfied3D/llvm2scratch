@@ -1133,7 +1133,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"floats, got type {type(instr.left.type)}")
 
-          if not (isinstance(left, sb3.Known) or isinstance(left, sb3.Known)):
+          if not (isinstance(left, sb3.Known) or isinstance(right, sb3.Known)):
             # Result is negative if left/right have different signs
             cond = sb3.BoolOp("<", sb3.Op("mul", left, right), sb3.Known(0))
           else:
