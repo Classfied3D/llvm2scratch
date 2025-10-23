@@ -124,6 +124,7 @@ int main(void) {
   } else {
     i += 1.0f;
   }
+  i = -i;
 
   return 0;
 }

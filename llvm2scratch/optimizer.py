@@ -233,13 +233,13 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
 
           match value.op:
             case "add" | "sub":
-              if known == 0:
+              if known == 0 and not (value.op == "sub" and left_is_known):
                 value = unknown
                 did_opti_total = True
               elif isinstance(unknown, sb3.Op) and unknown.op in ["add", "sub"] and \
                    getKnownAndUnknown(unknown) is not None:
-                # Combine known terms into one operation
 
+                # Combine known terms into one operation
                 inner_known_and_unknown = getKnownAndUnknown(unknown)
                 assert inner_known_and_unknown is not None
                 inner_known, inner_unknown, inner_left_is_known = inner_known_and_unknown

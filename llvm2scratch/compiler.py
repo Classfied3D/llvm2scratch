@@ -769,6 +769,22 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address.value, value.value)]))
 
+    case ir.UnaryOp(): # Do a calculation with one value
+      operand = transValue(instr.operand, ctx, bctx)
+      blocks.add(operand.blocks)
+      operand = operand.value
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var.var_type != "param"
+
+      assert instr.opcode == ir.UnaryOpcode.FNeg # Only fneg exists in llvm ir
+
+      if isinstance(operand, IndexableValue):
+        raise CompException(f"Indexable value not supported in unary op {instr}")
+      assert isinstance(instr.operand.type, ir.FloatTy)
+
+      blocks.add(res_var.setValue(sb3.Op("sub", sb3.Known(0), operand)))
+
     case ir.BinaryOp(): # Do a calculation with two values
       left = transValue(instr.left, ctx, bctx)
       blocks.add(left.blocks)
@@ -1483,6 +1499,8 @@ def getInstrVarUse(instr: ir.Instr,
       vals = [instr.address, instr.value]
     case ir.Call():
       vals = [a for a in instr.args]
+    case ir.UnaryOp():
+      vals = [instr.operand]
     case ir.BinaryOp() | ir.ICmp() | ir.FCmp():
       vals = [instr.left, instr.right]
     case ir.Br() | ir.Switch():
