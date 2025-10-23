@@ -177,6 +177,8 @@ def getByteSize(ty: ir.Type) -> int:
     case ir.IntegerTy():
       # Scratch's fp variables can store < 52 bits per variable accurately
       return math.ceil(ty.width / VARIABLE_MAX_BITS)
+    case ir.FloatTy():
+      return 1; # All floats are stored with scratch's double precision variables
     case ir.ArrayTy():
       return ty.size * getByteSize(ty.inner)
     case ir.StructTy():
@@ -249,6 +251,9 @@ def transValue(val: ir.Value,
       if num < 0:
         num = (2 ** width) + num
       return ValueAndBlocks(sb3.Known(num))
+
+    case ir.KnownFloatVal():
+      return ValueAndBlocks(sb3.Known(val.value))
 
     case ir.KnownArrVal():
       values: list[sb3.Value | IndexableValue] = []
@@ -1108,6 +1113,43 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                 res_val = sb3.Op("add", res_val, results.pop())
             else:
               res_val = results[0]
+
+        case ir.BinaryOpcode.FAdd | ir.BinaryOpcode.FSub | \
+             ir.BinaryOpcode.FMul | ir.BinaryOpcode.FDiv: # Basic float operations
+
+           op_lookup: dict[ir.BinaryOpcode, Literal["add", "sub", "mul", "div"]] = {
+            ir.BinaryOpcode.FAdd: "add", ir.BinaryOpcode.FSub: "sub",
+            ir.BinaryOpcode.FMul: "mul", ir.BinaryOpcode.FDiv: "div"
+           }
+
+           if not isinstance(instr.left.type, ir.FloatTy):
+             raise CompException(f"Instruction {instr} with opcode add only supports "
+                                 f"floats, got type {type(instr.left.type)}")
+
+           res_val = sb3.Op(op_lookup[instr.opcode], left, right)
+
+        case ir.BinaryOpcode.FRem: # Float remainder
+          if not isinstance(instr.left.type, ir.FloatTy):
+            raise CompException(f"Instruction {instr} with opcode add only supports "
+                                f"floats, got type {type(instr.left.type)}")
+
+          if not (isinstance(left, sb3.Known) or isinstance(left, sb3.Known)):
+            # Result is negative if left/right have different signs
+            cond = sb3.BoolOp("<", sb3.Op("mul", left, right), sb3.Known(0))
+          else:
+            known, unknown = (left, right) if isinstance(left, sb3.Known) else (right, left)
+            assert isinstance(known, sb3.Known)
+
+            if sb3.scratchCastToNum(known) > 0:
+              # Result is negative if unknown is negative
+              cond = sb3.BoolOp("<", unknown, sb3.Known(0))
+            else:
+              # Result is negative if unknown is positive
+              cond = sb3.BoolOp(">", unknown, sb3.Known(0))
+
+          res_val = sb3.Op("sub",
+            sb3.Op("mod", left, right),
+            sb3.Op("mul", right, cond))
 
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")

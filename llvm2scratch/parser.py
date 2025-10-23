@@ -153,6 +153,12 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
       assert isinstance(type, IntegerTy)
       return KnownIntVal(type, val, type.width)
 
+    case llvm.ValueKind.constant_fp:
+      val = value.get_constant_value(round_fp=True)
+      assert isinstance(val, float)
+      assert isinstance(type, (HalfTy, FloatTy, DoubleTy, Fp128Ty))
+      return KnownFloatVal(type, val)
+
     case llvm.ValueKind.basic_block:
       # A basic block label
       label_name = str(value).split(":")[0].strip()

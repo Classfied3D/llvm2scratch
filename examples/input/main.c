@@ -117,5 +117,8 @@ int main(void) {
   h[2] = (SensorData){7, 2};
   putchar('0' + h[2].temp);
 
+  float i = 3.0f;
+  i += 0.5f;
+
   return 0;
 }
