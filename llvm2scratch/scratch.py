@@ -308,6 +308,14 @@ class Known(Value):
     raw = self.known
     if not isinstance(self.known, str):
       raw = float(raw)
+
+    if raw == float("+inf"):
+      raw = "Infinity"
+    elif raw == float("-inf"):
+      raw = "-Infinity"
+    elif isinstance(raw, float) and math.isnan(raw):
+      raw = "NaN"
+
     return [1, [(10 if isinstance(self.known, str) else 4), raw]], ctx
 
   def getRawVarInit(self) -> str | float | bool:
@@ -791,6 +799,26 @@ def scratchCastToStr(value: Known) -> str:
   raw = value.known
   if isinstance(raw, bool): return "true" if raw else "false"
   return str(raw)
+
+def scratchCompare(left: Known, right: Known) -> float:
+  """
+  Works out the difference between two Known values like scratch does for comparison operators
+  Negative number if left < right; 0 if equal; positive otherwise
+  """
+  try:
+    left_val = float(left.known)
+    right_val = float(right.known)
+
+    # Sorry mathematicians lol
+    if left_val == float("+inf") and right_val == float("+inf") or \
+       left_val == float("-inf") and right_val == float("-inf"):
+      return 0
+
+    return left_val - right_val
+  except ValueError:
+    left_val = scratchCastToStr(left).lower()
+    right_val = scratchCastToStr(right).lower()
+    return 0 if left_val == right_val else (-1 if left_val < right_val else 1)
 
 def genId() -> Id:
   return random.randbytes(16).hex()

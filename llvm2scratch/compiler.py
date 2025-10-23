@@ -352,7 +352,9 @@ def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
   """Undoes two's complement on a value."""
 
   # Weird formula but works
-  return sb3.Op("add", sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
+  return sb3.Op("add",
+    sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)),
+    sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
 
 def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
   if isinstance(val, sb3.Known):
@@ -1225,7 +1227,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       right = right.value
 
       res_var = transVar(instr.result, bctx)
-      assert res_var is None or res_var.var_type != "param"
+      assert res_var.var_type != "param"
 
       if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
         raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -1291,6 +1293,70 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = sb3.BoolOp(">", reverse_twos_complement(left), reverse_twos_complement_and_sub_half(right))
         else:
           res_val = sb3.BoolOp("<", reverse_twos_complement_and_sub_half(left), reverse_twos_complement(right))
+
+      # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
+      res_val = sb3.Op("bool_as_int", res_val)
+
+      blocks.add(res_var.setValue(res_val))
+
+    case ir.FCmp(): # Compare two float values
+      left = transValue(instr.left, ctx, bctx)
+      blocks.add(left.blocks)
+      left = left.value
+
+      right = transValue(instr.right, ctx, bctx)
+      blocks.add(right.blocks)
+      right = right.value
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var.var_type != "param"
+
+      if not isinstance(instr.left.type, ir.FloatTy):
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"floats, got type {type(instr.left.type)}")
+      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
+
+      # NaN > Infinity in scratch
+      is_nan = lambda val: sb3.BoolOp(">", val, sb3.Known(float("inf")))
+      # Use slower lexical string comparison (Infinity > j > NaN due to alphabetical order)
+      is_not_nan = lambda val: sb3.BoolOp("<", val, sb3.Known("j"))
+
+      match instr.cond:
+        case ir.FCmpCond.TrueCond | ir.FCmpCond.FalseCond:
+          res_val = sb3.KnownBool(instr.cond is ir.FCmpCond.TrueCond)
+
+        case ir.FCmpCond.Oeq:
+          # Anything = NaN is false in scratch apart from NaN = NaN - only need to check one side
+          res_val = sb3.BoolOp("and", is_not_nan(right), sb3.BoolOp("=", left, right))
+
+        case ir.FCmpCond.One | ir.FCmpCond.Ogt | ir.FCmpCond.Oge | ir.FCmpCond.Olt | ir.FCmpCond.Ole:
+          op = "=" if instr.cond is ir.FCmpCond.One else \
+              (">" if instr.cond in {ir.FCmpCond.Ogt, ir.FCmpCond.Ole} else "<")
+          inverted = instr.cond in {ir.FCmpCond.One, ir.FCmpCond.Oge, ir.FCmpCond.Ole}
+          invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
+
+          res_val = sb3.BoolOp("and",
+            sb3.BoolOp("and", is_not_nan(left), is_not_nan(right)),
+            invert_val_if_necessary(sb3.BoolOp(op, left, right)))
+
+        case ir.FCmpCond.Uno:
+          res_val = sb3.BoolOp("and", is_not_nan(left), is_not_nan(right))
+
+        case ir.FCmpCond.Ueq | ir.FCmpCond.Une | ir.FCmpCond.Ugt | ir.FCmpCond.Uge | ir.FCmpCond.Ult | ir.FCmpCond.Ule:
+          op = "=" if instr.cond in {ir.FCmpCond.Ueq, ir.FCmpCond.Une} else \
+              (">" if instr.cond in {ir.FCmpCond.Ogt, ir.FCmpCond.Ole} else "<")
+          inverted = instr.cond in {ir.FCmpCond.One, ir.FCmpCond.Oge, ir.FCmpCond.Ole}
+          invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
+
+          res_val = sb3.BoolOp("or",
+            sb3.BoolOp("or", is_nan(left), is_nan(right)),
+            invert_val_if_necessary(sb3.BoolOp(op, left, right)))
+
+        case ir.FCmpCond.Ord:
+          res_val = sb3.BoolOp("or", is_nan(left), is_nan(right))
+
+        case _:
+          raise CompException(f"fcmp does not support comparsion mode {instr.cond}")
 
       # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
       res_val = sb3.Op("bool_as_int", res_val)
@@ -1417,9 +1483,7 @@ def getInstrVarUse(instr: ir.Instr,
       vals = [instr.address, instr.value]
     case ir.Call():
       vals = [a for a in instr.args]
-    case ir.BinaryOp():
-      vals = [instr.left, instr.right]
-    case ir.ICmp():
+    case ir.BinaryOp() | ir.ICmp() | ir.FCmp():
       vals = [instr.left, instr.right]
     case ir.Br() | ir.Switch():
       vals = [instr.cond] if isinstance(instr, (ir.CondBr, ir.Switch)) else []

@@ -115,15 +115,15 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
       elif isinstance(value.left, sb3.Known) and isinstance(value.right, sb3.Known):
         if value.op in ["<", ">", "="]:
           did_opti_total = True
-          left = sb3.scratchCastToNum(value.left)
-          right = sb3.scratchCastToNum(value.right)
+          comparison = sb3.scratchCompare(value.left, value.right)
+
           match value.op:
             case "<":
-              value = sb3.KnownBool(left < right)
+              value = sb3.KnownBool(comparison < 0)
             case ">":
-              value = sb3.KnownBool(left > right)
+              value = sb3.KnownBool(comparison > 0)
             case "=":
-              value = sb3.KnownBool(left == right)
+              value = sb3.KnownBool(comparison == 0)
 
         elif value.op in ["and", "or"]:
           did_opti_total = True
@@ -133,6 +133,21 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
             value = sb3.KnownBool(left and right)
           else:
             value = sb3.KnownBool(left or right)
+
+      elif value.op in ["and", "or"] and \
+        (isinstance(value.left, sb3.Known) or isinstance(value.right, sb3.Known)):
+        did_opti_total = True
+        known, unknown = (value.left, value.right) if isinstance(value.left, sb3.Known) \
+          else (value.right, value.left)
+        assert isinstance(known, sb3.Known) and isinstance(unknown, sb3.Value)
+        known_val = sb3.scratchCastToBool(known)
+
+        if value.op == "and" and known_val is False:
+          value = sb3.KnownBool(False)
+        elif value.op == "or" and known_val is True:
+          value = sb3.KnownBool(True)
+        else:
+          value = unknown
 
       elif value.op in ["<", ">", "="] and \
           ((isinstance(value.left, sb3.Op) and value.left.op == "bool_as_int") ^ \

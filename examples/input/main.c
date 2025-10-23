@@ -119,6 +119,11 @@ int main(void) {
 
   float i = 3.0f;
   i += 0.5f;
+  if (i > 3.4f) {
+    i -= 1.0f;
+  } else {
+    i += 1.0f;
+  }
 
   return 0;
 }
