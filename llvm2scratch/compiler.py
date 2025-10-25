@@ -1197,7 +1197,22 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           # TODO FIX: support larger values
           if instr.value.type.width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction icmp currently supports "
+            raise CompException(f"Instruction {instr} currently supports "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
+
+        case ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt:
+          if not isinstance(instr.value.type, ir.FloatTy): # TODO: add vector support
+            raise CompException(f"Instruction {instr} only supports "
+                                f"floats, got type {type(instr.value.type)}")
+
+        case ir.ConvOpcode.FPToUI | ir.ConvOpcode.FPToSI:
+          if not isinstance(instr.value.type, ir.FloatTy): # TODO: add vector support
+            raise CompException(f"Instruction {instr} only supports "
+                                f"floats, got type {type(instr.value.type)}")
+
+          assert isinstance(to_ty, ir.IntegerTy)
+          if to_ty.width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports converting to "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
         case ir.ConvOpcode.BitCast:
@@ -1217,8 +1232,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         case ir.ConvOpcode.Trunc:
           assert isinstance(to_ty, ir.IntegerTy)
           res_val = sb3.Op("mod", value, sb3.Known(2 ** to_ty.width))
-        case ir.ConvOpcode.ZExt:
-          res_val = value
+
         case ir.ConvOpcode.SExt:
           assert isinstance(from_ty, ir.IntegerTy) and isinstance(to_ty, ir.IntegerTy)
           from_bits, to_bits = from_ty.width, to_ty.width
@@ -1230,7 +1244,24 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           # e.g. i2 -> i4: 1111 - 0011 = 1100
           diff = (2 ** to_bits - 1) - (2 ** from_bits - 1)
           res_val = sb3.Op("add", value, sb3.Op("mul", sb3.Known(diff), is_neg))
-        case ir.ConvOpcode.BitCast:
+
+        case ir.ConvOpcode.FPToUI:
+          res_val = sb3.Op("floor", value)
+
+        case ir.ConvOpcode.FPToSI:
+          assert isinstance(to_ty, ir.IntegerTy)
+          res_val = sb3.Op("mod",
+            sb3.Op("mul",
+              sb3.Op("floor", sb3.Op("abs", value)),
+              sb3.Op("sub",
+                sb3.Op("mul",
+                  sb3.BoolOp(">", value, sb3.Known(0)),
+                  sb3.Known(2)),
+                sb3.Known(1))),
+            sb3.Known(2 ** to_ty.width))
+
+        case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | ir.ConvOpcode.BitCast:
+          # No-op
           res_val = value
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")

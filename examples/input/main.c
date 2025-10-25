@@ -129,6 +129,8 @@ int main(void) {
 
   int j = 257;
   u_int8_t k = j;
+  float l = 3.14f;
+  int m = l;
 
   return 0;
 }
