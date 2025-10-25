@@ -425,6 +425,11 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
 
       return Call(result, func_val, arg_vals, tail_kind)
 
+    case "freeze":
+      assert result is not None
+      value, *_ = instr.operands
+      return Freeze(result, decodeValue(value, mod))
+
     case _:
       raise ValueError(f"Opcode {instr.opcode} not implemented")
 

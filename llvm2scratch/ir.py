@@ -327,6 +327,10 @@ class Call(Instr, MaybeHasResult):
   tail_kind: CallTailKind
 
 @dataclass
+class Freeze(Instr, HasResult):
+  value: Value
+
+@dataclass
 class Block():
   label: str
   instrs: list[Instr]

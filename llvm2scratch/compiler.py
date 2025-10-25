@@ -35,6 +35,7 @@ class Config:
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before reseting
                                         # scratch's call stack via a broadcast
+  ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
 
   debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
                                                            # future compilations for optimization
@@ -1277,6 +1278,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
              ir.ConvOpcode.IntToPtr | ir.ConvOpcode.BitCast:
           # No-op
           res_val = value
+
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
 
@@ -1456,7 +1458,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         res_var.setValue(false_val.value)
       ])))
 
-    case ir.Phi():
+    case ir.Phi(): # Choose a value based on which block control came from
       pass # Phi assignments are dealt with in the brancher function
 
     case ir.GetElementPtr(): # Offset a pointer to get an address in an array/struct
@@ -1497,8 +1499,42 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert res_var.var_type != "param"
       blocks.add(res_var.setValue(offset_ptr))
 
+    case ir.Call(): # Call a function
+      pass # Calls are handled in transFuncs
+
+    case ir.Freeze(): # Freeze a value to replace poison/undef with a valid value
+      # Essentially a no-op, but for some types (e.g. integers)
+      # poison can exist in invalid states e.g. -3 or 1.2 or NaN
+      value = transValue(instr.value, ctx, bctx)
+      blocks.add(value.blocks)
+      value = value.value
+      assert isinstance(value, sb3.Value)
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var.var_type != "param"
+
+      match instr.value.type:
+        case ir.IntegerTy() | ir.PointerTy():
+          width = instr.value.type.width if isinstance(instr.value.type, ir.IntegerTy) \
+            else ctx.cfg.ptr_size_bits
+
+          # Works with NaN, Infinity, invalid values (mod turns infinity to NaN but
+          # floor doesn't, so doesn't work other way around)
+          res_val = res_var.setValue(sb3.Op("floor", sb3.Op("mod", value, sb3.Known(2 ** width))))
+
+        case ir.FloatTy():
+          # No-op
+          res_val = res_var.setValue(value)
+
+        case _:
+          raise CompException(f"Instruction {instr} with opcode add only supports "
+                              f"integers and floats, got type {type(instr.value.type)}")
+
+      blocks.add(res_val)
+
     case _:
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
+
   return blocks, ctx, bctx
 
 def getTerminatorInstrLabels(instr: ir.Instr) -> set[str]:
@@ -1541,7 +1577,7 @@ def getInstrVarUse(instr: ir.Instr,
       # For phi, even though it might depend on a value, the
       # branch instruction is made responsible instead
       vals = []
-    case ir.Ret() | ir.Conversion():
+    case ir.Ret() | ir.Conversion() | ir.Freeze():
       vals = [instr.value]
     case ir.Load():
       vals = [instr.address]
