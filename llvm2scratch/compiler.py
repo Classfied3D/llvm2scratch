@@ -349,7 +349,7 @@ def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
 def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
-  """Undoes two's complement on a value."""
+  """Reverses two's complement on a value."""
 
   # Weird formula but works
   return sb3.Op("add",
@@ -1190,7 +1190,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(value, sb3.Value)
 
       match instr.opcode:
-        case ir.ConvOpcode.Trunc | ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt:
+        case ir.ConvOpcode.Trunc | ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt | \
+             ir.ConvOpcode.UIToFP | ir.ConvOpcode.SIToFP:
           if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
               f"integers, got type {type(instr.value.type)}")
@@ -1260,7 +1261,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                 sb3.Known(1))),
             sb3.Known(2 ** to_ty.width))
 
-        case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | ir.ConvOpcode.BitCast:
+        case ir.ConvOpcode.SIToFP:
+          assert isinstance(from_ty, ir.IntegerTy)
+          res_val = undoTwosComplement(from_ty.width, value)
+
+        case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | \
+             ir.ConvOpcode.UIToFP | ir.ConvOpcode.BitCast:
           # No-op
           res_val = value
         case _:

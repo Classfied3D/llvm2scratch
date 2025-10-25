@@ -131,6 +131,7 @@ int main(void) {
   u_int8_t k = j;
   float l = 3.14f;
   int m = l;
+  float n = m;
 
   return 0;
 }
