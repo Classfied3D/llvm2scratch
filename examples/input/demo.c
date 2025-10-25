@@ -1,5 +1,5 @@
+#include "sb3api.h"
 #include <stdint.h>
-#include <stdio.h>
 
 static int a = 7;
 static char* message = "loldefault";
@@ -84,25 +84,25 @@ int main(void) {
   int c = test_branch(2);
 
   for (unsigned char d = 65; d != 70; d++) {
-    putchar(d);
+    SB3_say_char(d);
   }
 
   unsigned int e = 221;
   switch (e) {
     case 0:
-      puts("0");
+      SB3_say_str("0");
       break;
     case 1:
-      puts("1");
+      SB3_say_str("1");
       break;
     case 20:
-      puts("20");
+      SB3_say_str("20");
       break;
     case 21:
-      puts("21");
+      SB3_say_str("21");
       break;
     default:
-      puts(message + 3);
+      SB3_say_str(message + 3);
       break;
   }
 
@@ -112,11 +112,11 @@ int main(void) {
   char str[] = "hello world";
 
   numberize(str);
-  puts(str);
+  SB3_say_str(str);
 
   SensorData h[5];
   h[2] = (SensorData){7, 2};
-  putchar('0' + h[2].temp);
+  SB3_say_char('0' + h[2].temp);
 
   float i = 3.0f;
   i += 0.5f;

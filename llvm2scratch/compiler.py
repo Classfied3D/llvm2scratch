@@ -178,7 +178,7 @@ def getByteSize(ty: ir.Type) -> int:
     case ir.IntegerTy():
       # Scratch's fp variables can store < 52 bits per variable accurately
       return math.ceil(ty.width / VARIABLE_MAX_BITS)
-    case ir.FloatTy():
+    case ir.FloatingPointTy():
       return 1; # All floats are stored with scratch's double precision variables
     case ir.ArrayTy():
       return ty.size * getByteSize(ty.inner)
@@ -784,7 +784,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       if isinstance(operand, IndexableValue):
         raise CompException(f"Indexable value not supported in unary op {instr}")
-      assert isinstance(instr.operand.type, ir.FloatTy)
+      assert isinstance(instr.operand.type, ir.FloatingPointTy)
 
       blocks.add(res_var.setValue(sb3.Op("sub", sb3.Known(0), operand)))
 
@@ -1143,14 +1143,14 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             ir.BinaryOpcode.FMul: "mul", ir.BinaryOpcode.FDiv: "div"
            }
 
-           if not isinstance(instr.left.type, ir.FloatTy):
+           if not isinstance(instr.left.type, ir.FloatingPointTy):
              raise CompException(f"Instruction {instr} with opcode add only supports "
                                  f"floats, got type {type(instr.left.type)}")
 
            res_val = sb3.Op(op_lookup[instr.opcode], left, right)
 
         case ir.BinaryOpcode.FRem: # Float remainder
-          if not isinstance(instr.left.type, ir.FloatTy):
+          if not isinstance(instr.left.type, ir.FloatingPointTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"floats, got type {type(instr.left.type)}")
 
@@ -1203,12 +1203,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
         case ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt:
-          if not isinstance(instr.value.type, ir.FloatTy): # TODO: add vector support
+          if not isinstance(instr.value.type, ir.FloatingPointTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} only supports "
                                 f"floats, got type {type(instr.value.type)}")
 
         case ir.ConvOpcode.FPToUI | ir.ConvOpcode.FPToSI:
-          if not isinstance(instr.value.type, ir.FloatTy): # TODO: add vector support
+          if not isinstance(instr.value.type, ir.FloatingPointTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} only supports "
                                 f"floats, got type {type(instr.value.type)}")
 
@@ -1379,7 +1379,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
-      if not isinstance(instr.left.type, ir.FloatTy):
+      if not isinstance(instr.left.type, ir.FloatingPointTy):
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"floats, got type {type(instr.left.type)}")
       assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
@@ -1522,7 +1522,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           # floor doesn't, so doesn't work other way around)
           res_val = res_var.setValue(sb3.Op("floor", sb3.Op("mod", value, sb3.Known(2 ** width))))
 
-        case ir.FloatTy():
+        case ir.FloatingPointTy():
           # No-op
           res_val = res_var.setValue(value)
 
@@ -2265,7 +2265,7 @@ def addForeignFunctions(ctx: Context) -> Context:
       ascii_lookup.append(char)
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
 
-  ctx = addFunc("puts", ["input"], 0, sb3.BlockList([
+  ctx = addFunc("SB3_say_str", ["input"], 0, sb3.BlockList([
     sb3.EditVar("set", "buffer", sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
@@ -2283,11 +2283,15 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
-  ctx = addFunc("putchar", ["input"], 0, sb3.BlockList([
+  ctx = addFunc("SB3_say_char", ["input"], 0, sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex",
       (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
       sb3.GetParameter(localizeParameter("input")))),
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+  ]), ctx)
+
+  ctx = addFunc("SB3_say_dbl", ["input"], 0, sb3.BlockList([
+    sb3.Say(sb3.GetParameter(localizeParameter("input"))),
   ]), ctx)
 
   return ctx
