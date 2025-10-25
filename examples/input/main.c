@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 
 static int a = 7;
@@ -125,6 +126,9 @@ int main(void) {
     i += 1.0f;
   }
   i = -i;
+
+  int j = 257;
+  u_int8_t k = j;
 
   return 0;
 }

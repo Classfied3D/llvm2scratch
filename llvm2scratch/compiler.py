@@ -353,8 +353,10 @@ def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
 
   # Weird formula but works
   return sb3.Op("add",
-    sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)),
-    sb3.Known(-(2 ** width))), sb3.Known(2 ** (width - 1) - 1))
+    sb3.Op("mod",
+      sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)),
+      sb3.Known(-(2 ** width))),
+    sb3.Known(2 ** (width - 1) - 1))
 
 def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
   if isinstance(val, sb3.Known):
@@ -1188,7 +1190,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(value, sb3.Value)
 
       match instr.opcode:
-        case ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt:
+        case ir.ConvOpcode.Trunc | ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt:
           if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
               f"integers, got type {type(instr.value.type)}")
@@ -1212,6 +1214,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_val = None
 
       match instr.opcode:
+        case ir.ConvOpcode.Trunc:
+          assert isinstance(to_ty, ir.IntegerTy)
+          res_val = sb3.Op("mod", value, sb3.Known(2 ** to_ty.width))
         case ir.ConvOpcode.ZExt:
           res_val = value
         case ir.ConvOpcode.SExt:
