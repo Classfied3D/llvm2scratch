@@ -1191,7 +1191,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       match instr.opcode:
         case ir.ConvOpcode.Trunc | ir.ConvOpcode.ZExt | ir.ConvOpcode.SExt | \
-             ir.ConvOpcode.UIToFP | ir.ConvOpcode.SIToFP:
+             ir.ConvOpcode.UIToFP | ir.ConvOpcode.SIToFP | ir.ConvOpcode.IntToPtr:
           if not isinstance(instr.value.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
               f"integers, got type {type(instr.value.type)}")
@@ -1213,6 +1213,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           assert isinstance(to_ty, ir.IntegerTy)
           if to_ty.width > VARIABLE_MAX_BITS:
+            raise CompException(f"Instruction {instr} currently supports converting to "
+                                f"integers with <= {VARIABLE_MAX_BITS} bits")
+
+        case ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr:
+          assert isinstance(instr.value.type, ir.PointerTy)
+          assert isinstance(instr.res_type, ir.IntegerTy)
+          if instr.res_type.width > VARIABLE_MAX_BITS:
             raise CompException(f"Instruction {instr} currently supports converting to "
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
@@ -1266,7 +1273,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = undoTwosComplement(from_ty.width, value)
 
         case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | \
-             ir.ConvOpcode.UIToFP | ir.ConvOpcode.BitCast:
+             ir.ConvOpcode.UIToFP | ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr | \
+             ir.ConvOpcode.IntToPtr | ir.ConvOpcode.BitCast:
           # No-op
           res_val = value
         case _:
