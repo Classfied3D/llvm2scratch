@@ -127,7 +127,7 @@ class ValueAndBlocks:
 @dataclass
 class IndexableValue:
   """A collection of values that can be indexed over (e.g. a string)"""
-  vals: list[sb3.Value | IndexableValue]
+  vals: list[sb3.Value]
 
 @dataclass
 class IndexableValueAndBlocks:
@@ -242,22 +242,29 @@ def transValue(val: ir.Value,
       return ValueAndBlocks(res)
 
     case ir.KnownIntVal():
-      # TODO FIX: allow different sizes with val.ty
-      if val.width > VARIABLE_MAX_BITS: raise CompException(f">{VARIABLE_MAX_BITS} bits not "
-                                                            f"yet supported, got {val.width}")
-
       # Calculate the two's complement version of the number
       num = val.value
       width = val.width
       if num < 0:
         num = (2 ** width) + num
-      return ValueAndBlocks(sb3.Known(num))
+
+      if val.width <= VARIABLE_MAX_BITS:
+        return ValueAndBlocks(sb3.Known(num))
+
+      # Little endian ordering of values
+      values: list[sb3.Value] = []
+      while width > 0:
+        values.append(sb3.Known(num % (2 ** VARIABLE_MAX_BITS)))
+        num = num // (2 ** VARIABLE_MAX_BITS)
+        width -= VARIABLE_MAX_BITS
+
+      return IndexableValueAndBlocks(IndexableValue(values))
 
     case ir.KnownFloatVal():
       return ValueAndBlocks(sb3.Known(val.value))
 
     case ir.KnownArrVal():
-      values: list[sb3.Value | IndexableValue] = []
+      values: list[sb3.Value] = []
       blocks = sb3.BlockList()
       for element in val.values:
         el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init))
@@ -759,18 +766,22 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
     case ir.Store(): # Copy a value to an address on the stack
       value = transValue(instr.value, ctx, bctx)
       blocks.add(value.blocks)
+      value = value.value
 
       address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
+      address = address.value
 
-      if isinstance(value.value, IndexableValue) or isinstance(address.value, IndexableValue):
+      if isinstance(address, IndexableValue):
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
-      if getByteSize(instr.value.type) > 1:
-        # TODO FIX: allow storing of larger values
-        raise CompException("Only 1 scratch byte can be stored per stack value at the moment")
-
-      blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address.value, value.value)]))
+      if isinstance(value, sb3.Value):
+        blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address, value)]))
+      else:
+        for offset, val in enumerate(value.vals):
+          offset_val = sb3.Known(offset)
+          set_ptr = sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", address, offset_val), val)
+          blocks.add(set_ptr)
 
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
