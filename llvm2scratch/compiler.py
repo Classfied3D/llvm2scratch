@@ -513,65 +513,70 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, mid_val, True,
                                      _lo=_lo,     _hi=mid))])
 
-def recomputeRawSumChain(i: int, left: IdxbleValue, right: IdxbleValue, bit_mask: int) -> sb3.Value:
-  sum0 = sb3.Op("add", left.vals[0], right.vals[0])
-  prev = sum0
-  for j in range(1, i + 1):
-    sum_ab = sb3.Op("add", left.vals[j], right.vals[j])
-    carry = sb3.BoolOp(">", prev, sb3.Known(bit_mask))
-    raw_sum = sb3.Op("add", sum_ab, carry)
-    prev = raw_sum
-  return prev
+def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value, prev_sum: sb3.Value) -> sb3.Value:
+  # Binary subtraction is exactly the same as addition but using subtraction to apply the carry/borrow bit and subtraction
+  # checks for negative instead. The modulus used with add also functions as a "borrow"
 
-def calculateSum(left: IdxbleValue, right: IdxbleValue, width: int, ctx: Context) \
+  raw_sum = sb3.Op(op, left, right)
+
+  if op == "add":
+    carry = sb3.BoolOp(">", prev_sum, sb3.Known((2 ** VARIABLE_MAX_BITS) - 1))
+  else:
+    carry = sb3.BoolOp("<", prev_sum, sb3.Known(0))
+
+  carried_sum = sb3.Op(op, raw_sum, carry)
+
+  return carried_sum
+
+def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: IdxbleValue, width: int, ctx: Context) \
     -> IdxbleValueAndBlocks:
-  n = len(left.vals)
-  assert n == len(right.vals)
-  assert n == math.ceil(width / VARIABLE_MAX_BITS)
-  if n == 0:
-    return IdxbleValueAndBlocks()
+  op_literal: Literal["add", "sub"] = op # well done python type checker
 
-  bit_mask = (2 ** VARIABLE_MAX_BITS) - 1
+  steps = len(left.vals)
+  assert steps == len(right.vals)
+  assert steps == math.ceil(width / VARIABLE_MAX_BITS)
+  if steps == 0:
+    return IdxbleValueAndBlocks()
 
   best_cost = float("inf")
   best_blocks = sb3.BlockList()
   best_sum_nodes: list[sb3.Value] = []
 
-  max_spacing = min(n, 10) # Tends to be about 3, no need to search much higher
+  max_spacing = min(steps, 10) # Tends to be about 3, no need to search much higher
 
   for spacing in range(1, max_spacing + 1):
     start_index = spacing
     for omit_last in (False, True):
-      checkpoint_indices = set(range(start_index, n, spacing))
-      if omit_last and (n - 1) in checkpoint_indices:
-        checkpoint_indices.remove(n - 1)
+      checkpoint_indices = set(range(start_index, steps, spacing))
+      if omit_last and (steps - 1) in checkpoint_indices:
+        checkpoint_indices.remove(steps - 1)
 
       cost = 0.0
       blocks = sb3.BlockList()
       sum_nodes: list[sb3.Value] = []
       stored_temp_names: dict[int, str] = {}
 
-      for i in range(n):
-        modulus = 2 ** (VARIABLE_MAX_BITS if i != n - 1 else width % VARIABLE_MAX_BITS)
+      for i in range(steps):
+        modulus = 2 ** (VARIABLE_MAX_BITS if i != steps - 1 else width % VARIABLE_MAX_BITS)
 
         if i == 0:
-          raw = sb3.Op("add", left.vals[0], right.vals[0])
+          raw = sb3.Op(op_literal, left.vals[0], right.vals[0])
           cost += optimizer.getValueCost(raw)
         else:
           earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
           prev_stored = max(earlier_stored) if earlier_stored else None
 
-          if prev_stored is not None:
-            prev_node = sb3.GetVar(stored_temp_names[prev_stored])
-            prev = prev_node
-            for j in range(prev_stored + 1, i + 1):
-              sum_ab = sb3.Op("add", left.vals[j], right.vals[j])
-              carry = sb3.BoolOp(">", prev, sb3.Known(bit_mask))
-              carried_sum = sb3.Op("add", sum_ab, carry)
-              prev = carried_sum
-            raw = prev
+          if prev_stored is None:
+            start = 1
+            prev = sb3.Op(op, left.vals[0], right.vals[0])
           else:
-            raw = recomputeRawSumChain(i, left, right, bit_mask)
+            start = prev_stored + 1
+            prev = sb3.GetVar(stored_temp_names[prev_stored])
+
+          for j in range(start, i + 1):
+            prev = paritialSumDiff(op, left.vals[j], right.vals[j], prev)
+
+          raw = prev
 
         if (i in checkpoint_indices) and (i >= start_index):
           temp_name = genTempVar(ctx)
@@ -925,7 +930,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_val = None
 
       match instr.opcode:
-        case ir.BinaryOpcode.Add:
+        case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub:
           pass
         case _:
           if isinstance(left, IdxbleValue) or \
@@ -934,33 +939,31 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
+          str_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add/sub only supports "
                                 f"integers, got type {type(instr.left.type)}")
 
           width = instr.left.type.width
-          # TODO FIX: support larger values by using multiple vars and carrying
-          if width > VARIABLE_MAX_BITS:
-            if instr.opcode is ir.BinaryOpcode.Sub:
-              raise CompException(f"Instruction {instr} opcode sub currently supports "
-                                  f"integers with <= {VARIABLE_MAX_BITS} bits")
 
+          if width > VARIABLE_MAX_BITS:
             assert isinstance(left, IdxbleValue) and isinstance(right, IdxbleValue)
 
-            sum = calculateSum(left, right, width, ctx)
+            sum = calculateSumDiff(str_opcode, left, right, width, ctx)
             blocks.add(sum.blocks)
             blocks.add(res_var.setAllValues(sum.value))
+
             res_val = False
 
           else:
             assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
-            scratch_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
 
             if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
               # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
-              res_val = sb3.Op(scratch_opcode, left, right)
+              res_val = sb3.Op(str_opcode, left, right)
             else:
-              res_val = sb3.Op("mod", sb3.Op(scratch_opcode, left, right),
+              res_val = sb3.Op("mod", sb3.Op(str_opcode, left, right),
                               sb3.Known(2 ** width))
 
         case ir.BinaryOpcode.Mul: # Multiply two values
@@ -2504,6 +2507,6 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx.proj.code.append(initblocks)
 
   # Optimise scratch project
-  #if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj, ignore_external_change={ctx.cfg.stack_size_var})
+  if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj, ignore_external_change={ctx.cfg.stack_size_var})
 
   return ctx.proj, debug_info

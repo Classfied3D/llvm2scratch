@@ -132,8 +132,9 @@ int main(void) {
   int m = l;
   float n = m;
 
-  long long o = 3;
+  long long o = 1;
   o += 2;
+  o -= 5;
 
   return 0;
 }
