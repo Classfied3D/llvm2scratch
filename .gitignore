@@ -8,6 +8,7 @@ examples/output
 examples/profile.out
 examples/input/main
 examples/input/main.ll
+examples/input/addition.ll
 examples/debug_branch_info.txt
 
 flamegraph.sh

@@ -316,8 +316,14 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
 
     case "load":
       assert result is not None
+      rest = raw_instr_no_res.split("load ", 1)[1].strip() \
+        .removeprefix("atomic ").removeprefix("volatile ")
+
+      loaded_type_str, _ = extractFirstType(rest)
+      loaded_type = decodeTypeStr(loaded_type_str, mod)
+
       value, *_ = instr.operands
-      return Load(result, decodeValue(value, mod))
+      return Load(result, loaded_type, decodeValue(value, mod))
 
     case "store":
       value, addr, *_ = instr.operands

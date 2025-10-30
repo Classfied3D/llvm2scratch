@@ -125,14 +125,14 @@ class ValueAndBlocks:
   blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
 
 @dataclass
-class IndexableValue:
+class IdxbleValue:
   """A collection of values that can be indexed over (e.g. a string)"""
-  vals: list[sb3.Value]
+  vals: list[sb3.Value] = field(default_factory=list)
 
 @dataclass
-class IndexableValueAndBlocks:
+class IdxbleValueAndBlocks:
   """An indexable value and any blocks that come before it needed to get that value"""
-  value: IndexableValue
+  value: IdxbleValue = field(default_factory=IdxbleValue)
   blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
 
 @dataclass
@@ -141,7 +141,7 @@ class Variable:
   var_type: Literal["global", "param", "var"]
   fn_name: str | None
 
-  def getRawVarName(self) -> str:
+  def getUnidxedRawVarName(self) -> str:
     match self.var_type:
       case "global":
         return f"@{self.var_name}"
@@ -153,15 +153,32 @@ class Variable:
       case _:
         raise CompException("Unmatched")
 
-  def getValue(self) -> sb3.Value:
-    name = self.getRawVarName()
+  def getRawVarName(self, index: int | None = None) -> str:
+    unidxed = self.getUnidxedRawVarName()
+    if index is None: return unidxed
+    return f"{unidxed}:{index}"
+
+  def getValue(self, index: int | None = None) -> sb3.Value:
+    name = self.getRawVarName(index)
     if self.var_type == "param":
       return sb3.GetParameter(name)
     return sb3.GetVar(name)
 
-  def setValue(self, value: sb3.Value, op: Literal["set", "change"]="set") -> sb3.Block:
+  def getAllValues(self, value_len: int) -> IdxbleValue:
+    values = []
+    for i in range(value_len):
+      values.append(self.getValue(i))
+    return IdxbleValue(values)
+
+  def setValue(self, value: sb3.Value, op: Literal["set", "change"]="set", index: int | None = None) -> sb3.Block:
     if self.var_type == "param": raise CompException(f"{self.var_name} param is read only")
-    return sb3.EditVar(op, self.getRawVarName(), value)
+    return sb3.EditVar(op, self.getRawVarName(index), value)
+
+  def setAllValues(self, values: IdxbleValue) -> sb3.BlockList:
+    blocks = sb3.BlockList()
+    for i, val in enumerate(values.vals):
+      blocks.add(self.setValue(val, index=i))
+    return blocks
 
 class CompException(Exception):
   """Exception in the compiler"""
@@ -228,8 +245,8 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int,
   return known_offset, unknown_offsets
 
 def transValue(val: ir.Value,
-                ctx: Context, bctx: BlockInfo | None,
-                is_global_init: bool=False) -> ValueAndBlocks | IndexableValueAndBlocks:
+               ctx: Context, bctx: BlockInfo | None,
+               is_global_init: bool=False) -> ValueAndBlocks | IdxbleValueAndBlocks:
   match val:
     case ir.LocalVarVal() | ir.ArgumentVal() | ir.GlobalVarVal():
       var = transVar(val, bctx)
@@ -239,6 +256,11 @@ def transValue(val: ir.Value,
           # Global variables store their address in their variable
           # when optimizations are enabled we use this address directly
           res = sb3.Known(ctx.globvar_to_ptr[val.name])
+
+      size = getByteSize(val.type)
+      if isinstance(val, (ir.LocalVarVal, ir.ArgumentVal)) and size > 1:
+        return IdxbleValueAndBlocks(var.getAllValues(size))
+
       return ValueAndBlocks(res)
 
     case ir.KnownIntVal():
@@ -258,7 +280,7 @@ def transValue(val: ir.Value,
         num = num // (2 ** VARIABLE_MAX_BITS)
         width -= VARIABLE_MAX_BITS
 
-      return IndexableValueAndBlocks(IndexableValue(values))
+      return IdxbleValueAndBlocks(IdxbleValue(values))
 
     case ir.KnownFloatVal():
       return ValueAndBlocks(sb3.Known(val.value))
@@ -271,7 +293,7 @@ def transValue(val: ir.Value,
         values.append(el_val)
         blocks.add(el_blocks)
 
-      return IndexableValueAndBlocks(IndexableValue(values), blocks)
+      return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
 
     case ir.ConstExprVal():
       gep = val.expr
@@ -491,6 +513,89 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, mid_val, True,
                                      _lo=_lo,     _hi=mid))])
 
+def recomputeRawSumChain(i: int, left: IdxbleValue, right: IdxbleValue, bit_mask: int) -> sb3.Value:
+  sum0 = sb3.Op("add", left.vals[0], right.vals[0])
+  prev = sum0
+  for j in range(1, i + 1):
+    sum_ab = sb3.Op("add", left.vals[j], right.vals[j])
+    carry = sb3.BoolOp(">", prev, sb3.Known(bit_mask))
+    raw_sum = sb3.Op("add", sum_ab, carry)
+    prev = raw_sum
+  return prev
+
+def calculateSum(left: IdxbleValue, right: IdxbleValue, width: int, ctx: Context) \
+    -> IdxbleValueAndBlocks:
+  n = len(left.vals)
+  assert n == len(right.vals)
+  assert n == math.ceil(width / VARIABLE_MAX_BITS)
+  if n == 0:
+    return IdxbleValueAndBlocks()
+
+  bit_mask = (2 ** VARIABLE_MAX_BITS) - 1
+
+  best_cost = float("inf")
+  best_blocks = sb3.BlockList()
+  best_sum_nodes: list[sb3.Value] = []
+
+  max_spacing = min(n, 10) # Tends to be about 3, no need to search much higher
+
+  for spacing in range(1, max_spacing + 1):
+    start_index = spacing
+    for omit_last in (False, True):
+      checkpoint_indices = set(range(start_index, n, spacing))
+      if omit_last and (n - 1) in checkpoint_indices:
+        checkpoint_indices.remove(n - 1)
+
+      cost = 0.0
+      blocks = sb3.BlockList()
+      sum_nodes: list[sb3.Value] = []
+      stored_temp_names: dict[int, str] = {}
+
+      for i in range(n):
+        modulus = 2 ** (VARIABLE_MAX_BITS if i != n - 1 else width % VARIABLE_MAX_BITS)
+
+        if i == 0:
+          raw = sb3.Op("add", left.vals[0], right.vals[0])
+          cost += optimizer.getValueCost(raw)
+        else:
+          earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
+          prev_stored = max(earlier_stored) if earlier_stored else None
+
+          if prev_stored is not None:
+            prev_node = sb3.GetVar(stored_temp_names[prev_stored])
+            prev = prev_node
+            for j in range(prev_stored + 1, i + 1):
+              sum_ab = sb3.Op("add", left.vals[j], right.vals[j])
+              carry = sb3.BoolOp(">", prev, sb3.Known(bit_mask))
+              carried_sum = sb3.Op("add", sum_ab, carry)
+              prev = carried_sum
+            raw = prev
+          else:
+            raw = recomputeRawSumChain(i, left, right, bit_mask)
+
+        if (i in checkpoint_indices) and (i >= start_index):
+          temp_name = genTempVar(ctx)
+          stored_temp_names[i] = temp_name
+          blocks.add(sb3.EditVar("set", temp_name, raw))
+          cost += optimizer.SET_VAR_COST + optimizer.getValueCost(raw)
+
+        if i in stored_temp_names:
+          expr_for_mod = sb3.GetVar(stored_temp_names[i])
+        else:
+          expr_for_mod = raw
+
+        mod_node = sb3.Op("mod", expr_for_mod, sb3.Known(modulus))
+        cost += optimizer.getValueCost(mod_node)
+
+        sum_nodes.append(mod_node)
+
+      if cost < best_cost:
+        best_cost = cost
+        best_blocks = blocks
+        best_sum_nodes = sum_nodes
+
+  return IdxbleValueAndBlocks(IdxbleValue(best_sum_nodes), best_blocks)
+
 def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
   ptr = sb3.GetVar(stack_size_var)
   if offset > 0:
@@ -521,7 +626,7 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
   for res_var, ir_val in phi_info:
     if isinstance(ir_val, ir.UndefVal): continue # Undef values do not need to be assigned
     val = transValue(ir_val, ctx, bctx)
-    if isinstance(val, IndexableValueAndBlocks):
+    if isinstance(val, IdxbleValueAndBlocks):
       raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(val.blocks)
     blocks.add(res_var.setValue(val.value))
@@ -533,7 +638,7 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
   blocks = sb3.BlockList()
   for arg in args:
     value = transValue(arg, ctx, bctx)
-    if isinstance(value, IndexableValueAndBlocks):
+    if isinstance(value, IdxbleValueAndBlocks):
       raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(value.blocks)
     arguments.append(value.value)
@@ -757,11 +862,18 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
 
-      if isinstance(address.value, IndexableValue):
+      if isinstance(address.value, IdxbleValue):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
+      byte_size = getByteSize(instr.loaded_type)
+
       var = transVar(instr.result, bctx)
-      blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
+      if byte_size == 1:
+        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
+      else:
+        blocks.add(var.setAllValues(IdxbleValue([
+          sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", address.value, sb3.Known(i))) for i in range(byte_size)
+        ])))
 
     case ir.Store(): # Copy a value to an address on the stack
       value = transValue(instr.value, ctx, bctx)
@@ -772,7 +884,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       blocks.add(address.blocks)
       address = address.value
 
-      if isinstance(address, IndexableValue):
+      if isinstance(address, IdxbleValue):
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
       if isinstance(value, sb3.Value):
@@ -793,7 +905,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       assert instr.opcode == ir.UnaryOpcode.FNeg # Only fneg exists in llvm ir
 
-      if isinstance(operand, IndexableValue):
+      if isinstance(operand, IdxbleValue):
         raise CompException(f"Indexable value not supported in unary op {instr}")
       assert isinstance(instr.operand.type, ir.FloatingPointTy)
 
@@ -812,32 +924,47 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert res_var.var_type != "param"
       res_val = None
 
-      if isinstance(left, IndexableValue) or \
-         isinstance(right, IndexableValue):
-        raise CompException(f"Indexable value not supported in binop {instr}")
+      match instr.opcode:
+        case ir.BinaryOpcode.Add:
+          pass
+        case _:
+          if isinstance(left, IdxbleValue) or \
+             isinstance(right, IdxbleValue):
+            raise CompException(f"Indexable value not supported in binop {instr}")
 
       match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
-            raise CompException(f"Instruction {instr} with opcode add only supports "
+            raise CompException(f"Instruction {instr} with opcode add/sub only supports "
                                 f"integers, got type {type(instr.left.type)}")
 
           width = instr.left.type.width
           # TODO FIX: support larger values by using multiple vars and carrying
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports "
-                                f"integers with <= {VARIABLE_MAX_BITS} bits")
+            if instr.opcode is ir.BinaryOpcode.Sub:
+              raise CompException(f"Instruction {instr} opcode sub currently supports "
+                                  f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-          scratch_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+            assert isinstance(left, IdxbleValue) and isinstance(right, IdxbleValue)
 
-          if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
-            # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
-            res_val = sb3.Op(scratch_opcode, left, right)
+            sum = calculateSum(left, right, width, ctx)
+            blocks.add(sum.blocks)
+            blocks.add(res_var.setAllValues(sum.value))
+            res_val = False
+
           else:
-            res_val = sb3.Op("mod", sb3.Op(scratch_opcode, left, right),
-                             sb3.Known(2 ** width))
+            assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+            scratch_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+
+            if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
+              # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
+              res_val = sb3.Op(scratch_opcode, left, right)
+            else:
+              res_val = sb3.Op("mod", sb3.Op(scratch_opcode, left, right),
+                              sb3.Known(2 ** width))
 
         case ir.BinaryOpcode.Mul: # Multiply two values
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -851,6 +978,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             res_val = blocks_and_value.value
 
         case ir.BinaryOpcode.UDiv: # Divide one value by another (unsigned)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           # TODO OPTI: optimise for known values
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -869,6 +997,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             res_val = sb3.Op("div", left, right) # Value is poison if one is not a multiple of another
 
         case ir.BinaryOpcode.SDiv: # Divide one value by another (signed)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -930,6 +1059,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.URem: # Calculate remainder (unsigned)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -944,6 +1074,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = sb3.Op("mod", left, right)
 
         case ir.BinaryOpcode.SRem: # Calculate remainder (signed)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           # TODO OPTI: optimise for known values
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -1024,6 +1155,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.Shl: # Calculate left shift
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1038,6 +1170,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
 
         case ir.BinaryOpcode.LShr: # Calculate right shift (unsigned)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1052,6 +1185,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
 
         case ir.BinaryOpcode.AShr: # Calculate right shift (signed)
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1086,6 +1220,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor: # Calculate binary operation
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy): # TODO: add vector support
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1148,6 +1283,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
         case ir.BinaryOpcode.FAdd | ir.BinaryOpcode.FSub | \
              ir.BinaryOpcode.FMul | ir.BinaryOpcode.FDiv: # Basic float operations
+           assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
 
            op_lookup: dict[ir.BinaryOpcode, Literal["add", "sub", "mul", "div"]] = {
             ir.BinaryOpcode.FAdd: "add", ir.BinaryOpcode.FSub: "sub",
@@ -1161,6 +1297,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
            res_val = sb3.Op(op_lookup[instr.opcode], left, right)
 
         case ir.BinaryOpcode.FRem: # Float remainder
+          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.FloatingPointTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"floats, got type {type(instr.left.type)}")
@@ -1725,7 +1862,7 @@ def transTerminatorInstr(instr: ir.Instr,
     case ir.Ret(): # Return from a func
       if instr.value is not None:
         value = transValue(instr.value, ctx, bctx)
-        if isinstance(value.value, IndexableValue):
+        if isinstance(value.value, IdxbleValue):
           raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
         blocks.add(sb3.EditVar("set", ctx.cfg.return_var, value.value))
@@ -1775,7 +1912,7 @@ def transTerminatorInstr(instr: ir.Instr,
       blocks.add(assignParameters(bctx.available_params, poss_depends))
 
       cond = transValue(instr.cond, ctx, bctx)
-      if isinstance(cond.value, IndexableValue):
+      if isinstance(cond.value, IdxbleValue):
         raise CompException(f"Indexable value not supported for brach condition {instr}")
       blocks.add(cond.blocks)
 
@@ -2211,7 +2348,7 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
       unknown = len(blocks_and_value.blocks) > 0
       value = blocks_and_value.value
 
-      if isinstance(value, IndexableValue):
+      if isinstance(value, IdxbleValue):
         unknown |= not all([isinstance(val, sb3.Known) for val in value.vals])
       else:
         unknown |= not isinstance(value, sb3.Known)
@@ -2223,7 +2360,7 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
         case sb3.Known():
           size = total_size
           values.append(value)
-        case IndexableValue():
+        case IdxbleValue():
           assert isinstance(glob.type, ir.ArrayTy)
           size = getByteSize(glob.type.inner)
           values.extend(value.vals)
@@ -2367,6 +2504,6 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx.proj.code.append(initblocks)
 
   # Optimise scratch project
-  if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj, ignore_external_change={ctx.cfg.stack_size_var})
+  #if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj, ignore_external_change={ctx.cfg.stack_size_var})
 
   return ctx.proj, debug_info

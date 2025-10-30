@@ -62,7 +62,6 @@ void numberize(char* str) {
 }
 
 int main(void) {
-  a += 2;
   a -= 4;
   a *= 2;
   a /= -3;
@@ -133,8 +132,8 @@ int main(void) {
   int m = l;
   float n = m;
 
-  long long a = 3;
-  //a += 2;
+  long long o = 3;
+  o += 2;
 
   return 0;
 }

@@ -276,6 +276,7 @@ class Alloca(Instr, HasResult):
 
 @dataclass
 class Load(Instr, HasResult):
+  loaded_type: Type
   address: Value
 
 @dataclass
