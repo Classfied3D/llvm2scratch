@@ -119,7 +119,7 @@ class DoubleTy(FloatingPointTy):
 class Fp128Ty(FloatingPointTy):
   pass
 
-class PointerTy(VecTargetTy):
+class PointerTy(VecTargetTy, AggTargetTy):
   pass
 
 @dataclass
@@ -138,6 +138,7 @@ class ArrayTy(AggTargetTy):
 @dataclass
 class StructTy(AggTargetTy):
   name: str
+  is_packed: bool
   members: list[AggTargetTy]
 
 @dataclass
@@ -147,7 +148,7 @@ class Value:
 class KnownVal(Value):
   pass
 
-class KnownArrTargetVal(Value):
+class KnownAggTargetVal(Value):
   pass
 
 class KnownVecTargetVal(Value):
@@ -168,36 +169,44 @@ class LocalVarVal(Value):
   name: str
 
 @dataclass
-class GlobalVarVal(Value):
+class GlobalVarVal(KnownVal, KnownAggTargetVal):
   name: str
 
 @dataclass
-class UndefVal(KnownVal, KnownVecTargetVal, KnownArrTargetVal):
+class NullPtrVal(KnownVal, KnownAggTargetVal):
   pass
 
 @dataclass
-class KnownIntVal(KnownVal, KnownVecTargetVal, KnownArrTargetVal):
+class UndefVal(KnownVal, KnownVecTargetVal, KnownAggTargetVal):
+  pass
+
+@dataclass
+class KnownIntVal(KnownVal, KnownVecTargetVal, KnownAggTargetVal):
   value: int
   width: int
 
 @dataclass
-class KnownFloatVal(KnownVal, KnownVecTargetVal, KnownArrTargetVal):
+class KnownFloatVal(KnownVal, KnownVecTargetVal, KnownAggTargetVal):
   value: float
 
 @dataclass
-class KnownVecVal(KnownVal, KnownArrTargetVal):
+class KnownVecVal(KnownVal, KnownAggTargetVal):
   values: list[KnownVecTargetVal]
 
 @dataclass
-class KnownArrVal(KnownVal, KnownArrTargetVal):
-  values: list[KnownArrTargetVal]
+class KnownArrVal(KnownVal, KnownAggTargetVal):
+  values: list[KnownAggTargetVal]
+
+@dataclass
+class KnownStructVal(KnownVal, KnownAggTargetVal):
+  values: list[KnownAggTargetVal]
 
 @dataclass
 class LabelVal(Value):
   label: str
 
 @dataclass
-class ConstExprVal(KnownVal):
+class ConstExprVal(KnownVal, KnownAggTargetVal):
   expr: GetElementPtr
 
 class Instr:

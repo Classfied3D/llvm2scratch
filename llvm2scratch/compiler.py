@@ -2393,11 +2393,7 @@ def initLocalStack(ctx: Context) -> sb3.BlockList:
     ]))
   ])
 
-def addFunc(name: str, params: list[str], total_alloca_size: int, contents: sb3.BlockList, ctx: Context) -> Context:
-  """
-  total_alloca_size: int of how much the function allocates to the stack.
-  0 if it doesn't, None if a not fixed amount.
-  """
+def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context) -> Context:
   localized_params = [Variable(param, "param", name) for param in params]
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
@@ -2416,7 +2412,7 @@ def addForeignFunctions(ctx: Context) -> Context:
       ascii_lookup.append(char)
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
 
-  ctx = addFunc("SB3_say_str", ["input"], 0, sb3.BlockList([
+  ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
     sb3.EditVar("set", "buffer", sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
@@ -2434,14 +2430,14 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
-  ctx = addFunc("SB3_say_char", ["input"], 0, sb3.BlockList([
+  ctx = addFunc("SB3_say_char", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex",
       (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
       sb3.GetParameter(localizeParameter("input")))),
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
-  ctx = addFunc("SB3_say_dbl", ["input"], 0, sb3.BlockList([
+  ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetParameter(localizeParameter("input"))),
   ]), ctx)
 

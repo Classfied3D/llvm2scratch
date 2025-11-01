@@ -8,8 +8,12 @@ from .ir import *
 def decodeTypeStr(type_str: str, mod: llvm.ModuleRef) -> Type:
   if type_str == "void":
     return VoidTy()
-  ir = "\n".join(str(struct) for struct in mod.struct_types) \
-    + f"""
+  init_stucts = ""
+  for struct in mod.struct_types:
+    # Some types created in global values are included
+    if str(struct).startswith("%"):
+      init_stucts += str(struct) + "\n"
+  ir = init_stucts + f"""
   declare void @dummy({type_str})
   """
   mod = llvm.parse_assembly(ir)
@@ -47,17 +51,15 @@ def getGEPConstExprStr(gep_str: str, mod: llvm.ModuleRef) -> GetElementPtr:
 
   gep_str = "getelementptr " + rest
 
-  ir = "\n".join(str(struct) for struct in mod.struct_types) + \
-        "\n".join(str(glob) for glob in mod.global_variables) + \
-  f"""
-  define void @dummy() {{
+  ir = f"""{str(mod)}
+  define void @dummy_parse_func() {{
     {gep_str}
     ret void
   }}
   """
 
   mod = llvm.parse_assembly(ir)
-  func = next(mod.functions)
+  func = list(mod.functions)[-1]
   block = next(func.blocks)
   instr = next(block.instructions)
   parsed_instr = decodeInstr(instr, mod)
@@ -103,7 +105,8 @@ def decodeType(type: llvm.TypeRef) -> Type:
       members = [decodeType(ty) for ty in type.elements]
       assert all(isinstance(mem, AggTargetTy) for mem in members)
       members = cast(list[AggTargetTy], members)
-      return StructTy(name, members)
+      is_packed = str(type).replace(" ", "").startswith("<{")
+      return StructTy(name, is_packed, members)
 
     case _:
       raise ValueError(f"Unknown type: {type.type_kind.name}")
@@ -444,7 +447,7 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
   for glob in mod.global_variables:
     glob_name = glob.name
 
-    rest = str(glob).strip()
+    rest = str(glob).split("=", 1)[1].strip()
     if "constant" in rest:
       glob_constant = True
       rest = rest.split("constant", 1)[-1].strip()
@@ -457,7 +460,7 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
     if len(rest) == 0 or rest.startswith(","):
       glob_init = None
     else:
-      glob_init = valueFromInitializerText(rest.rsplit(",", 1)[0].strip(), type, lambda string: getGEPConstExprStr(string, mod))
+      glob_init = valueFromInitializerText(rest.rsplit(", align", 1)[0].strip(), type, lambda string: getGEPConstExprStr(string, mod))
       assert isinstance(glob_init, (KnownVal, GlobalVarVal, ConstExprVal))
 
     glob_vars.update({glob_name: GlobalVar(glob_name, type, glob_constant, glob_init)})

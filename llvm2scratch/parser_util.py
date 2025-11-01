@@ -1,15 +1,17 @@
-from typing import Any
+from llvm2scratch.ir import KnownAggTargetVal
+from llvm2scratch.ir import KnownIntVal
+from typing import Any, Optional, cast
 import re
 
 from . ir import *
 
-# Regexes used
-_FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
-_INT_IN_TYPE_RE = re.compile(r"\b[iI]\d+\s+(-?\d+)\b")
-_CSTRING_RE = re.compile(r"c\"((?:[^\"\\]|\\.)*)\"")
-_INITLINE_RE = re.compile(r"=\s*(?:global|constant)\s*(.+)$")
+FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
+TYPE_NAME_RE = re.compile(r'%[A-Za-z0-9._]+')
+INT_IN_TYPE_RE = re.compile(r"\b[iI]\d+\s+(-?\d+)\b")
+CSTRING_RE = re.compile(r'c"((?:\\.|[^"])*)"')
+INITLINE_RE = re.compile(r"=\s*(?:global|constant)\s*(.+)$")
 
-_RETURN_ATTRS = [
+RETURN_ATTRS = [
   "zeroext", "signext", "noext", "inreg",
   "sret", "byval", "byref", "preallocated",
   "inalloca", "elementtype", "alignstack",
@@ -23,11 +25,407 @@ _RETURN_ATTRS = [
 ]
 
 # Build regex that matches any of them, optionally with (<...>) or <n> arguments
-_ATTR_RE = re.compile(
-  r"^(?:" + "|".join(map(re.escape, _RETURN_ATTRS)) + r")(\s*\([^)]*\))?\s+"
+ATTR_RE = re.compile(
+  r"^(?:" + "|".join(map(re.escape, RETURN_ATTRS)) + r")(\s*\([^)]*\))?\s+"
 )
 
-# ---------- Helpers ----------
+def extractBracketContent(s: str, start: int) -> tuple[str,int]:
+  openCh = s[start]
+  pairs = {'<':'>','[':']','{':'}','(':')'}
+  if openCh not in pairs:
+    raise ValueError("not a bracket at start")
+  closeCh = pairs[openCh]
+  i = start + 1
+  depth = 1
+  contentStart = i
+  L = len(s)
+  while i < L and depth > 0:
+    c = s[i]
+    if c == '"':
+      j = i + 1
+      while j < L:
+        if s[j] == '"' and s[j-1] != '\\':
+          i = j
+          break
+        j += 1
+    elif c == openCh:
+      depth += 1
+    elif c == closeCh:
+      depth -= 1
+      if depth == 0:
+        return s[contentStart:i], i+1
+    i += 1
+  raise ValueError("unmatched bracket")
+
+def splitTopLevelCommas(s: str) -> list[str]:
+  elems = []
+  i = 0
+  start = 0
+  stack = []
+  l = len(s)
+  pairs = {'<':'>','{':'}','[':']','(':')'}
+  opens = set(pairs.keys()); closes = set(pairs.values())
+  in_quote = False
+  while i < l:
+    c = s[i]
+    if c == '"' and (i == 0 or s[i-1] != '\\'):
+      in_quote = not in_quote
+      i += 1
+      continue
+    if in_quote:
+      i += 1
+      continue
+    if c in opens:
+      stack.append(c)
+    elif c in closes:
+      if stack:
+        top = stack[-1]
+        if pairs.get(top) == c:
+          stack.pop()
+        else:
+          stack.pop()
+    elif c == ',' and not stack:
+      elems.append(s[start:i].strip())
+      start = i+1
+    i += 1
+  last = s[start:].strip()
+  if last:
+    elems.append(last)
+  return elems
+
+def isTypeToken(tok: str) -> bool:
+  tok = tok.strip()
+  if re.fullmatch(r'\[\s*\d+\s*x\b[^\]]+\]', tok):
+    return True
+  if re.fullmatch(r'(?:i\d+|ptr|float|double|void|int|char|i8|i16|i32|i64|i128)', tok):
+    return True
+  if TYPE_NAME_RE.fullmatch(tok):
+    return True
+  return False
+
+def isTypeOnly(content: str) -> bool:
+  if not content:
+    return False
+  if re.search(r'c"|zeroinitializer|@|null|getelementptr\b', content):
+    return False
+  if re.match(r'^\s*\d+\s*x\b', content):
+    return True
+  pieces = splitTopLevelCommas(content)
+  if not pieces:
+    return False
+  for p in pieces:
+    p = p.strip()
+    if isTypeToken(p):
+      continue
+    m = re.match(r'^(%[A-Za-z0-9._]+)\s*(\{.*\})$', p, re.S)
+    if m:
+      inner = m.group(2)
+      if inner.startswith('{') and inner.endswith('}') and isTypeOnly(inner[1:-1].strip()):
+        continue
+    if p.startswith('{') and p.endswith('}'):
+      inner = p[1:-1].strip()
+      if isTypeOnly(inner):
+        continue
+      return False
+    if p.startswith('<{') and p.endswith('}>'):
+      inner = p[2:-2].strip()
+      if isTypeOnly(inner):
+        continue
+      return False
+    return False
+  return True
+
+def decodeLLVMCStringLiteral(inner: str) -> list[int]:
+  def hex_to_x(m): return "\\x"+m.group(1)
+  s = re.sub(r"\\([0-F]{2})", hex_to_x, inner)
+  try:
+    decoded_bytes = s.encode("utf-8").decode("unicode_escape").encode("latin-1")
+  except Exception:
+    out=bytearray(); i=0; L=len(s)
+    while i < L:
+      if s[i]=='\\' and i+1 < L and s[i+1]=='x':
+        out.append(int(s[i+2:i+4],16)); i+=4
+      else:
+        out.append(ord(s[i])); i+=1
+    decoded_bytes = bytes(out)
+  return list(decoded_bytes)
+
+def stripLeadingTypes(s: str) -> str:
+  s = s.strip()
+  if not s: return s
+  if s[0] in '<[{(':
+    return s
+  if s.startswith('c"') or s.startswith('@') or s.startswith('%') or s.startswith('getelementptr') or s.startswith('null') or s[0] == '-' or s[0].isdigit():
+    return s
+  parts = s.split(None, 1)
+  return parts[1] if len(parts) > 1 else parts[0]
+
+def readAdjacentValueAfterType(elem: str, decode_gep_str_func) -> Optional[Any]:
+  elem = elem.strip()
+
+  if elem.startswith("getelementptr"):
+    return parseScalarToken(elem, decode_gep_str_func)
+
+  m = re.match(r'^\s*\[\s*(\d+)\s*x\s*[^\]]+\]\s*(.+)$', elem, re.S)
+  if m:
+    rest = m.group(2).strip()
+    if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
+      return None
+    if rest.startswith('c"'):
+      mm = CSTRING_RE.match(rest)
+      if mm:
+        return decodeLLVMCStringLiteral(mm.group(1))
+    if rest.startswith('zeroinitializer'):
+      return "zeroinitializer"
+    if rest and rest[0] in '<[{(':
+      return parseInitializer(rest, decode_gep_str_func)
+    if rest.startswith('@') or rest.startswith('%'):
+      return rest
+    num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
+    if num_m:
+      tok = num_m.group(0)
+      try:
+        if tok.lower().startswith('0x'):
+          return int(tok, 16)
+        return int(tok, 10)
+      except:
+        return rest
+    return rest
+
+  if elem and elem[0] in '<{(':
+    try:
+      grp, after = extractBracketContent(elem, 0)
+    except ValueError:
+      return None
+    rest = elem[after:].strip()
+    if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
+      return None
+    if rest.startswith('c"'):
+      mm = CSTRING_RE.match(rest)
+      if mm:
+        return decodeLLVMCStringLiteral(mm.group(1))
+    if rest.startswith('zeroinitializer'):
+      return "zeroinitializer"
+    if rest and rest[0] in '<[{(':
+      return parseInitializer(rest, decode_gep_str_func)
+    if rest.startswith('@') or rest.startswith('%'):
+      return rest
+    num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
+    if num_m:
+      tok = num_m.group(0)
+      try:
+        if tok.lower().startswith('0x'):
+          return int(tok, 16)
+        return int(tok, 10)
+      except:
+        return rest
+    return None
+  return None
+
+def findDataBracket(s: str, start: int = 0) -> tuple[str,int]:
+  pos = start; L=len(s)
+  while pos < L and s[pos].isspace(): pos+=1
+  if pos >= L or s[pos] not in '<[{': raise ValueError("expected bracket at start")
+  while pos < L and s[pos] in '<[{':
+    content, after = extractBracketContent(s, pos)
+    if re.search(r'c"|zeroinitializer|@|null|getelementptr\b', content) or not isTypeOnly(content):
+      return content, after
+    k=0; groups=[]
+    while k < len(content):
+      while k < len(content) and content[k].isspace(): k+=1
+      if k >= len(content): break
+      if content[k] in '<[{':
+        inner, inner_after = extractBracketContent(content, k)
+        groups.append((inner, k, inner_after))
+        k = inner_after; continue
+      k += 1
+    for inner, _, inner_after in groups:
+      if re.search(r'c"|zeroinitializer|@|null|getelementptr\b', inner) or not isTypeOnly(inner):
+        abs_after = pos + inner_after
+        return inner, abs_after
+    pos = after
+    while pos < L and s[pos].isspace(): pos+=1
+    if pos >= L or s[pos] not in '<[{': return content, after
+  return content, after
+
+def parseScalarToken(s: str, decode_gep_str_func) -> Any:
+  s = s.strip()
+
+  if s.startswith("getelementptr"):
+    return decode_gep_str_func(s)
+
+  s = s.strip()
+  if not s: return None
+  m = CSTRING_RE.match(s)
+  if m and s.startswith('c"'): return decodeLLVMCStringLiteral(m.group(1))
+  adj = readAdjacentValueAfterType(s, decode_gep_str_func)
+  if adj is not None: return adj
+  s2 = stripLeadingTypes(s).strip()
+  if not s2: return None
+  if s2 == 'null': return None
+  if s2.startswith('@') or s2.startswith('%'): return s2
+  num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', s2)
+  if num_m:
+    tok = num_m.group(0)
+    try:
+      if tok.lower().startswith('0x'): return int(tok,16)
+      return int(tok,10)
+    except: pass
+  if s2.startswith('getelementptr'):
+    idx = s2.find('(')
+    if idx != -1:
+      depth = 0; i = idx; L = len(s2)
+      while i < L:
+        if s2[i] == '(':
+          depth += 1
+        elif s2[i] == ')':
+          depth -= 1
+          if depth == 0:
+            return s2[:i+1].strip()
+        i += 1
+    return s2
+  if s2 and s2[0] in '<[{(':
+    return parseInitializer(s2, decode_gep_str_func)
+  return s2
+
+def parseInitializer(init_text: str, decode_gep_str_func) -> Any:
+  s = init_text.strip()
+  if not s:
+    return None
+
+  # direct getelementptr -> delegate to scalar handler / decode function
+  if s.startswith("getelementptr"):
+    return parseScalarToken(s, decode_gep_str_func)
+
+  # direct c-string
+  m = CSTRING_RE.match(s)
+  if m and s.startswith('c"'):
+    return decodeLLVMCStringLiteral(m.group(1))
+
+  # bracketed forms
+  if s[0] in '<[{(':
+    try:
+      first_content, pos_after_first = extractBracketContent(s, 0)
+    except ValueError:
+      return parseScalarToken(s, decode_gep_str_func)
+
+    # If the first bracket looks like a pure type spec and there's an adjacent
+    # value (e.g. "[N x i8] c'...'" or "{ i8 } c'...'"), parse that adjacent value
+    rest = s[pos_after_first:].lstrip()
+    if isTypeOnly(first_content) and rest:
+      if rest.startswith('c"'):
+        mm = CSTRING_RE.match(rest)
+        if mm:
+          return decodeLLVMCStringLiteral(mm.group(1))
+      if rest.startswith('zeroinitializer'):
+        return "zeroinitializer"
+      if rest.startswith('getelementptr'):
+        return parseScalarToken(rest, decode_gep_str_func)
+      if rest and rest[0] in '<[{(':
+        return parseInitializer(rest, decode_gep_str_func)
+      if rest.startswith('@') or rest.startswith('%'):
+        return rest
+      num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
+      if num_m:
+        tok = num_m.group(0)
+        try:
+          if tok.lower().startswith('0x'):
+            return int(tok, 16)
+          return int(tok, 10)
+        except:
+          pass
+
+    # At this point we are dealing with a real bracketed aggregate.
+    # Remember the opening bracket to preserve semantics later.
+    open_ch = s[0]
+
+    try:
+      outer_content, pos_after = extractBracketContent(s, 0)
+    except ValueError:
+      return parseScalarToken(s, decode_gep_str_func)
+
+    # findDataBracket returns the bracket that actually contains data (skipping type-only wrappers)
+    try:
+      data_content, data_after = findDataBracket(s, 0)
+    except Exception:
+      return parseScalarToken(s, decode_gep_str_func)
+
+    top_elems = splitTopLevelCommas(outer_content)   # elements as written in outer bracket
+    data_elems = splitTopLevelCommas(data_content)   # the actual data elements we will parse
+
+    parsed: list[Any] = []
+    for de in data_elems:
+      de = de.strip()
+      # If element is a named aggregate "%name { ... }", parse the inner braces
+      m_named = re.match(r'^(%[A-Za-z0-9._]+)\s*(\{.*\})$', de, re.S)
+      if m_named:
+        inner = m_named.group(2)
+        parsed.append(parseInitializer(inner, decode_gep_str_func))
+        continue
+
+      # If it's an adjacency like "[N x T] c'...'" or "{ T } value", read it
+      adj = readAdjacentValueAfterType(de, decode_gep_str_func)
+      if adj is not None:
+        parsed.append(adj)
+        continue
+
+      # Otherwise strip a leading type token and parse recursively
+      cleaned = stripLeadingTypes(de)
+      parsed.append(parseInitializer(cleaned, decode_gep_str_func))
+
+    #
+    # Deterministic wrapping rules
+    #
+
+    # 1) If outer bracket is array-like ('<' or '['):
+    #    - if outer had multiple top-level elements -> return parsed as-is
+    #    - if outer had exactly one top-level element:
+    #        * if parsed is a single byte-array (list[int]) produced from a c"..." adjacency,
+    #          return that byte-array directly (user wanted plain byte arrays for c"...")
+    #        * if parsed is a single aggregate (i.e. parsed == [[...]]), keep that aggregate
+    #          (return parsed) so we represent "array containing one aggregate" as [[...]]
+    #        * otherwise return [parsed] to represent an array with one element
+    if open_ch in '[<':
+      if len(top_elems) == 1:
+        if len(parsed) == 1 and isinstance(parsed[0], list) and all(isinstance(x, int) for x in parsed[0]):
+          # special-case: [ { i8 } c"..." ] -> c"..." -> list[int]
+          return parsed[0]
+        if len(parsed) == 1 and isinstance(parsed[0], list):
+          # already a single aggregate inside (e.g. parsed == [[...]]), return as-is
+          return parsed
+        # otherwise return an array containing the parsed element(s)
+        return [parsed]
+      else:
+        return parsed
+
+    # 2) If outer bracket is an aggregate ('{' or '('):
+    #    - aggregates should preserve one-level aggregate semantics.
+    #    - If parsed has exactly one inner aggregate (parsed == [[...]]), return
+    #      a wrapper list so the outer aggregate is preserved: [[...]]
+    #    - Otherwise return parsed (list of field values)
+    if open_ch in '{(':
+      if len(parsed) == 1 and isinstance(parsed[0], list):
+        return [parsed[0]]
+      return parsed
+
+    # fallback
+    return parsed
+
+  # Non-bracketed: maybe multiple top-level comma-separated parts
+  parts = splitTopLevelCommas(s)
+  if len(parts) > 1:
+    return [parseScalarToken(stripLeadingTypes(p), decode_gep_str_func) for p in parts]
+
+  return parseScalarToken(s, decode_gep_str_func)
+
+def stripReturnAttrs(rest: str) -> str:
+  s = rest.strip()
+  while True:
+    m = ATTR_RE.match(s)
+    if not m:
+      break
+    s = s[m.end():].lstrip()
+  return s
 
 def findMatchingBracket(s, start) -> int:
   """Given s[start] is one of '<[{', find index of matching closing bracket.
@@ -60,224 +458,6 @@ def findMatchingBracket(s, start) -> int:
     i += 1
   raise ValueError("No matching closing bracket for {} at pos {}".format(open_ch, start))
 
-def stripReturnAttrs(rest: str) -> str:
-  s = rest.strip()
-  while True:
-    m = _ATTR_RE.match(s)
-    if not m:
-      break
-    s = s[m.end():].lstrip()
-  return s
-
-def extractBracketContent(s, start) -> tuple[str, int]:
-  """Return (content_string, end_index_plus_one).
-     start must point at an opening bracket char (<, [, {)."""
-  end = findMatchingBracket(s, start)
-  return s[start+1:end], end+1
-
-def splitTopLevelCommas(s):
-  """
-  Split s on commas that are at top-level (not nested inside < >, [ ], { } or quotes).
-  Returns list of substrings (stripped).
-  """
-  parts = []
-  buf = []
-  depth = 0
-  i = 0
-  n = len(s)
-  while i < n:
-    c = s[i]
-    if c in "<[{":
-      # consume full bracket expression
-      j = i
-      end = findMatchingBracket(s, i)
-      buf.append(s[i:end+1])
-      i = end + 1
-      continue
-    if c == '"':
-      # copy quoted string including escapes
-      j = i + 1
-      buf.append(c)
-      while j < n:
-        buf.append(s[j])
-        if s[j] == '"' and s[j-1] != "\\":
-          break
-        j += 1
-      i = j + 1
-      continue
-    if c == "," and depth == 0:
-      parts.append("".join(buf).strip())
-      buf = []
-      i += 1
-      continue
-    # track parentheses depth for safety (though we handled the main bracket types)
-    if c in ">]})":
-      # shouldn't happen if bracket handling works, but keep char
-      buf.append(c)
-    else:
-      buf.append(c)
-    i += 1
-  if buf:
-    parts.append("".join(buf).strip())
-  # remove empty parts (possible from extra commas)
-  return [p for p in parts if p != ""]
-
-
-def _decodeLLVMCStringLiteral(inner) -> list[int]:
-  """
-  Decode the contents found inside c"..." in LLVM IR.
-  Handles simple escapes and octal escapes like \00.
-  Returns a list of integer byte values (0..255) instead of bytes.
-  """
-  # convert octal escapes \NNN to \xHH sequences
-  def hex_to_x(m):
-    return "\\x" + m.group(1)
-  s = re.sub(r"\\([0-F]{2})", hex_to_x, inner)
-  # Now interpret standard backslash escapes and \xHH
-  # We'll decode via 'unicode_escape' then map to bytes (latin-1) and convert to ints.
-  try:
-    decoded_bytes = s.encode("utf-8").decode("unicode_escape").encode("latin-1")
-  except Exception:
-    # fallback: naively replace \xHH occurrences
-    out = bytearray()
-    i = 0
-    while i < len(s):
-      if s[i] == "\\" and i+1 < len(s) and s[i+1] == "x":
-        hexv = s[i+2:i+4]
-        out.append(int(hexv, 16))
-        i += 4
-      else:
-        out.append(ord(s[i]))
-        i += 1
-    decoded_bytes = bytes(out)
-  return list(decoded_bytes)
-
-
-# ---------- Core parsing ----------
-
-def parseScalarToken(tok: str, decode_gep_str_func) -> int | float | None | str | list[int] | GetElementPtr:
-  """
-  Parse a scalar token like:
-    - "float 1.000000e+00" -> float
-    - "1.0000e+00" -> float
-    - "i32 42" -> int
-    - "42" -> int
-    - "undef" -> None (keeps as None)
-    - "null" -> None
-  """
-
-  t = tok.strip()
-
-  if t.startswith("getelementptr"):
-    return decode_gep_str_func(t)
-
-  if not t:
-    return t
-  # c"..." handled elsewhere
-  if t == "undef" or t == "zeroinitializer" or t == "null":
-    return None
-  if t.startswith("@"):
-    return t
-  # match c"..." pattern
-  m = _CSTRING_RE.search(t)
-  if m:
-    # return list of ints for the string literal
-    return _decodeLLVMCStringLiteral(m.group(1))
-  # float with a leading "float" keyword
-  if t.startswith("float "):
-    num = t[len("float "):].strip()
-    try:
-      return float(num)
-    except Exception:
-      pass
-  # integer with leading type "i32 42" etc
-  m = _INT_IN_TYPE_RE.match(t)
-  if m:
-    return int(m.group(1))
-  # try float literal
-  m = _FLOAT_RE.search(t)
-  if m:
-    toknum = m.group(0)
-    # decide int vs float
-    if re.match(r"^[+-]?\d+$", toknum):
-      return int(toknum)
-    else:
-      return float(toknum)
-  # fallback: return raw token
-  return t
-
-
-def parseInitializer(init_text, decode_gep_str_func) -> float | int | list[int] | list[Any] | str | GetElementPtr | None:
-  """
-  Parse the initializer string and return Python structure:
-    - list[int] for c"..." style constant-data arrays
-    - list for aggregates
-    - scalar for single scalar
-    - string fallback otherwise
-  """
-  s = init_text.strip()
-
-  if s.startswith("getelementptr"):
-    return parseScalarToken(s, decode_gep_str_func)
-
-  # 1) c"..." immediate -> list[int]
-  m = _CSTRING_RE.search(s)
-  if m and s.strip().startswith("c\""):
-    return _decodeLLVMCStringLiteral(m.group(1))
-
-  # 2) If begins with a bracket, it may be a type specifier followed by data
-  if s and s[0] in "<[{":
-    # extract first bracketed group
-    try:
-      first_content, pos_after_first = extractBracketContent(s, 0)
-    except ValueError:
-      # can't parse bracket; fallback to scalar parse
-      return parseScalarToken(s, decode_gep_str_func)
-
-    # decide if the first group is a type-spec (contains 'x' and a type)
-    if re.search(r"\b\d+\s*x\b", first_content) or re.search(r"\bx\b", first_content):
-      # likely a type spec; skip whitespace and check for a following bracket/data
-      rest = s[pos_after_first:].lstrip()
-      if rest and rest[0] in "<[{":
-        # parse the next bracketed part as the real data
-        data_content, pos_after_data = extractBracketContent(rest, 0)
-        elems = splitTopLevelCommas(data_content)
-        return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
-      # NEW: if rest contains a c"..." constant-data string, decode it
-      m_c = _CSTRING_RE.search(rest)
-      if m_c:
-        return _decodeLLVMCStringLiteral(m_c.group(1))
-      else:
-        # no separate data bracket and no c"..." — maybe the first bracket included elements
-        elems = splitTopLevelCommas(first_content)
-        return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
-    else:
-      # first bracket likely contains actual data elements
-      elems = splitTopLevelCommas(first_content)
-      return [parseInitializer(elem, decode_gep_str_func) for elem in elems]
-
-  # 3) If it looks like an array/vector without an outer bracket (rare),
-  #    split top-level commas directly.
-  top_elems = splitTopLevelCommas(s)
-  if len(top_elems) > 1:
-    return [parseInitializer(elem, decode_gep_str_func) for elem in top_elems]
-
-  # 4) Else try scalar
-  return parseScalarToken(s, decode_gep_str_func)
-
-# ---------- Convenience wrapper ----------
-
-def decodeGlobalInitializerText(global_str, decode_gep_str_func):
-  """Given str(gv) or initializer string, extract initializer fragment and parse."""
-
-  m = _INITLINE_RE.search(global_str.strip())
-  if m:
-    init_text = m.group(1).strip()
-    return parseInitializer(init_text, decode_gep_str_func)
-  else:
-    # If not a full global line, assume the whole string is the initializer itself
-    return parseInitializer(global_str, decode_gep_str_func)
-
 def valueFromParsed(parsed: Any, typ: Type) -> Value:
   """
   Build a Value (KnownIntVal / KnownFloatVal / KnownVecVal / KnownArrVal, etc)
@@ -288,6 +468,9 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
   """
 
   if isinstance(typ, IntegerTy):
+    if parsed == "zeroinitializer":
+      return KnownIntVal(typ, 0, typ.width)
+
     if isinstance(parsed, int):
       return KnownIntVal(typ, parsed, typ.width)
 
@@ -315,23 +498,28 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
     return KnownVecVal(typ, vec_values)
 
   elif isinstance(typ, ArrayTy):
+    if parsed == "zeroinitializer":
+      values = [valueFromParsed("zeroinitializer", typ.inner) for _ in range(typ.size)]
+      assert all([isinstance(value, KnownAggTargetVal) for value in values])
+      return KnownArrVal(typ, [cast(KnownAggTargetVal, value) for value in values])
+
     if not isinstance(parsed, list):
       raise ValueError(f"ArrayTy expected list of elements, got {type(parsed)!r}: {parsed}")
     if len(parsed) != typ.size:
       raise ValueError(f"ArrayTy size mismatch: expected {typ.size}, got {len(parsed)}")
-    arr_values: list[KnownArrTargetVal] = []
+    arr_values: list[KnownAggTargetVal] = []
 
     for elem in parsed:
       val = valueFromParsed(elem, typ.inner)
-      if not isinstance(val, KnownArrTargetVal):
+      if not isinstance(val, KnownAggTargetVal):
         raise ValueError(f"Array element produced non-arr-target value: {val}")
       arr_values.append(val)
 
     return KnownArrVal(typ, arr_values)
 
   elif isinstance(typ, PointerTy):
-    if parsed is None:
-      raise NotImplementedError("Null pointer initializers not implemented yet")
+    if parsed is None or parsed == "zeroinitializer":
+      return NullPtrVal(typ)
 
     # If parsed is a string (e.g., "@globalname") we could return GlobalVarVal
     if isinstance(parsed, str) and parsed.startswith("@"):
@@ -354,6 +542,31 @@ def valueFromParsed(parsed: Any, typ: Type) -> Value:
   # Void or unknown
   elif isinstance(typ, VoidTy):
     raise ValueError("VoidTy cannot have an initializer value")
+
+  elif isinstance(typ, StructTy):
+    if parsed == "zeroinitializer":
+      values = [valueFromParsed("zeroinitializer", mem) for mem in typ.members]
+      assert all([isinstance(value, KnownAggTargetVal) for value in values])
+      return KnownStructVal(typ, [cast(KnownAggTargetVal, value) for value in values])
+
+    if not isinstance(parsed, list):
+      raise ValueError(f"StructTy expected list of elements, got {type(parsed)!r}: {parsed}")
+    if typ.is_packed:
+      # the <{ ... }> brackets are incorrectly treated as two brackets
+      assert len(parsed) == 1
+      parsed = parsed[0]
+    if len(parsed) != len(typ.members):
+      raise ValueError(f"StructTy member mismatch: expected {len(typ.members)} got {len(parsed)}")
+
+    struct_values: list[KnownAggTargetVal] = []
+
+    for i, elem in enumerate(parsed):
+      val = valueFromParsed(elem, typ.members[i])
+      if not isinstance(val, KnownAggTargetVal):
+        raise ValueError(f"Struct element produced non-agg-target value: {val}")
+      struct_values.append(val)
+
+    return KnownStructVal(typ, struct_values)
 
   # Fallback for unknown types
   raise NotImplementedError(f"value_from_parsed not implemented for type {type(typ).__name__}")
