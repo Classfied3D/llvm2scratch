@@ -30,14 +30,14 @@ ATTR_RE = re.compile(
 )
 
 def extractBracketContent(s: str, start: int) -> tuple[str,int]:
-  openCh = s[start]
+  open_ch = s[start]
   pairs = {'<':'>','[':']','{':'}','(':')'}
-  if openCh not in pairs:
+  if open_ch not in pairs:
     raise ValueError("not a bracket at start")
-  closeCh = pairs[openCh]
+  close_ch = pairs[open_ch]
   i = start + 1
   depth = 1
-  contentStart = i
+  content_start = i
   L = len(s)
   while i < L and depth > 0:
     c = s[i]
@@ -45,48 +45,36 @@ def extractBracketContent(s: str, start: int) -> tuple[str,int]:
       j = i + 1
       while j < L:
         if s[j] == '"' and s[j-1] != '\\':
-          i = j
-          break
+          i = j; break
         j += 1
-    elif c == openCh:
+    elif c == open_ch:
       depth += 1
-    elif c == closeCh:
+    elif c == close_ch:
       depth -= 1
       if depth == 0:
-        return s[contentStart:i], i+1
+        return s[content_start:i], i+1
     i += 1
   raise ValueError("unmatched bracket")
 
 def splitTopLevelCommas(s: str) -> list[str]:
   elems = []
-  i = 0
-  start = 0
-  stack = []
-  l = len(s)
+  i = 0; start = 0; stack = []; L = len(s)
   pairs = {'<':'>','{':'}','[':']','(':')'}
   opens = set(pairs.keys()); closes = set(pairs.values())
   in_quote = False
-  while i < l:
+  while i < L:
     c = s[i]
     if c == '"' and (i == 0 or s[i-1] != '\\'):
-      in_quote = not in_quote
-      i += 1
-      continue
+      in_quote = not in_quote; i += 1; continue
     if in_quote:
-      i += 1
-      continue
+      i += 1; continue
     if c in opens:
       stack.append(c)
     elif c in closes:
       if stack:
-        top = stack[-1]
-        if pairs.get(top) == c:
-          stack.pop()
-        else:
-          stack.pop()
+        stack.pop()
     elif c == ',' and not stack:
-      elems.append(s[start:i].strip())
-      start = i+1
+      elems.append(s[start:i].strip()); start = i+1
     i += 1
   last = s[start:].strip()
   if last:
@@ -117,21 +105,8 @@ def isTypeOnly(content: str) -> bool:
     p = p.strip()
     if isTypeToken(p):
       continue
-    m = re.match(r'^(%[A-Za-z0-9._]+)\s*(\{.*\})$', p, re.S)
-    if m:
-      inner = m.group(2)
-      if inner.startswith('{') and inner.endswith('}') and isTypeOnly(inner[1:-1].strip()):
-        continue
-    if p.startswith('{') and p.endswith('}'):
-      inner = p[1:-1].strip()
-      if isTypeOnly(inner):
-        continue
-      return False
-    if p.startswith('<{') and p.endswith('}>'):
-      inner = p[2:-2].strip()
-      if isTypeOnly(inner):
-        continue
-      return False
+    if p.startswith('{') and p.endswith('}') and isTypeOnly(p[1:-1].strip()):
+      continue
     return False
   return True
 
@@ -155,84 +130,132 @@ def stripLeadingTypes(s: str) -> str:
   if not s: return s
   if s[0] in '<[{(':
     return s
-  if s.startswith('c"') or s.startswith('@') or s.startswith('%') or s.startswith('getelementptr') or s.startswith('null') or s[0] == '-' or s[0].isdigit():
+  if s.startswith('c"') or s.startswith('getelementptr') or s.startswith('null') or s[0] == '-' or s[0].isdigit():
+    return s
+  if s.startswith('%') and ' ' in s:
+    head, tail = s.split(None, 1)
+    if TYPE_NAME_RE.fullmatch(head):
+      return tail.strip()
+    return s
+  if s.startswith('@'):
     return s
   parts = s.split(None, 1)
   return parts[1] if len(parts) > 1 else parts[0]
 
-def readAdjacentValueAfterType(elem: str, decode_gep_str_func) -> Optional[Any]:
-  elem = elem.strip()
-
-  if elem.startswith("getelementptr"):
-    return parseScalarToken(elem, decode_gep_str_func)
-
-  m = re.match(r'^\s*\[\s*(\d+)\s*x\s*[^\]]+\]\s*(.+)$', elem, re.S)
-  if m:
-    rest = m.group(2).strip()
-    if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
-      return None
-    if rest.startswith('c"'):
-      mm = CSTRING_RE.match(rest)
-      if mm:
-        return decodeLLVMCStringLiteral(mm.group(1))
-    if rest.startswith('zeroinitializer'):
-      return "zeroinitializer"
-    if rest and rest[0] in '<[{(':
-      return parseInitializer(rest, decode_gep_str_func)
-    if rest.startswith('@') or rest.startswith('%'):
-      return rest
-    num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
-    if num_m:
-      tok = num_m.group(0)
-      try:
-        if tok.lower().startswith('0x'):
-          return int(tok, 16)
-        return int(tok, 10)
-      except:
-        return rest
-    return rest
-
-  if elem and elem[0] in '<{(':
-    try:
-      grp, after = extractBracketContent(elem, 0)
-    except ValueError:
-      return None
-    rest = elem[after:].strip()
-    if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
-      return None
-    if rest.startswith('c"'):
-      mm = CSTRING_RE.match(rest)
-      if mm:
-        return decodeLLVMCStringLiteral(mm.group(1))
-    if rest.startswith('zeroinitializer'):
-      return "zeroinitializer"
-    if rest and rest[0] in '<[{(':
-      return parseInitializer(rest, decode_gep_str_func)
-    if rest.startswith('@') or rest.startswith('%'):
-      return rest
-    num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
-    if num_m:
-      tok = num_m.group(0)
-      try:
-        if tok.lower().startswith('0x'):
-          return int(tok, 16)
-        return int(tok, 10)
-      except:
-        return rest
+def parseScalarToken(s: str, decode_gep_str_func) -> Any:
+  s = s.strip()
+  if not s:
     return None
-  return None
+  if s.startswith("getelementptr"):
+    return decode_gep_str_func(s)
+  m = CSTRING_RE.match(s)
+  if m and s.startswith('c"'):
+    return decodeLLVMCStringLiteral(m.group(1))
+  adj = readAdjacentValueAfterType(s, decode_gep_str_func)
+  if adj is not None:
+    return adj
+  s2 = stripLeadingTypes(s).strip()
+  if not s2:
+    return None
+  if s2 == 'null': return None
+  if s2 == 'zeroinitializer': return "zeroinitializer"
+  if s2 and s2[0] in '<[{(':
+    return parseInitializer(s2, decode_gep_str_func)
+  if s2.startswith('@') or s2.startswith('%'):
+    if ' ' in s2:
+      stripped = stripLeadingTypes(s2)
+      if stripped != s2:
+        return parseScalarToken(stripped, decode_gep_str_func)
+    return s2
+  num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', s2)
+  if num_m:
+    tok = num_m.group(0)
+    try:
+      return int(tok, 0)
+    except:
+      pass
+  if s2.startswith("getelementptr"):
+    return decode_gep_str_func(s2)
+  return s2
+
+def readAdjacentValueAfterType(elem: str, decode_gep_str_func) -> Optional[Any]:
+    elem = elem.strip()
+    if elem.startswith("getelementptr"):
+        return decode_gep_str_func(elem)
+
+    # If it starts with '[' use extractBracketContent to handle nested brackets correctly
+    if elem and elem[0] == '[':
+        try:
+            bracket_content, after = extractBracketContent(elem, 0)
+        except ValueError:
+            return None
+        rest = elem[after:].strip()
+        if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
+            return None
+        if rest.startswith('c"'):
+            mm = CSTRING_RE.match(rest)
+            if mm: return decodeLLVMCStringLiteral(mm.group(1))
+        if rest.startswith('zeroinitializer'):
+            return "zeroinitializer"
+        if rest == 'null':
+            return None
+        if rest and rest[0] in '<[{(':
+            return parseInitializer(rest, decode_gep_str_func)
+        if rest.startswith('@') or rest.startswith('%'):
+            stripped = stripLeadingTypes(rest)
+            if stripped != rest:
+                return parseInitializer(stripped, decode_gep_str_func)
+            return rest
+        num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
+        if num_m:
+            tok = num_m.group(0)
+            try: return int(tok,0)
+            except: return rest
+        return rest
+
+    # generic bracket-handling fallback (for '{', '<', '(')
+    if elem and elem[0] in '<{(':
+        try:
+            grp, after = extractBracketContent(elem, 0)
+        except ValueError:
+            return None
+        rest = elem[after:].strip()
+        if ',' in rest and splitTopLevelCommas(rest)[0] != rest:
+            return None
+        if rest.startswith('c"'):
+            mm = CSTRING_RE.match(rest)
+            if mm: return decodeLLVMCStringLiteral(mm.group(1))
+        if rest.startswith('zeroinitializer'):
+            return "zeroinitializer"
+        if rest == 'null':
+            return None
+        if rest and rest[0] in '<[{(':
+            return parseInitializer(rest, decode_gep_str_func)
+        if rest.startswith('@') or rest.startswith('%'):
+            stripped = stripLeadingTypes(rest)
+            if stripped != rest:
+                return parseInitializer(stripped, decode_gep_str_func)
+            return rest
+        num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
+        if num_m:
+            tok = num_m.group(0)
+            try: return int(tok,0)
+            except: return rest
+        return None
+    return None
 
 def findDataBracket(s: str, start: int = 0) -> tuple[str,int]:
-  pos = start; L=len(s)
-  while pos < L and s[pos].isspace(): pos+=1
+  pos = start; L = len(s)
+  while pos < L and s[pos].isspace(): pos += 1
   if pos >= L or s[pos] not in '<[{': raise ValueError("expected bracket at start")
   while pos < L and s[pos] in '<[{':
     content, after = extractBracketContent(s, pos)
     if re.search(r'c"|zeroinitializer|@|null|getelementptr\b', content) or not isTypeOnly(content):
       return content, after
-    k=0; groups=[]
+    # inspect nested groups
+    k = 0; groups = []
     while k < len(content):
-      while k < len(content) and content[k].isspace(): k+=1
+      while k < len(content) and content[k].isspace(): k += 1
       if k >= len(content): break
       if content[k] in '<[{':
         inner, inner_after = extractBracketContent(content, k)
@@ -244,178 +267,86 @@ def findDataBracket(s: str, start: int = 0) -> tuple[str,int]:
         abs_after = pos + inner_after
         return inner, abs_after
     pos = after
-    while pos < L and s[pos].isspace(): pos+=1
+    while pos < L and s[pos].isspace(): pos += 1
     if pos >= L or s[pos] not in '<[{': return content, after
   return content, after
 
-def parseScalarToken(s: str, decode_gep_str_func) -> Any:
-  s = s.strip()
-
-  if s.startswith("getelementptr"):
-    return decode_gep_str_func(s)
-
-  s = s.strip()
-  if not s: return None
-  m = CSTRING_RE.match(s)
-  if m and s.startswith('c"'): return decodeLLVMCStringLiteral(m.group(1))
-  adj = readAdjacentValueAfterType(s, decode_gep_str_func)
-  if adj is not None: return adj
-  s2 = stripLeadingTypes(s).strip()
-  if not s2: return None
-  if s2 == 'null': return None
-  if s2.startswith('@') or s2.startswith('%'): return s2
-  num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', s2)
-  if num_m:
-    tok = num_m.group(0)
-    try:
-      if tok.lower().startswith('0x'): return int(tok,16)
-      return int(tok,10)
-    except: pass
-  if s2.startswith('getelementptr'):
-    idx = s2.find('(')
-    if idx != -1:
-      depth = 0; i = idx; L = len(s2)
-      while i < L:
-        if s2[i] == '(':
-          depth += 1
-        elif s2[i] == ')':
-          depth -= 1
-          if depth == 0:
-            return s2[:i+1].strip()
-        i += 1
-    return s2
-  if s2 and s2[0] in '<[{(':
-    return parseInitializer(s2, decode_gep_str_func)
-  return s2
-
 def parseInitializer(init_text: str, decode_gep_str_func) -> Any:
   s = init_text.strip()
-  if not s:
-    return None
-
-  # direct getelementptr -> delegate to scalar handler / decode function
-  if s.startswith("getelementptr"):
-    return parseScalarToken(s, decode_gep_str_func)
-
-  # direct c-string
+  if not s: return None
+  if s.startswith("getelementptr"): return parseScalarToken(s, decode_gep_str_func)
   m = CSTRING_RE.match(s)
-  if m and s.startswith('c"'):
-    return decodeLLVMCStringLiteral(m.group(1))
-
-  # bracketed forms
+  if m and s.startswith('c"'): return decodeLLVMCStringLiteral(m.group(1))
   if s[0] in '<[{(':
     try:
       first_content, pos_after_first = extractBracketContent(s, 0)
     except ValueError:
       return parseScalarToken(s, decode_gep_str_func)
-
-    # If the first bracket looks like a pure type spec and there's an adjacent
-    # value (e.g. "[N x i8] c'...'" or "{ i8 } c'...'"), parse that adjacent value
     rest = s[pos_after_first:].lstrip()
     if isTypeOnly(first_content) and rest:
       if rest.startswith('c"'):
         mm = CSTRING_RE.match(rest)
-        if mm:
-          return decodeLLVMCStringLiteral(mm.group(1))
-      if rest.startswith('zeroinitializer'):
-        return "zeroinitializer"
-      if rest.startswith('getelementptr'):
-        return parseScalarToken(rest, decode_gep_str_func)
+        if mm: return decodeLLVMCStringLiteral(mm.group(1))
+      if rest.startswith('zeroinitializer'): return "zeroinitializer"
+      if rest == 'null': return None
+      if rest.startswith('getelementptr'): return parseScalarToken(rest, decode_gep_str_func)
       if rest and rest[0] in '<[{(':
         return parseInitializer(rest, decode_gep_str_func)
       if rest.startswith('@') or rest.startswith('%'):
+        stripped = stripLeadingTypes(rest)
+        if stripped != rest:
+          return parseScalarToken(stripped, decode_gep_str_func)
         return rest
       num_m = re.match(r'^-?0x[0-9a-fA-F]+|^-?\d+', rest)
       if num_m:
         tok = num_m.group(0)
         try:
-          if tok.lower().startswith('0x'):
-            return int(tok, 16)
-          return int(tok, 10)
-        except:
-          pass
-
-    # At this point we are dealing with a real bracketed aggregate.
-    # Remember the opening bracket to preserve semantics later.
+          return int(tok, 0)
+        except: pass
     open_ch = s[0]
-
     try:
       outer_content, pos_after = extractBracketContent(s, 0)
     except ValueError:
       return parseScalarToken(s, decode_gep_str_func)
-
-    # findDataBracket returns the bracket that actually contains data (skipping type-only wrappers)
     try:
       data_content, data_after = findDataBracket(s, 0)
     except Exception:
       return parseScalarToken(s, decode_gep_str_func)
-
-    top_elems = splitTopLevelCommas(outer_content)   # elements as written in outer bracket
-    data_elems = splitTopLevelCommas(data_content)   # the actual data elements we will parse
-
-    parsed: list[Any] = []
+    top_elems = splitTopLevelCommas(outer_content)
+    data_elems = splitTopLevelCommas(data_content)
+    parsed = []
     for de in data_elems:
       de = de.strip()
-      # If element is a named aggregate "%name { ... }", parse the inner braces
       m_named = re.match(r'^(%[A-Za-z0-9._]+)\s*(\{.*\})$', de, re.S)
       if m_named:
         inner = m_named.group(2)
+        # preserve named aggregate as a single nested element (keep wrapper)
         parsed.append(parseInitializer(inner, decode_gep_str_func))
         continue
-
-      # If it's an adjacency like "[N x T] c'...'" or "{ T } value", read it
       adj = readAdjacentValueAfterType(de, decode_gep_str_func)
       if adj is not None:
-        parsed.append(adj)
-        continue
-
-      # Otherwise strip a leading type token and parse recursively
+        parsed.append(adj); continue
       cleaned = stripLeadingTypes(de)
       parsed.append(parseInitializer(cleaned, decode_gep_str_func))
-
-    #
-    # Deterministic wrapping rules
-    #
-
-    # 1) If outer bracket is array-like ('<' or '['):
-    #    - if outer had multiple top-level elements -> return parsed as-is
-    #    - if outer had exactly one top-level element:
-    #        * if parsed is a single byte-array (list[int]) produced from a c"..." adjacency,
-    #          return that byte-array directly (user wanted plain byte arrays for c"...")
-    #        * if parsed is a single aggregate (i.e. parsed == [[...]]), keep that aggregate
-    #          (return parsed) so we represent "array containing one aggregate" as [[...]]
-    #        * otherwise return [parsed] to represent an array with one element
+    # Wrapping rules
     if open_ch in '[<':
       if len(top_elems) == 1:
         if len(parsed) == 1 and isinstance(parsed[0], list) and all(isinstance(x, int) for x in parsed[0]):
-          # special-case: [ { i8 } c"..." ] -> c"..." -> list[int]
           return parsed[0]
         if len(parsed) == 1 and isinstance(parsed[0], list):
-          # already a single aggregate inside (e.g. parsed == [[...]]), return as-is
           return parsed
-        # otherwise return an array containing the parsed element(s)
         return [parsed]
       else:
         return parsed
-
-    # 2) If outer bracket is an aggregate ('{' or '('):
-    #    - aggregates should preserve one-level aggregate semantics.
-    #    - If parsed has exactly one inner aggregate (parsed == [[...]]), return
-    #      a wrapper list so the outer aggregate is preserved: [[...]]
-    #    - Otherwise return parsed (list of field values)
     if open_ch in '{(':
+      # preserve single-inner aggregate by wrapping it so outer aggregate remains a single field
       if len(parsed) == 1 and isinstance(parsed[0], list):
         return [parsed[0]]
       return parsed
-
-    # fallback
     return parsed
-
-  # Non-bracketed: maybe multiple top-level comma-separated parts
   parts = splitTopLevelCommas(s)
   if len(parts) > 1:
     return [parseScalarToken(stripLeadingTypes(p), decode_gep_str_func) for p in parts]
-
   return parseScalarToken(s, decode_gep_str_func)
 
 def stripReturnAttrs(rest: str) -> str:
