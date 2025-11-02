@@ -108,6 +108,9 @@ def decodeType(type: llvm.TypeRef) -> Type:
       is_packed = str(type).replace(" ", "").startswith("<{")
       return StructTy(name, is_packed, members)
 
+    case llvm.TypeKind.metadata:
+      return MetadataTy()
+
     case _:
       raise ValueError(f"Unknown type: {type.type_kind.name}")
 
@@ -157,10 +160,15 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
       return KnownIntVal(type, val, type.width)
 
     case llvm.ValueKind.constant_fp:
+      # Known fp constant
       val = value.get_constant_value(round_fp=True)
       assert isinstance(val, float)
       assert isinstance(type, (HalfTy, FloatTy, DoubleTy, Fp128Ty))
       return KnownFloatVal(type, val)
+
+    case llvm.ValueKind.constant_pointer_null:
+      # Null pointer constant
+      return NullPtrVal(type)
 
     case llvm.ValueKind.basic_block:
       # A basic block label
@@ -185,6 +193,10 @@ def decodeValue(value: llvm.ValueRef, mod: llvm.ModuleRef) -> Value:
       else:
         raise ValueError(f"Unknown constant expression: {rest}")
 
+    case llvm.ValueKind.metadata_as_value:
+      # Metadata as value, used in some instrinsics
+      return MetadataVal(type)
+
     case _:
       raise ValueError(f"Unknown value type: {value.value_kind.name}")
 
@@ -196,19 +208,10 @@ def decodeLabel(value: llvm.ValueRef, mod: llvm.ModuleRef) -> LabelVal:
 def decodeIntrinsic(name: str) -> Intrinsic | None:
   if not name.startswith("llvm."):
     return None
-  name = name.removeprefix("llvm.")
-
-  if name.startswith("memcpy"):
-    if name.startswith("memcpy.inline"):
-      return Intrinsic.MemCpyInline
-    return Intrinsic.MemCpy
-  elif name.startswith("memmove"):
-    return Intrinsic.MemMove
-  elif name.startswith("lifetime.start"):
-    return Intrinsic.LifetimeStart
-  elif name.startswith("lifetime.end"):
-    return Intrinsic.LifetimeEnd
-  raise ValueError(f"Unknown intrinsic {name}")
+  matches = [item for item in Intrinsic if name.startswith(item.value)]
+  if not matches:
+    raise ValueError(f"Unknown intrinsic {name}")
+  return max(matches, key=lambda x: len(x.value))
 
 def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
   result = getResultLocalVar(instr)
@@ -305,6 +308,17 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
       mask = next(instr.operands)
 
       return ShuffleVector(result, decodeValue(vec1, mod), decodeValue(vec2, mod), decodeValue(mask, mod))
+
+    case "insertvalue":
+      agg, element, *indices = [decodeValue(val, mod) for val in instr.operands]
+
+      return InsertValue(agg, element, indices)
+
+    case "extractvalue":
+      assert result is not None
+      agg, *indices = [decodeValue(val, mod) for val in instr.operands]
+
+      return ExtractValue(result, agg, indices)
 
     case "alloca":
       assert result is not None
@@ -423,7 +437,6 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef) -> Instr:
     case "call":
       *args, callee = instr.operands
       func_val = decodeValue(callee, mod)
-      assert isinstance(func_val, FunctionVal)
       arg_vals = [decodeValue(arg, mod) for arg in args]
 
       tail_kind = CallTailKind.NoTail
@@ -487,8 +500,8 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
       block_name = block_val.label
 
       instructions: list[Instr] = []
-      for inst in block.instructions:
-        instructions.append(decodeInstr(inst, mod))
+      for instr in block.instructions:
+        instructions.append(decodeInstr(instr, mod))
       fn_blocks.update({block_name: Block(block_name, instructions)})
 
     intrinsic = decodeIntrinsic(fn_name)

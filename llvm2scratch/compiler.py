@@ -2067,6 +2067,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       for instr in block.instrs:
         match instr:
           case ir.Call():
+            if not isinstance(instr.func, ir.FunctionVal):
+              raise CompException("Function pointers not supported")
             called_name = instr.func.name
             calls.add(called_name)
             return_addresses.setdefault(called_name, list())
@@ -2293,6 +2295,9 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       for instr_index, instr in enumerate(block.instrs[:-1]):
         assert bctx is not None
         if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
+          if not isinstance(instr.func, ir.FunctionVal):
+            raise CompException("Function pointers not supported")
+
           callee_name = instr.func.name
           args = instr.args
 

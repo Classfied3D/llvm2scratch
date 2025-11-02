@@ -78,11 +78,21 @@ class CallTailKind(Enum):
   MustTail = "musttail"
 
 class Intrinsic(Enum):
+  VaStart = "llvm.va_start"
+  VaEnd = "llvm.va_end"
+  VaCopy = "llvm.va_copy"
+  Abs = "llvm.abs"
+  SMax = "llvm.smax"
+  SMin = "llvm.smin"
+  UMax = "llvm.umax"
+  UMin = "llvm.umin"
   MemCpy = "llvm.memcpy"
   MemCpyInline = "llvm.memcpy.inline"
   MemMove = "llvm.memmove"
+  FAbs = "llvm.fabs"
   LifetimeStart = "llvm.lifetime.start"
   LifetimeEnd = "llvm.lifetime.end"
+  NoAliasScopeDecl = "llvm.experimental.noalias.scope.decl"
 
 @dataclass
 class ResultLocalVar:
@@ -120,6 +130,9 @@ class Fp128Ty(FloatingPointTy):
   pass
 
 class PointerTy(VecTargetTy, AggTargetTy):
+  pass
+
+class MetadataTy(Type):
   pass
 
 @dataclass
@@ -209,6 +222,9 @@ class LabelVal(Value):
 class ConstExprVal(KnownVal, KnownAggTargetVal):
   expr: GetElementPtr
 
+class MetadataVal(Value):
+  pass
+
 class Instr:
   pass
 
@@ -279,6 +295,17 @@ class ShuffleVector(Instr, HasResult):
   mask_vector: Value
 
 @dataclass
+class ExtractValue(Instr, HasResult):
+  agg: Value
+  indicies: list[Value]
+
+@dataclass
+class InsertValue(Instr):
+  agg: Value
+  element: Value
+  indices: list[Value]
+
+@dataclass
 class Alloca(Instr, HasResult):
   allocated_type: Type
   num_elements: Value
@@ -332,7 +359,7 @@ class Select(Instr, HasResult):
 
 @dataclass
 class Call(Instr, MaybeHasResult):
-  func: FunctionVal
+  func: Value
   args: list[Value]
   tail_kind: CallTailKind
 

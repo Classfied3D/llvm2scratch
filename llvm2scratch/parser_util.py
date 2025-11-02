@@ -21,7 +21,18 @@ RETURN_ATTRS = [
   "nofree", "nest", "swiftself", "swiftasync",
   "swifterror", "immarg", "noundef", "readnone",
   "readonly", "writeonly", "writable",
-  "initializes", "dead_on_unwind", "dead_on_return"
+  "initializes", "dead_on_unwind", "dead_on_return",
+  "private", "internal", "available_externally", "linkonce",
+  "weak", "common", "appending", "extern_weak",
+  "linkonce_odr", "weak_odr", "external",
+  "ccc", "fastcc", "coldcc", "ghccc",
+  "cc 11", "anyregcc", "preserve_mostcc", "preserve_allcc",
+  "preserve_nonecc", "cxx_fast_tlscc", "tailcc", "swiftcc",
+  "swifttailcc", "cfguard_checkcc", "cc",
+  "default", "hidden", "protected",
+  "dllimport", "dllexport",
+  "localdynamic", "initialexec", "localexec", "general dynamic",
+  "dso_preemptable", "dso_local"
 ]
 
 # Build regex that matches any of them, optionally with (<...>) or <n> arguments
