@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 static int a = 7;
+static long long ll_a = 149876583280495765;
 static char* message = "loldefault";
 
 typedef struct SensorData {
@@ -135,6 +136,8 @@ int main(void) {
   long long o = 1;
   o += 2;
   o -= 5;
+
+  ll_a += 55;
 
   return 0;
 }

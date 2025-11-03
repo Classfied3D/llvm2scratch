@@ -2370,8 +2370,7 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
           size = total_size
           values.append(value)
         case IdxbleValue():
-          assert isinstance(glob.type, ir.ArrayTy)
-          size = getByteSize(glob.type.inner)
+          size = 1
           values.extend(value.vals)
 
       if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
