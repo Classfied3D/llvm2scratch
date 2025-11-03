@@ -1735,7 +1735,8 @@ def getInstrVarUse(instr: ir.Instr,
     case ir.Store():
       vals = [instr.address, instr.value]
     case ir.Call():
-      vals = [a for a in instr.args]
+      vals = [instr.func]
+      vals.extend([a for a in instr.args])
     case ir.UnaryOp():
       vals = [instr.operand]
     case ir.BinaryOp() | ir.ICmp() | ir.FCmp():

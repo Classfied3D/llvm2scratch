@@ -172,7 +172,7 @@ class ArgumentVal(Value):
   name: str
 
 @dataclass
-class FunctionVal(Value):
+class FunctionVal(KnownVal):
   name: str
   return_type: Type
   intrinsic: Intrinsic | None
@@ -215,14 +215,14 @@ class KnownStructVal(KnownVal, KnownAggTargetVal):
   values: list[KnownAggTargetVal]
 
 @dataclass
-class LabelVal(Value):
+class LabelVal(KnownVal):
   label: str
 
 @dataclass
 class ConstExprVal(KnownVal, KnownAggTargetVal):
   expr: GetElementPtr
 
-class MetadataVal(Value):
+class MetadataVal(KnownVal):
   pass
 
 class Instr:
