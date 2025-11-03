@@ -77,6 +77,8 @@ class FuncInfo:
   fn_id: int
   # The parameters the function takes (doesn't include return address)
   params: list[Variable]
+  # The types of the parameters
+  param_sizes: list[int]
   # Everything the function might call (may include itself)
   can_call: set[str] = field(default_factory=set)
   # Any functions that call this function
@@ -106,6 +108,7 @@ class BlockInfo:
   """Info about a LLVM block"""
   fn: FuncInfo
   available_params: list[Variable] # All params that can be accessed from the function
+  available_param_sizes: list[int] # All sizes of above params
   first_block: bool = False # Is this is the first block of the function
   code: sb3.BlockList = field(default_factory=sb3.BlockList) # The current code instructions are being added to
   label: str | None = None # Name/Label of the block
@@ -117,6 +120,7 @@ class BlockVarUse:
   depends: set[str] = field(default_factory=set)
   modifies: set[str] = field(default_factory=set)
   branches: set[str] = field(default_factory=set)
+  depends_var_sizes: dict[str, int] = field(default_factory=dict)
 
 @dataclass
 class ValueAndBlocks:
@@ -352,6 +356,21 @@ def localizeCallId(call_id: int, label: str, fn_name: str, recursive: bool = Fal
   if not recursive:
     return f"{fn_name}:{label}:return addr {call_id}"
   return f"{fn_name}:{label}:recursive call {call_id}"
+
+def localizeSizedParameters(params: list[Variable], sizes: list[int]) -> list[str]:
+  assert len(params) == len(sizes)
+  res: list[str] = []
+  for param, size in zip(params, sizes):
+    for i in range(max(size, 1)):
+      res.append(param.getRawVarName(None if size == 1 else i))
+  return res
+
+def combineIdxableValues(vals: list[sb3.Value | IdxbleValue]) -> IdxbleValue:
+  res = []
+  for val in vals:
+    if isinstance(val, sb3.Value): res.append(val)
+    else:                          res.extend(val.vals)
+  return IdxbleValue(res)
 
 def genTempVar(ctx: Context) -> str:
   return ctx.cfg.tmp_prefix + random.randbytes(12).hex()
@@ -622,14 +641,15 @@ def storeOnStack(stack_var: str, stack_size_var: str, offset: int, value: sb3.Va
 def loadFromStack(stack_var: str, stack_size_var: str, offset: int) -> sb3.Value:
   return sb3.GetOfList("atindex", stack_var, offsetStackSize(stack_size_var, offset))
 
-def assignParameters(params: list[Variable], next_var_use_depends: set[str]) -> sb3.BlockList:
+def assignParameters(params: list[Variable], param_sizes: list[int], next_var_use_depends: set[str]) -> sb3.BlockList:
+  assert len(params) == len(param_sizes)
   blocks = sb3.BlockList()
-  for param in params:
+  for param, size in zip(params, param_sizes):
     var = deepcopy(param)
     var.var_type = "var"
     # Don't assign anything we depend upon in future
     if var.var_name in next_var_use_depends:
-      blocks.add(var.setValue(param.getValue()))
+      blocks.add(var.setAllValues(param.getAllValues(size)))
   return blocks
 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
@@ -649,15 +669,17 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
   blocks = sb3.BlockList()
   for arg in args:
     value = transValue(arg, ctx, bctx)
-    if isinstance(value, IdxbleValueAndBlocks):
-      raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(value.blocks)
-    arguments.append(value.value)
+    if not isinstance(value, IdxbleValueAndBlocks):
+      arguments.append(value.value)
+    else:
+      for val in value.value.vals: arguments.append(val)
   return arguments, blocks
 
-def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncInfo,
+def getUncheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes: list[int], fn: FuncInfo,
                                ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
-  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, [param.getRawVarName() for param in params])])
+  assert len(params) == len(param_sizes)
+  blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, localizeSizedParameters(params, param_sizes))])
 
   if ctx.cfg.do_debug_branch_log:
     # Increment the branch counter in the log
@@ -673,7 +695,7 @@ def getUncheckedProcedureStart(proc_name: str, params: list[Variable], fn: FuncI
 
   return blocks, ctx
 
-def getCheckedProcedureStart(proc_name: str, params: list[Variable],
+def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes: list[int],
                              next_var_use_depends: set[str], fn: FuncInfo,
                              ctx: Context) -> tuple[sb3.BlockList, Context]:
   """
@@ -681,19 +703,20 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable],
   that will reset the scratch's stack if reaching a max amount of permutations,
   preventing scratch from running out of memory
   """
+  assert len(params) == len(param_sizes)
 
   reset_broadcast = f"{proc_name}:reset stack"
-  arguments = [name.getValue() for name in params]
+  arguments: list[sb3.Value] = [sb3.GetVar(arg) for arg in localizeSizedParameters(params, param_sizes)]
   ctx.proj.code.append(sb3.BlockList([
     sb3.OnBroadcast(reset_broadcast),
     sb3.ProcedureCall(proc_name, arguments),
   ]))
 
-  blocks, ctx = getUncheckedProcedureStart(proc_name, params, fn, ctx, is_counted=True)
+  blocks, ctx = getUncheckedProcedureStart(proc_name, params, param_sizes, fn, ctx, is_counted=True)
 
   on_reset = sb3.BlockList()
 
-  on_reset = assignParameters(params, next_var_use_depends)
+  on_reset = assignParameters(params, param_sizes, next_var_use_depends)
   on_reset.add(sb3.BlockList([
     sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
     sb3.EditCounter("clear"),
@@ -742,6 +765,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
   if poss_recursive:
     # Get all variables which are used later after the recursion
     must_store: list[Variable] = []
+    must_store_sizes: list[int] = []
     # Include the return value in variables which aren't depended on
     for var in next_var_use.depends:
       decoded_var = transVar(var, bctx)
@@ -751,11 +775,16 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
     # Sort the parameters in numeric then alphabetical order for better readability
     must_store.sort(key=lambda var: (0, int(var.var_name)) if var.var_name.isdigit() else (1, var.var_name))
 
+    # Work out sizes of must stores
+    must_store_sizes = [next_var_use.depends_var_sizes[var.var_name] for var in must_store]
+
     if caller.total_alloca_size is None and not caller.skip_stack_size_change:
       must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
+      must_store_sizes.append(1)
 
     if caller.takes_return_address:
       must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
+      must_store_sizes.append(1)
 
     # If we don't need to store any parameters for later we don't need to do anything special when we recurse
     poss_recursive = len(must_store) > 0
@@ -772,7 +801,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
         # Pass return address into function
         arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
-      bctx.code.add(assignParameters(bctx.available_params, next_var_use.depends | ctx.cfg.special_locals))
+      bctx.code.add(assignParameters(
+        bctx.available_params, bctx.available_param_sizes,
+        next_var_use.depends | ctx.cfg.special_locals
+      ))
 
     call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
     bctx.code.add(arg_value_blocks)
@@ -785,9 +817,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       ctx.proj.code.append(bctx.code)
       bctx.first_block = False
       bctx.available_params = []
+      bctx.available_param_sizes = []
 
       # Add code for callback
-      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], caller, ctx,
+      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], [], caller, ctx,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
   else:
@@ -804,6 +837,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       ctx.proj.code.append(bctx.code)
       # Make sure that these parameters are assigned back to variables if needed later
       bctx.available_params = must_store
+      bctx.available_param_sizes = must_store_sizes
       bctx.code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
 
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
@@ -828,9 +862,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       ctx.proj.code.append(bctx.code)
       bctx.first_block = False
       bctx.available_params = []
+      bctx.available_param_sizes = []
 
       # Add code for callback
-      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], caller, ctx,
+      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], [], caller, ctx,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
 
@@ -1719,10 +1754,11 @@ def getTerminatorInstrLabels(instr: ir.Instr) -> set[str]:
 
 def getInstrVarUse(instr: ir.Instr,
     block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]]
-  ) -> tuple[set[str], set[str]]:
-  """Returns what the instruction depends on and modifies"""
+  ) -> tuple[set[str], set[str], dict[str, int]]:
+  """Returns what the instruction depends on and modifies, and the var sizes of what it depends on"""
   depends: set[str] = set()
   modifies: set[str] = set()
+  depends_var_sizes: dict[str, int] = {}
 
   if isinstance(instr, (ir.HasResult, ir.MaybeHasResult)):
     if instr.result is not None:
@@ -1763,15 +1799,15 @@ def getInstrVarUse(instr: ir.Instr,
   for val in vals:
     if val is not None:
       match val:
-        # TODO FIX: special handling for getElementPtr etc
         case ir.ArgumentVal() | ir.LocalVarVal():
           depends.add(val.name)
+          depends_var_sizes[val.name] = getByteSize(val.type)
         case ir.GlobalVarVal() | ir.KnownVal():
           pass
         case _:
           raise CompException(f"Unknown Value: {val}")
 
-  return depends, modifies
+  return depends, modifies, depends_var_sizes
 
 def getBlockVarUse(instrs: list[ir.Instr],
                    block_phi_info: defaultdict[str, list[tuple[Variable, ir.Value]]],
@@ -1787,10 +1823,11 @@ def getBlockVarUse(instrs: list[ir.Instr],
   res = BlockVarUse() if starting_var_use is None else starting_var_use
 
   for instr in instrs:
-    instr_depends, instr_modifies = getInstrVarUse(instr, block_phi_info)
+    instr_depends, instr_modifies, instr_depends_var_sizes = getInstrVarUse(instr, block_phi_info)
     # If we modify something before using it then we don't depend on it
     res.depends |= instr_depends - res.modifies
     res.modifies |= instr_modifies
+    res.depends_var_sizes.update(instr_depends_var_sizes)
 
   res.branches = getTerminatorInstrLabels(instrs[-1]) - {"ret"}
   if block_var_use is not None:
@@ -1798,6 +1835,7 @@ def getBlockVarUse(instrs: list[ir.Instr],
     for label in res.branches:
       res.depends |= block_var_use[label].depends - modified
       res.modifies |= block_var_use[label].modifies
+      res.depends_var_sizes.update(block_var_use[label].depends_var_sizes)
 
   return res
 
@@ -1812,6 +1850,11 @@ def getFuncBranchesVarUse(func: ir.Function,
   memo: dict[tuple[str, frozenset[str]], BlockVarUse] = {}
 
   res: dict[str, BlockVarUse] = {}
+
+  # Update dictionary for all dependents
+  total_depends_var_sizes: dict[str, int] = {}
+  for var_use in label_var_use.values():
+    total_depends_var_sizes.update(var_use.depends_var_sizes)
 
   for start_label in func.blocks:
     # Worklist (current label, depends so far, modifies so far)
@@ -1848,7 +1891,7 @@ def getFuncBranchesVarUse(func: ir.Function,
       for succ in block_use.branches:
         stack.append((succ, set(depends_so_far), set(modifies_so_far)))
 
-    res[start_label] = BlockVarUse(agg_depends, agg_modifies, agg_branches)
+    res[start_label] = BlockVarUse(agg_depends, agg_modifies, agg_branches, total_depends_var_sizes)
 
   return res
 
@@ -1908,7 +1951,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case ir.UncondBr():
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
 
       # Assign phi nodes
       blocks.add(assignPhiNodes(phi_info[instr.branch.label], ctx, bctx))
@@ -1919,7 +1962,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case ir.CondBr(): # Jump to a label, either known or dependent on a condition
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
 
       cond = transValue(instr.cond, ctx, bctx)
       if isinstance(cond.value, IdxbleValue):
@@ -1939,7 +1982,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case ir.Switch(): # Jump to many labels depending on a value
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
 
       assert isinstance(instr.cond.type, ir.IntegerTy)
       width = instr.cond.type.width
@@ -2189,13 +2232,17 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     fn_takes_ret_addr = fn_returns_to_address and len(fn_ret_addresses) > 1
 
     param_names = []
+    param_sizes = []
     for arg in fn.args:
       param_names.append(arg.name)
+      param_sizes.append(getByteSize(arg.type))
 
-    if fn_takes_ret_addr: param_names.append(ctx.cfg.return_address_local)
+    if fn_takes_ret_addr:
+      param_names.append(ctx.cfg.return_address_local)
+      param_sizes.append(1)
     params = [Variable(name, "param", fn.name) for name in param_names]
 
-    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, call_graph[fn.name][0],
+    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, call_graph[fn.name][0],
                                     fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
                                     all_check_locations.get(fn.name, list()),
                                     branch_alloca_size[fn.name], total_alloca_size.get(fn.name, None),
@@ -2215,10 +2262,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
     fn_name = func.name
     info = ctx.fn_info[fn_name]
 
-    for arg in func.args:
-      if getByteSize(arg.type) > 1:
-        raise CompException("Parameters can only be one scratch byte in size") # TODO FIX
-
     is_first_block = True
     total_fn_allocated = 0
     for block in func.blocks.values():
@@ -2227,18 +2270,21 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       if is_first_block:
         proc_name = fn_name
         localized_params = info.params
+        localized_param_sizes = info.param_sizes
       else:
         proc_name = localizeLabel(block.label, info)
         localized_params = []
+        localized_param_sizes = []
 
       # Get code to start the branch (procedure definition, etc)
       if (block.label not in info.checked_blocks) or (is_first_block and info.branches_to_first):
-        starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params, info, ctx,
+        starting_fn_code, ctx = getUncheckedProcedureStart(proc_name, localized_params,
+                                                           localized_param_sizes, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
         next_var_use_depends = info.block_var_use[block.label].depends
         next_var_use_depends |= ctx.cfg.special_locals
-        starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params,
+        starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params, localized_param_sizes,
                                                          next_var_use_depends, info, ctx)
 
       if is_first_block and ctx.cfg.do_debug_branch_log:
@@ -2251,14 +2297,14 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       # Store the previous stack size if necessary
       if is_first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
-        starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params))
+        starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params, info.param_sizes))
           .setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
 
       if is_first_block and info.branches_to_first:
         # Work out what variables might be depended on in future
         poss_depends = info.block_var_use[block.label].depends
         poss_depends |= ctx.cfg.special_locals
-        starting_fn_code.add(assignParameters(info.params, poss_depends))
+        starting_fn_code.add(assignParameters(info.params, info.param_sizes, poss_depends))
 
         first_block_proc_name = localizeLabel(block.label, info)
 
@@ -2268,10 +2314,10 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         ctx.proj.code.append(starting_fn_code)
 
         if block.label not in info.checked_blocks:
-          starting_fn_code, ctx = getUncheckedProcedureStart(first_block_proc_name, [], info, ctx,
+          starting_fn_code, ctx = getUncheckedProcedureStart(first_block_proc_name, [], [], info, ctx,
                                                             is_counted=info.returns_to_address)
         else:
-          starting_fn_code, ctx = getCheckedProcedureStart(first_block_proc_name, [],
+          starting_fn_code, ctx = getCheckedProcedureStart(first_block_proc_name, [], [],
                                                            poss_depends, info, ctx)
 
         is_first_block = False
@@ -2293,8 +2339,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
-      available_params: list[Variable] = info.params if is_first_block else []
-      bctx = BlockInfo(info, available_params, first_block=is_first_block,
+      available_params, av_param_sizes = (info.params, info.param_sizes) if is_first_block else ([], [])
+      bctx = BlockInfo(info, available_params, av_param_sizes, first_block=is_first_block,
                        code=starting_fn_code, label=block.label,
                        allocated=total_fn_allocated)
 
@@ -2409,7 +2455,7 @@ def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context)
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params)
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, [1]*len(params))
   ctx.next_fn_id += 1
   return ctx
 
