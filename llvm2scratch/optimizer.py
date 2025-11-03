@@ -85,7 +85,7 @@ def setInputs(block: sb3.Block, inputs: list[sb3.Value]) -> sb3.Block:
   return block
 
 # Returns None if not an unknown and known else [the known, the unknown, and if the left was known]
-def getKnownAndUnknown(value: sb3.Op) -> tuple[sb3.Known, sb3.Value, bool] | None:
+def getKnownAndUnknown(value: sb3.Op | sb3.BoolOp) -> tuple[sb3.Known, sb3.Value, bool] | None:
   if value.right is None: return None
   if isinstance(value.left, sb3.Known):
     return value.left, value.right, True
@@ -135,7 +135,7 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
             value = sb3.KnownBool(left or right)
 
       elif value.op in ["and", "or"] and \
-        (isinstance(value.left, sb3.Known) or isinstance(value.right, sb3.Known)):
+         (isinstance(value.left, sb3.Known) or isinstance(value.right, sb3.Known)):
         did_opti_total = True
         known, unknown = (value.left, value.right) if isinstance(value.left, sb3.Known) \
           else (value.right, value.left)
@@ -150,9 +150,30 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
           value = unknown
 
       elif value.op in ["<", ">", "="] and \
-          ((isinstance(value.left, sb3.Op) and value.left.op == "bool_as_int") ^ \
-          (isinstance(value.right, sb3.Op) and value.right.op == "bool_as_int")) and \
-          (isinstance(value.left, sb3.Known) ^ isinstance(value.right, sb3.Known)):
+           (isinstance(value.left, sb3.Known) or isinstance(value.right, sb3.Known)) and \
+           ((isinstance(value.left, sb3.Op) and value.left.op in {"add", "sub"}) ^ \
+           (isinstance(value.right, sb3.Op) and value.right.op in {"add", "sub"})):
+        known_and_unknown_comp = getKnownAndUnknown(value)
+        assert known_and_unknown_comp is not None
+        known_comp, unknown_comp, known_comp_is_left = known_and_unknown_comp
+        assert isinstance(unknown_comp, sb3.Op)
+
+        known_and_unknown_add = getKnownAndUnknown(unknown_comp)
+        if isinstance(known_comp.known, (float, bool)) and known_and_unknown_add is not None:
+          known_add, unknown_add, known_add_is_left = known_and_unknown_add
+          if isinstance(known_add.known, (float, bool)) and not (known_add_is_left and unknown_comp.op == "sub"):
+            value_added = float(known_add.known if unknown_comp.op == "add" else -known_add.known)
+            known_comp = sb3.Known(known_comp.known - value_added) # Subtract from both sides
+            unknown_comp = unknown_add
+
+            did_opti_total = True
+            value = sb3.BoolOp(value.op, known_comp, unknown_comp) if known_comp_is_left else \
+                    sb3.BoolOp(value.op, unknown_comp, known_comp)
+
+      elif value.op in ["<", ">", "="] and \
+           ((isinstance(value.left, sb3.Op) and value.left.op == "bool_as_int") ^ \
+           (isinstance(value.right, sb3.Op) and value.right.op == "bool_as_int")) and \
+           (isinstance(value.left, sb3.Known) ^ isinstance(value.right, sb3.Known)):
         did_opti_total = True
         op = value.op
         unknown, known = value.left, value.right

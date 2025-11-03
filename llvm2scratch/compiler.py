@@ -513,10 +513,9 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, mid_val, True,
                                      _lo=_lo,     _hi=mid))])
 
-def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value, prev_sum: sb3.Value) -> sb3.Value:
+def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value, prev_sum: sb3.Value, ctx: Context) -> sb3.Value:
   # Binary subtraction is exactly the same as addition but using subtraction to apply the carry/borrow bit and subtraction
   # checks for negative instead. The modulus used with add also functions as a "borrow"
-
   raw_sum = sb3.Op(op, left, right)
 
   if op == "add":
@@ -525,6 +524,8 @@ def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value
     carry = sb3.BoolOp("<", prev_sum, sb3.Known(0))
 
   carried_sum = sb3.Op(op, raw_sum, carry)
+  # When using known values, the optimizer can subtract values from both sides
+  if ctx.cfg.opti: carried_sum = optimizer.completeSimplifyValue(carried_sum)
 
   return carried_sum
 
@@ -537,6 +538,11 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
   assert steps == math.ceil(width / VARIABLE_MAX_BITS)
   if steps == 0:
     return IdxbleValueAndBlocks()
+
+  if ctx.cfg.opti:
+    # Optimize the values beforehand - helps with finding optimial calculation after optimizations
+    left = IdxbleValue([optimizer.completeSimplifyValue(l) for l in left.vals])
+    right = IdxbleValue([optimizer.completeSimplifyValue(r) for r in right.vals])
 
   best_cost = float("inf")
   best_blocks = sb3.BlockList()
@@ -574,7 +580,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
             prev = sb3.GetVar(stored_temp_names[prev_stored])
 
           for j in range(start, i + 1):
-            prev = paritialSumDiff(op, left.vals[j], right.vals[j], prev)
+            prev = paritialSumDiff(op, left.vals[j], right.vals[j], prev, ctx)
 
           raw = prev
 

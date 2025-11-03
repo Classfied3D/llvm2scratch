@@ -304,6 +304,9 @@ class Known(Value):
     else:
       self.known = float(val)
 
+  def __repr__(self) -> str:
+    return self.known.__repr__()
+
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     raw = self.known
     if not isinstance(self.known, str):
