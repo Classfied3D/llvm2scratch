@@ -15,7 +15,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Examples
 * [Hello World](https://scratch.mit.edu/projects/1201848279/)
-* [Math](https://scratch.mit.edu/projects/1206058442/)
+* [Integer Math](https://scratch.mit.edu/projects/1206058442/)
 * [Old Branching](https://scratch.mit.edu/projects/1206466346/)
 * [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
 * [Recursion](https://scratch.mit.edu/projects/1211169662/)
@@ -25,6 +25,11 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Installation
 
 * Install llvm2scratch with `pip install ` followed by the path to the project root (the folder containing the pyproject.toml and llvm2scratch folder)
+
+## Usage
+```
+llvm2scratch [-h] [-o OUTPUT] [--opti OPTI] input
+```
 
 ## Info
 
@@ -53,7 +58,6 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Planning
 
-* Linking LLVM IR Files: https://stackoverflow.com/a/41181212/
 * Opti: unused param elision
 * Opti: known list (lookup table) progagation
 * Opti: remove Repeat(Known(1))

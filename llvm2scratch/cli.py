@@ -7,7 +7,7 @@ def main():
   parser = argparse.ArgumentParser(description="Process a file with optional optimization.")
   parser.add_argument("input", type=Path, help="Path to the input ir file")
   parser.add_argument(
-    "--output",
+    "-o", "--output",
     type=Path,
     default="out.sprite3",
     help="Path to the output sprite3 file"
