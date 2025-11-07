@@ -7,7 +7,7 @@ def main():
   os.chdir(script_dir)
 
   # --target=i386-none-elf will remove standard lib, preferable when adding own
-  subprocess.run(["clang", "-S", "-m32", "-O0", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "main.ll"],
+  subprocess.run(["clang", "-S", "-m32", "-Os", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "main.ll"],
                  cwd=os.path.join(script_dir, "input"))
 
   with open("input/main.ll", "r") as file:

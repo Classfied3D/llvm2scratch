@@ -14,10 +14,15 @@ int add_one(int num) {
   return num + 1;
 }
 
-void do_nothing(long long input) {}
+long long add_one_ll(long long num) {
+  return num + 1;
+}
+
+void do_nothing(void) {}
 
 int test_branch(int num) {
-  do_nothing(ll_a);
+  do_nothing();
+  ll_a = add_one_ll(ll_a);
 
   int a = 3;
 

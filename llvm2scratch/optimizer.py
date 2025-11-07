@@ -601,11 +601,22 @@ def assignmentElisionBlock(blocklist: sb3.BlockList, to_elide: dict[str, sb3.Val
 
   return new_blocklist, did_opti
 
-def assignmentElision(proj: sb3.Project, ignore_external_change: set[str] | None = None) -> tuple[sb3.Project, bool]:
-  """Optimise a code block by removing variable assignments which only lead to one read.
+def assignmentElision(proj: sb3.Project,
+                      dont_remove: set[str] | None = None, \
+                      ignore_external_change: set[str] | None = None) -> tuple[sb3.Project, bool]:
+  """
+  Optimise a code block by removing variable assignments which only lead to one read.
+  Don't remove: a set of variable names in which assignments should not be elided for (e.g.
+  return values)
   Ignore external change: a set of variables in which even though might be modified outside
-  the function lead to no overall change (e.g. current stack size)."""
+  the function lead to no overall change (e.g. current stack size).
+  """
   _value_varuse_cache.clear()
+
+  if dont_remove is None:
+    dont_remove = set()
+  else:
+    dont_remove = {"var:" + var_name for var_name in dont_remove}
 
   if ignore_external_change is None:
     ignore_external_change = set()
@@ -719,6 +730,11 @@ def assignmentElision(proj: sb3.Project, ignore_external_change: set[str] | None
 
       to_elide.update(changed_but_unread)
 
+      # Don't elide vars in dont_elide
+      for var_name in dont_remove:
+        while var_name in to_elide.keys():
+          del to_elide[var_name]
+
       # Calculate if it is actually faster to elide
       slower_to_elide: set[str] = set()
       for var_name, (_, value) in to_elide.items():
@@ -744,10 +760,17 @@ def assignmentElision(proj: sb3.Project, ignore_external_change: set[str] | None
 
   return proj, did_total_opti
 
-def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None, ignore_external_change: set[str] | None = None) -> sb3.Project:
-  """Perform various optimizations (definied in all_opti) on a project.
+def optimize(proj: sb3.Project,
+             all_opti: set[Optimization] | None = None, \
+             dont_remove: set[str] | None = None, \
+             ignore_external_change: set[str] | None = None) -> sb3.Project:
+  """
+  Perform various optimizations (definied in all_opti) on a project.
+  Don't remove: a set of variable names in which assignments should not be elided for (e.g.
+  return values)
   Ignore external change: a set of variables in which even though might be modified outside
-  the function lead to no overall change (e.g. current stack size)."""
+  the function lead to no overall change (e.g. current stack size).
+  """
   if all_opti is None:
     all_opti = ALL_OPTIMIZATIONS
 
@@ -757,7 +780,7 @@ def optimize(proj: sb3.Project, all_opti: set[Optimization] | None = None, ignor
     current_opti = opti_to_perform.pop()
     match current_opti:
       case Optimization.ASSIGNMENT_ELISION:
-        proj, did_opti = assignmentElision(proj, ignore_external_change)
+        proj, did_opti = assignmentElision(proj, dont_remove, ignore_external_change)
       case Optimization.KNOWN_VALUE_PROPAGATION:
         proj, did_opti = knownValuePropagation(proj)
       case _:

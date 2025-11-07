@@ -68,6 +68,7 @@ class Context:
   cfg: Config
   fn_info: dict[str, FuncInfo] = field(default_factory=dict)
   globvar_to_ptr: dict[str, int] = field(default_factory=dict)
+  highest_return_size: int | None = None
   next_fn_id: int = 0
 
 @dataclass
@@ -142,7 +143,7 @@ class IdxbleValueAndBlocks:
 @dataclass
 class Variable:
   var_name: str
-  var_type: Literal["global", "param", "var"]
+  var_type: Literal["global", "param", "var", "special_var"]
   fn_name: str | None
 
   def getUnidxedRawVarName(self) -> str:
@@ -154,6 +155,8 @@ class Variable:
       case "var":
         assert self.fn_name is not None
         return f"%{self.fn_name}:{self.var_name}" # Localize variables per function
+      case "special_var":
+        return f"{self.var_name}"
       case _:
         raise CompException("Unmatched")
 
@@ -728,7 +731,8 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
   return blocks, ctx
 
 def transSimpleCall(name: str, arguments: list[sb3.Value],
-                    output: Variable | None, ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
+                    result: Variable | None, result_size: int | None,
+                    ctx: Context) -> tuple[sb3.BlockList, sb3.BlockList]:
   """
   Translates simple function calls. Deals with passing parameters and
   return values. The first block list returned is any blocks to call
@@ -739,14 +743,19 @@ def transSimpleCall(name: str, arguments: list[sb3.Value],
   call_blocks = sb3.BlockList([sb3.ProcedureCall(name, arguments)])
 
   set_value_blocks = sb3.BlockList()
-  if output is not None:
-    set_value_blocks.add(output.setValue(sb3.GetVar(ctx.cfg.return_var)))
+  if result is not None:
+    assert result_size is not None
+    return_var = Variable(ctx.cfg.return_var, "special_var", None)
+    if result_size == 1:
+      set_value_blocks.add(result.setValue(return_var.getValue()))
+    else:
+      set_value_blocks.add(result.setAllValues(return_var.getAllValues(result_size)))
 
   return call_blocks, set_value_blocks
 
 def transComplexCall(caller: FuncInfo, callee: FuncInfo,
                      args: list[ir.Value], result: Variable | None,
-                     following_instrs: list[ir.Instr],
+                     result_size: int | None, following_instrs: list[ir.Instr],
                      ctx: Context, bctx: BlockInfo) -> tuple[Context, BlockInfo]:
   """
   Translates a function call. Deals with functions with return
@@ -806,7 +815,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
         next_var_use.depends | ctx.cfg.special_locals
       ))
 
-    call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+    call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
     bctx.code.add(arg_value_blocks)
     bctx.code.add(call_blocks)
 
@@ -841,7 +850,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       bctx.code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
 
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
-      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
       bctx.code.add(assign_blocks)
@@ -855,7 +864,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
       arguments.append(sb3.Known(return_addr_id))
 
-      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, ctx)
+      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
 
@@ -1915,10 +1924,18 @@ def transTerminatorInstr(instr: ir.Instr,
     case ir.Ret(): # Return from a func
       if instr.value is not None:
         value = transValue(instr.value, ctx, bctx)
-        if isinstance(value.value, IdxbleValue):
-          raise CompException(f"Returning multiple values not supported in {instr}")
         blocks.add(value.blocks)
-        blocks.add(sb3.EditVar("set", ctx.cfg.return_var, value.value))
+
+        return_var = Variable(ctx.cfg.return_var, "special_var", None)
+        if isinstance(value.value, sb3.Value):
+          blocks.add(return_var.setValue(value.value))
+        else:
+          blocks.add(return_var.setAllValues(value.value))
+
+        # Indicate to the optimizer that more numbered return values have been used which should not be optimized away
+        return_size = getByteSize(instr.value.type)
+        ctx.highest_return_size = return_size if ctx.highest_return_size is None else \
+                                  max(ctx.highest_return_size, return_size)
 
       # Change the stack size after setting the return value because some return values might be optimized to use
       # the stack size var
@@ -1946,7 +1963,6 @@ def transTerminatorInstr(instr: ir.Instr,
           pass # TODO FIX: if a function ever returns here the stack will unwind which may be unexpected
                # so the stop all block could be used. This happens with the main function
 
-      # TODO FIX: deallocate on ret instruction (only if function can allocate)
       blocks.end = True
 
     case ir.UncondBr():
@@ -2364,9 +2380,10 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           else:
             callee_info = ctx.fn_info[callee_name]
             result = None if instr.result is None else transVar(instr.result, bctx)
+            result_size = None if instr.result is None else getByteSize(instr.func.return_type)
             following_instrs = block.instrs[instr_index + 1:]
 
-            ctx, bctx = transComplexCall(info, callee_info, args, result, following_instrs, ctx, bctx)
+            ctx, bctx = transComplexCall(info, callee_info, args, result, result_size, following_instrs, ctx, bctx)
         else:
           instr_code, ctx, bctx = transInstr(instr, ctx, bctx)
           bctx.code.add(instr_code)
@@ -2449,6 +2466,12 @@ def initLocalStack(ctx: Context) -> sb3.BlockList:
       sb3.EditList("addto", ctx.cfg.local_stack_var, None, sb3.Known(0)),
     ]))
   ])
+
+def getDontRemove(ctx: Context) -> set[str]:
+  res = {ctx.cfg.return_var}
+  if ctx.highest_return_size is not None:
+    res |= {Variable(ctx.cfg.return_var, "special_var", None).getRawVarName(i) for i in range(ctx.highest_return_size)}
+  return res
 
 def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context) -> Context:
   localized_params = [Variable(param, "param", name) for param in params]
@@ -2560,6 +2583,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx.proj.code.append(initblocks)
 
   # Optimise scratch project
-  if cfg.opti: ctx.proj = optimizer.optimize(ctx.proj, ignore_external_change={ctx.cfg.stack_size_var})
+  if cfg.opti:
+    ctx.proj = optimizer.optimize(ctx.proj,
+                                  dont_remove = getDontRemove(ctx),
+                                  ignore_external_change = {ctx.cfg.stack_size_var})
 
   return ctx.proj, debug_info
