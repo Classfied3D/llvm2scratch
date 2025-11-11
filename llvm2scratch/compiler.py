@@ -660,10 +660,11 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
   for res_var, ir_val in phi_info:
     if isinstance(ir_val, ir.UndefVal): continue # Undef values do not need to be assigned
     val = transValue(ir_val, ctx, bctx)
-    if isinstance(val, IdxbleValueAndBlocks):
-      raise CompException(f"Function argument cannot be an indexable value")
     blocks.add(val.blocks)
-    blocks.add(res_var.setValue(val.value))
+    if isinstance(val, ValueAndBlocks):
+      blocks.add(res_var.setValue(val.value))
+    else:
+      blocks.add(res_var.setAllValues(val.value))
 
   return blocks
 
