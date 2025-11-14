@@ -172,6 +172,7 @@ class Variable:
     return sb3.GetVar(name)
 
   def getAllValues(self, value_len: int) -> IdxbleValue:
+    assert value_len > 1
     values = []
     for i in range(value_len):
       values.append(self.getValue(i))
@@ -182,6 +183,7 @@ class Variable:
     return sb3.EditVar(op, self.getRawVarName(index), value)
 
   def setAllValues(self, values: IdxbleValue) -> sb3.BlockList:
+    assert len(values.vals) > 1
     blocks = sb3.BlockList()
     for i, val in enumerate(values.vals):
       blocks.add(self.setValue(val, index=i))
@@ -660,7 +662,10 @@ def assignParameters(params: list[Variable], param_sizes: list[int], next_var_us
     var.var_type = "var"
     # Don't assign anything we depend upon in future
     if var.var_name in next_var_use_depends:
-      blocks.add(var.setAllValues(param.getAllValues(size)))
+      if size == 1:
+        blocks.add(var.setValue(param.getValue()))
+      else:
+        blocks.add(var.setAllValues(param.getAllValues(size)))
   return blocks
 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
