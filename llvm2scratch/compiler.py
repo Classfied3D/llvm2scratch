@@ -638,11 +638,19 @@ def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
     ptr = sb3.Op("sub", ptr, sb3.Known(-offset))
   return ptr
 
-def storeOnStack(stack_var: str, stack_size_var: str, offset: int, value: sb3.Value) -> sb3.Block:
-  return sb3.EditList("replaceat", stack_var, offsetStackSize(stack_size_var, offset), value)
+def storeOnStack(stack_var: str, stack_size_var: str, offset: int, size: int, value: sb3.Value | IdxbleValue) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+  if isinstance(value, sb3.Value):
+    blocks.add(sb3.EditList("replaceat", stack_var, offsetStackSize(stack_size_var, offset), value))
+  else:
+    for i in range(size):
+      blocks.add(sb3.EditList("replaceat", stack_var, offsetStackSize(stack_size_var, offset + i), value.vals[i]))
+  return blocks
 
-def loadFromStack(stack_var: str, stack_size_var: str, offset: int) -> sb3.Value:
-  return sb3.GetOfList("atindex", stack_var, offsetStackSize(stack_size_var, offset))
+def loadFromStack(stack_var: str, stack_size_var: str, offset: int, size: int) -> sb3.Value | IdxbleValue:
+  res: list[sb3.Value] = [sb3.GetOfList("atindex", stack_var, offsetStackSize(stack_size_var, offset + i)) for i in range(size)]
+  if size == 1: return res[0]
+  return IdxbleValue(res)
 
 def assignParameters(params: list[Variable], param_sizes: list[int], next_var_use_depends: set[str]) -> sb3.BlockList:
   assert len(params) == len(param_sizes)
@@ -856,10 +864,15 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       bctx.code.add(call_blocks)
       bctx.code.add(assign_blocks)
     else:
-      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(len(must_store))))
+      total_size = sum(must_store_sizes)
 
-      for i, var in enumerate(must_store):
-        bctx.code.add(storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -i, var.getValue()))
+      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(total_size)))
+
+      offset = 0
+      for i, (var, size) in enumerate(zip(must_store, must_store_sizes)):
+        val = var.getValue() if size == 1 else var.getAllValues(size)
+        bctx.code.add(storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -offset - (size - 1), size, val))
+        offset += size
         must_store[i].var_type = "var"
 
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
@@ -879,10 +892,16 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
 
-      for i, var in enumerate(must_store):
-        bctx.code.add(var.setValue(loadFromStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -i)))
+      offset = 0
+      for var, size in zip(must_store, must_store_sizes):
+        val = loadFromStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, -offset - (size - 1), size)
+        if isinstance(val, sb3.Value):
+          bctx.code.add(var.setValue(val))
+        else:
+          bctx.code.add(var.setAllValues(val))
+        offset += size
 
-      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(-len(must_store))))
+      bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(-total_size)))
 
   bctx.next_call_id += 1
 
