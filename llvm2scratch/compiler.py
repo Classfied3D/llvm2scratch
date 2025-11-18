@@ -294,15 +294,22 @@ def transValue(val: ir.Value,
     case ir.KnownFloatVal():
       return ValueAndBlocks(sb3.Known(val.value))
 
-    case ir.KnownArrVal():
+    case ir.KnownArrVal() | ir.KnownStructVal():
       values: list[sb3.Value] = []
       blocks = sb3.BlockList()
       for element in val.values:
         el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init))
-        values.append(el_val)
+        if isinstance(el_val, sb3.Value):
+          values.append(el_val)
+        else:
+          values.extend(el_val.vals)
         blocks.add(el_blocks)
 
       return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
+
+    case ir.NullPtrVal():
+      # Since pointers start from one anyway (because lists start from one in scratch), zero can be used for null
+      return ValueAndBlocks(sb3.Known(0))
 
     case ir.ConstExprVal():
       gep = val.expr
