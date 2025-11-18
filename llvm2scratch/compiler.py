@@ -261,7 +261,10 @@ def transValue(val: ir.Value,
       var = transVar(val, bctx)
       res = var.getValue()
       if isinstance(val, ir.GlobalVarVal):
-        if (ctx.cfg.opti or is_global_init) and val.name in ctx.globvar_to_ptr:
+        if val.name not in ctx.globvar_to_ptr:
+          raise CompException(f"Function pointers are not yet supported (reference to @{val.name})")
+
+        elif ctx.cfg.opti or is_global_init:
           # Global variables store their address in their variable
           # when optimizations are enabled we use this address directly
           res = sb3.Known(ctx.globvar_to_ptr[val.name])
