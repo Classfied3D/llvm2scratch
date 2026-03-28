@@ -2585,15 +2585,21 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
-  ctx = addFunc("SB3_ask", ["output", "input"], sb3.BlockList([
-    # if (input != "")
-    sb3.ControlFlow("if", sb3.BoolOp("not", sb3.BoolOp("=", sb3.GetParameter(localizeParameter("input")), sb3.Known(""))), sb3.BlockList([
-        sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))])
-    ])),
-
+  ctx = addFunc("SB3_ask_str", ["output", "input"], sb3.BlockList([
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
-    # This will set the return value for us.
-    sb3.ProcedureCall("!helper_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))])
+
+    sb3.ProcedureCall("!helper_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))]),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+  ]), ctx)
+
+  # Same as SB3_ask_str, but it outputs a double.
+  ctx = addFunc("SB3_ask_dbl", ["output", "input"], sb3.BlockList([
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
+
+    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")), sb3.GetAnswer()),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
   return ctx

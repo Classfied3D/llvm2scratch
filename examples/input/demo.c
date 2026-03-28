@@ -149,8 +149,13 @@ int main(void) {
   // Give me a sign to get my way
   question[34] = 0;
   char answer[32];
-  SB3_ask(answer, question);
+  SB3_ask_str(answer, question);
   SB3_say_str(answer);
+
+  // SB3_ask_dbl works a bit like scanf
+  double answer_dbl;
+  SB3_ask_dbl(&answer_dbl, "Give me a number");
+  SB3_say_dbl(answer_dbl);
 
   return 0;
 }
