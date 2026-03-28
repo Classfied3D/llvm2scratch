@@ -455,7 +455,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         info.might_modify.add(name)
         info.always_modify.add(name)
       case sb3.Ask():
-        name = "answer"
+        name = "answer:"
         info.might_modify.add(name)
         info.always_modify.add(name)
       case sb3.ProcedureCall() | sb3.Broadcast():

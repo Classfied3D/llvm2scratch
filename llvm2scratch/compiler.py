@@ -2598,7 +2598,11 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
-    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")), sb3.GetAnswer()),
+    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")),
+                 sb3.Op("str_to_float", sb3.GetAnswer()) # (answer + 0); casts strings to floats.
+                ),
+
+    # It might be worth making this be a 1 by default, but outputting 0 if the cast was unsuccessful.
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 

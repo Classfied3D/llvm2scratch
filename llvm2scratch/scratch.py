@@ -21,6 +21,7 @@ SHORT_OP_TO_OPCODE = {
   "reptimes": "control_repeat",
   "until": "control_repeat_until",
   "while": "control_while",
+
   # Variables
   "set": "data_setvariableto",
   "change": "data_changevariableby",
@@ -31,7 +32,9 @@ SHORT_OP_TO_OPCODE = {
   "deleteall": "data_deletealloflist",
   "atindex": "data_itemoflist",
   "indexof": "data_itemnumoflist",
+
   # Operators
+  "str_to_float": "operator_add",
   "add": "operator_add",
   "sub": "operator_subtract",
   "mul": "operator_multiply",
@@ -578,16 +581,16 @@ class GetOfList(Value):
     return [3, id, [10, ""]], ctx
 
 # Operators
-OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int",
+OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_to_float",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
 @dataclass
-class Op(Value): # TODO: make this be able to use one input
+class Op(Value):
   op: OperatorsCodes
   left: Value
   right: Value | None = None
 
   def __post_init__(self):
-    takes_one_op = self.op in ["length_of", "round", "bool_as_int"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
+    takes_one_op = self.op in ["length_of", "round", "bool_as_int", "str_to_float"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
     given_one_op = self.right is None
 
     if takes_one_op != given_one_op:
@@ -600,7 +603,9 @@ class Op(Value): # TODO: make this be able to use one input
 
     id = genId()
 
-    takes_one_op = self.right is None
+    right = self.right if self.op != "str_to_float" else Known(0)
+
+    takes_one_op = right is None
 
     match self.op:
       case "rand_between":
@@ -628,12 +633,12 @@ class Op(Value): # TODO: make this be able to use one input
 
     raw_left, ctx = self.left.getRawValue(id, ctx, casts_left_input_to)
     inputs = {lft_param: raw_left}
-    if self.right is not None:
+    if right is not None:
       casts_right_input_to = casts_left_input_to
       if self.op == "letter_n_of":
         casts_right_input_to = ScratchCast.TO_STR
 
-      raw_right, ctx = self.right.getRawValue(id, ctx, casts_right_input_to)
+      raw_right, ctx = right.getRawValue(id, ctx, casts_right_input_to)
       inputs.update({rgt_param: raw_right})
 
     fields = {}
