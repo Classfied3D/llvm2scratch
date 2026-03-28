@@ -1672,10 +1672,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       true_val = transValue(instr.true_value, ctx, bctx)
       false_val = transValue(instr.false_value, ctx, bctx)
 
-      if not all(isinstance(val.type, ir.IntegerTy) for val in \
-          (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
-        raise CompException(f"Instruction {instr} with opcode add only supports "
-                            f"integers, got other type")
+      # TODO: Fix it (#3)
+      # if not all(isinstance(val.type, ir.IntegerTy) for val in \
+      #     (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
+      #   raise CompException(f"Instruction {instr} with opcode add only supports "
+      #                       f"integers, got other type")
       assert isinstance(instr.cond.type, ir.IntegerTy)
       assert instr.cond.type.width == 1
       assert isinstance(cond.value, sb3.Value)
@@ -2590,7 +2591,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.ProcedureCall("!helper_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))]),
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
   ]), ctx)
 
   # Same as SB3_ask_str, but it outputs a double.
@@ -2598,12 +2599,14 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
-    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")),
-                 sb3.Op("str_to_float", sb3.GetAnswer()) # (answer + 0); casts strings to floats.
-                ),
+    sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
+    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
 
-    # It might be worth making this be a 1 by default, but outputting 0 if the cast was unsuccessful.
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
+
+    sb3.ControlFlow("if", sb3.BoolOp("not", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char") )), sb3.BlockList([
+      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+    ]))
   ]), ctx)
 
   return ctx
