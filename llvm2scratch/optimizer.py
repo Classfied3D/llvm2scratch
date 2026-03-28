@@ -386,7 +386,7 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
     return _value_varuse_cache[key]
 
   match value:
-    case sb3.Known() | sb3.GetParameter():
+    case sb3.Known() | sb3.GetParameter() | sb3.GetAnswer():
       result = set(), Counter()
     case sb3.GetVar():
       name = "var:" + value.var_name
@@ -551,7 +551,7 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
-    case sb3.Known() | sb3.GetParameter() | sb3.GetCounter():
+    case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | sb3.GetAnswer():
       result = value
       did_opti = False
     case sb3.GetVar():

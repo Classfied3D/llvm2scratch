@@ -476,6 +476,31 @@ class EditCounter(Block):
       "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
 
+# Sensing
+@dataclass
+class Ask(Block):
+  value: Value
+
+  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    raw_msg, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
+    return {
+      "opcode": "sensing_askandwait",
+      "inputs": {
+        "QUESTION": raw_msg
+      }
+    }, ctx
+
+@dataclass
+class GetAnswer(Value):
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    id = genId()
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": "sensing_answer"
+    }), BlockMeta(parent))
+
+    return [3, id, [10, ""]], ctx
+
 # Variables
 @dataclass
 class GetVar(Value):

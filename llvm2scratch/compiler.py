@@ -2527,21 +2527,48 @@ def addForeignFunctions(ctx: Context) -> Context:
       ascii_lookup.append(char)
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
 
-  ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
-    sb3.EditVar("set", "buffer", sb3.Known("")),
+  # Converts a C string to a Scratch string.
+  # Not meant to be used in C as it doesn't support Scratch strings.
+  ctx = addFunc("SB3_str2scratch", ["input"], sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
-      sb3.EditVar("set", "buffer",
+      sb3.EditVar("set", ctx.cfg.return_var,
         sb3.Op("join",
-          sb3.GetVar("buffer"),
+          sb3.GetVar(ctx.cfg.return_var),
           sb3.GetOfList("atindex",
             (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
             sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
       sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
     ])),
-    sb3.Say(sb3.GetVar("buffer")),
+  ]), ctx)
+
+  # Converts a Scratch string to a C string.
+  # Not meant to be used in C as it doesn't support Scratch strings.
+  ctx = addFunc("SB3_scratch2str", ["input", "str"], sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
+    sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("str"))),
+    sb3.EditVar("set", "i", sb3.Known(1)),
+    sb3.ControlFlow("reptimes", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))), sb3.BlockList([
+      # TODO: Case sensitivity (using costumes).
+      # This would also help for Scratch 2.0 support.
+      #   (although that's more than probably not planned, but I personally just really like Scratch 2.)
+      sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetVar("ptr"), sb3.GetOfList("indexof",
+        (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+        sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input")))
+        )),
+      sb3.EditVar("change", "i", sb3.Known(1)),
+      sb3.EditVar("change", "ptr", sb3.Known(1)),
+    ])),
+    # End of string
+    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetVar("ptr"), sb3.Known(0)),
+  ]), ctx)
+
+  ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
+    sb3.ProcedureCall("SB3_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
@@ -2555,6 +2582,49 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetParameter(localizeParameter("input"))),
   ]), ctx)
+
+  # output (str): The answer the user provided.
+  # input  (str): The question to display in the text bubble.
+  ctx = addFunc("SB3_ask", ["output", "input"], sb3.BlockList([
+    # if (input != "")
+    sb3.ControlFlow("if", sb3.BoolOp("not", sb3.BoolOp("=", sb3.GetParameter(localizeParameter("input")), sb3.Known(""))), sb3.BlockList([
+        sb3.ProcedureCall("SB3_str2scratch", [sb3.GetParameter(localizeParameter("input"))])
+    ])),
+
+    sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
+    # This will set the return value for us.
+    sb3.ProcedureCall("SB3_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))])
+  ]), ctx)
+
+  ## https://scratch.mit.edu/discuss/post/9065787/
+  ## Only useful for testing.
+  # ctx = addFunc("scanf", ["format", "ptr"], sb3.BlockList([
+  #   sb3.Ask(sb3.GetVar("buffer")),
+  #   sb3.EditVar("set", "buffer", sb3.Known("")),
+  #   sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("format"))),
+  #   sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+  #   sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
+  #     sb3.EditVar("set", "buffer",
+  #       sb3.Op("join",
+  #         sb3.GetVar("buffer"),
+  #         sb3.GetOfList("atindex",
+  #           (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+  #           sb3.GetVar("char")))),
+  #     sb3.EditVar("change", "ptr", sb3.Known(1)),
+  #     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+  #   ])),
+  #   sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar("buffer"), sb3.Known("%c")), sb3.BlockList([
+  #     sb3.EditList("replaceat", ctx.cfg.stack_var,
+  #       sb3.GetParameter(localizeParameter("ptr")),
+  #       sb3.GetOfList("indexof",
+  #         (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+  #         sb3.GetAnswer()))
+  #   ])),
+  #   sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar("buffer"), sb3.Known("%lf")), sb3.BlockList([
+  #     sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("ptr")), sb3.GetAnswer())
+  #   ])),
+  #   sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+  # ]), ctx)
 
   return ctx
 

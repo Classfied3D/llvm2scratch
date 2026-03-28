@@ -107,6 +107,7 @@ int main(void) {
       SB3_say_str("21");
       break;
     default:
+      // Should say "default"
       SB3_say_str(message + 3);
       break;
   }
@@ -133,7 +134,7 @@ int main(void) {
   i = -i;
 
   int j = 257;
-  u_int8_t k = j;
+  uint8_t k = j;
   float l = 3.14f;
   int m = l;
   float n = m;
@@ -143,6 +144,13 @@ int main(void) {
   o -= 5;
 
   ll_a += 55;
+
+  char question[] = "Give me a smile, give me your name, girl";
+  // Give me a sign to get my way
+  question[34] = 0;
+  char answer[32];
+  SB3_ask(answer, question);
+  SB3_say_str(answer);
 
   return 0;
 }
