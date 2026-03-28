@@ -2529,7 +2529,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Converts a C string to a Scratch string.
   # Not meant to be used in C as it doesn't support Scratch strings.
-  ctx = addFunc("SB3_str2scratch", ["input"], sb3.BlockList([
+  ctx = addFunc("!helper_str2scratch", ["input"], sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
@@ -2547,7 +2547,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
-  ctx = addFunc("SB3_scratch2str", ["input", "str"], sb3.BlockList([
+  ctx = addFunc("!helper_scratch2str", ["input", "str"], sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("str"))),
     sb3.EditVar("set", "i", sb3.Known(1)),
@@ -2567,7 +2567,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   ]), ctx)
 
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
-    sb3.ProcedureCall("SB3_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
@@ -2588,12 +2588,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("SB3_ask", ["output", "input"], sb3.BlockList([
     # if (input != "")
     sb3.ControlFlow("if", sb3.BoolOp("not", sb3.BoolOp("=", sb3.GetParameter(localizeParameter("input")), sb3.Known(""))), sb3.BlockList([
-        sb3.ProcedureCall("SB3_str2scratch", [sb3.GetParameter(localizeParameter("input"))])
+        sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))])
     ])),
 
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
     # This will set the return value for us.
-    sb3.ProcedureCall("SB3_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))])
+    sb3.ProcedureCall("!helper_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))])
   ]), ctx)
 
   return ctx
