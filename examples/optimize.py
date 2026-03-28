@@ -29,6 +29,13 @@ def main():
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
+
+    # https://github.com/Classfied3D/llvm2scratch/pull/2#discussion_r3004955618
+    # Also I should stop quoting that song TwT - Heathercat123
+    Ask(Known("Give me a smile")),
+    Say(GetAnswer()),
+    Ask(Known("Give me your name")),
+    Say(GetAnswer()),
   ]))
 
   proj.code.append(BlockList([

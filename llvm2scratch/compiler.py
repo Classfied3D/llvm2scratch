@@ -2596,36 +2596,6 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("SB3_scratch2str", [sb3.GetAnswer(), sb3.GetParameter(localizeParameter("output"))])
   ]), ctx)
 
-  ## https://scratch.mit.edu/discuss/post/9065787/
-  ## Only useful for testing.
-  # ctx = addFunc("scanf", ["format", "ptr"], sb3.BlockList([
-  #   sb3.Ask(sb3.GetVar("buffer")),
-  #   sb3.EditVar("set", "buffer", sb3.Known("")),
-  #   sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("format"))),
-  #   sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
-  #   sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
-  #     sb3.EditVar("set", "buffer",
-  #       sb3.Op("join",
-  #         sb3.GetVar("buffer"),
-  #         sb3.GetOfList("atindex",
-  #           (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-  #           sb3.GetVar("char")))),
-  #     sb3.EditVar("change", "ptr", sb3.Known(1)),
-  #     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
-  #   ])),
-  #   sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar("buffer"), sb3.Known("%c")), sb3.BlockList([
-  #     sb3.EditList("replaceat", ctx.cfg.stack_var,
-  #       sb3.GetParameter(localizeParameter("ptr")),
-  #       sb3.GetOfList("indexof",
-  #         (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-  #         sb3.GetAnswer()))
-  #   ])),
-  #   sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar("buffer"), sb3.Known("%lf")), sb3.BlockList([
-  #     sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("ptr")), sb3.GetAnswer())
-  #   ])),
-  #   sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
-  # ]), ctx)
-
   return ctx
 
 def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:

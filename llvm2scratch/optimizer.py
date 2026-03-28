@@ -386,13 +386,15 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
     return _value_varuse_cache[key]
 
   match value:
-    case sb3.Known() | sb3.GetParameter() | sb3.GetAnswer():
+    case sb3.Known() | sb3.GetParameter():
       result = set(), Counter()
     case sb3.GetVar():
       name = "var:" + value.var_name
       result = {name}, Counter({name: 1})
     case sb3.GetCounter():
       return {"counter:"}, Counter()
+    case sb3.GetAnswer():
+      return {"answer:"}, Counter()
     case sb3.Op() | sb3.BoolOp():
       depends, counts = getValueVarUse(value.left)
       if value.right is not None:
@@ -450,6 +452,10 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         name = "counter:"
         if block.op == "incr":
           info.dependent.add(name)
+        info.might_modify.add(name)
+        info.always_modify.add(name)
+      case sb3.Ask():
+        name = "answer"
         info.might_modify.add(name)
         info.always_modify.add(name)
       case sb3.ProcedureCall() | sb3.Broadcast():
