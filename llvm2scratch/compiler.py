@@ -1672,11 +1672,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       true_val = transValue(instr.true_value, ctx, bctx)
       false_val = transValue(instr.false_value, ctx, bctx)
 
-      # TODO: Fix it (#3)
-      # if not all(isinstance(val.type, ir.IntegerTy) for val in \
-      #     (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
-      #   raise CompException(f"Instruction {instr} with opcode add only supports "
-      #                       f"integers, got other type")
+      if not all(isinstance(val.type, ir.IntegerTy) for val in \
+          (instr.cond, instr.true_value, instr.false_value)): # TODO: add vector support
+        raise CompException(f"Instruction {instr} with opcode add only supports "
+                            f"integers, got other type")
       assert isinstance(instr.cond.type, ir.IntegerTy)
       assert instr.cond.type.width == 1
       assert isinstance(cond.value, sb3.Value)
