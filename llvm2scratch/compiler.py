@@ -2552,23 +2552,23 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("str"))),
     sb3.EditVar("set", "i", sb3.Known(1)),
 
-    # Default return value should be True
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
-
-    # Re-using the "char" variable for counting how many letters should be copied.
-    # I think it makes sense, right?
     # Default: full string.
-    sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input")))),
 
-    # Unless...
-    sb3.ControlFlow("if", sb3.BoolOp("not", # char >= count, doing this to account for the NULL at the end.
-                                     sb3.BoolOp("<", sb3.GetVar("char"), sb3.GetParameter(localizeParameter("count")))
-                                    ), sb3.BlockList([
-      # ... the limit is higher than the inputted string.
+    sb3.ControlFlow("if_else", sb3.BoolOp("<", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))), sb3.GetParameter(localizeParameter("count"))), sb3.BlockList([
+      # The limit is high enough.
+      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
+      # Re-using the "char" variable for counting how many letters should be copied.
+      # I think it makes sense, right?
+      # Also, according to @Classified3D and the README, calculating the length twice is the fastest option.
+      sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input")))),
+    ]),
+    # Else
+    sb3.BlockList([
+      # The limit is lower than the inputted string.
       # Return False and reduce the letter count.
       # Doing -1 to account for the NULL at the end.
       sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParameter(localizeParameter("count")), sb3.Known(1))),
-      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0))
     ])),
 
     sb3.ControlFlow("reptimes", sb3.GetVar("char"), sb3.BlockList([
