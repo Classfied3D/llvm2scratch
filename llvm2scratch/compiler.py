@@ -2606,6 +2606,20 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Return value is set by scratch2str.
   ]), ctx)
 
+  # output (str): The answer the user provided.
+  # input  (str): The question to display in the text bubble.
+  ctx = addFunc("SB3_ask_str_unsafe", ["output", "input"], sb3.BlockList([
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
+
+    sb3.ProcedureCall("!helper_scratch2str", [
+      sb3.GetAnswer(),
+      sb3.GetParameter(localizeParameter("output")),
+      sb3.Known("-1"), # An invalid value causes it to never reach the limit.
+    ]),
+    # Return value is set by scratch2str. It's always going to be 1.
+  ]), ctx)
+
   # Same as SB3_ask_str, but it outputs a double.
   ctx = addFunc("SB3_ask_dbl", ["output", "input"], sb3.BlockList([
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
