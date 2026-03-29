@@ -2551,7 +2551,27 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("str"))),
     sb3.EditVar("set", "i", sb3.Known(1)),
-    sb3.ControlFlow("reptimes", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))), sb3.BlockList([
+
+    # Default return value should be True
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
+
+    # Re-using the "char" variable for counting how many letters should be copied.
+    # I think it makes sense, right?
+    # Default: full string.
+    sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input")))),
+
+    # Unless...
+    sb3.ControlFlow("if", sb3.BoolOp("not", # char >= count, doing this to account for the NULL at the end.
+                                     sb3.BoolOp("<", sb3.GetVar("char"), sb3.GetParameter(localizeParameter("count")))
+                                    ), sb3.BlockList([
+      # ... the limit is higher than the inputted string.
+      # Return False and reduce the letter count.
+      # Doing -1 to account for the NULL at the end.
+      sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParameter(localizeParameter("count")), sb3.Known(1))),
+      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
+    ])),
+
+    sb3.ControlFlow("reptimes", sb3.GetVar("char"), sb3.BlockList([
       # TODO: Case sensitivity (using costumes).
       # This would also help for Scratch 2.0 support.
       #   (although that's more than probably not planned, but I personally just really like Scratch 2.)
@@ -2561,17 +2581,11 @@ def addForeignFunctions(ctx: Context) -> Context:
         )),
       sb3.EditVar("change", "i", sb3.Known(1)),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
-
-      sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("count"))), sb3.BlockList([
-        # We're about to hit the end of the buffer, end there.
-        sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetVar("ptr"), sb3.Known(0)),
-        sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
-        sb3.StopScript("stopthis"),
-      ]))
     ])),
     # End of string
     sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetVar("ptr"), sb3.Known(0)),
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
+
+    # Return value is set above.
   ]), ctx)
 
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
@@ -2615,7 +2629,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("!helper_scratch2str", [
       sb3.GetAnswer(),
       sb3.GetParameter(localizeParameter("output")),
-      sb3.Known("-1"), # An invalid value causes it to never reach the limit.
+      sb3.Known("Infinity"),
     ]),
     # Return value is set by scratch2str. It's always going to be 1.
   ]), ctx)
