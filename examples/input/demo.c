@@ -145,11 +145,8 @@ int main(void) {
 
   ll_a += 55;
 
-  char question[] = "Give me a smile, give me your name, girl";
-  // Give me a sign to get my way
-  question[34] = 0;
   char answer[32];
-  SB3_ask_str(answer, question);
+  SB3_ask_str(answer, "Give me a string", 32);
   SB3_say_str(answer);
 
   // SB3_ask_dbl works a bit like scanf
