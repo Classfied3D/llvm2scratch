@@ -2711,7 +2711,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Reset call stack
   initblocks.add(sb3.EditCounter("clear"))
 
-  print(getFuncPtrRefs(mod))
+  # print(getFuncPtrRefs(mod))
 
   # Setup stack
   globblocks, ctx = transGlobals(mod, ctx)

@@ -190,7 +190,7 @@ class ArgumentVal(Value):
   name: str
 
 @dataclass
-class FunctionVal(KnownVal):
+class FunctionVal(KnownVal, KnownAggTargetVal):
   name: str
 
 @dataclass
