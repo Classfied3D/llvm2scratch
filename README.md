@@ -5,22 +5,28 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Progress
 * 🆕 Stack Allocation, Deallocation, Loading + Storing
 * 🔢 Integer (Up to 48 bits) and Float Operations
-* 🔃 Functions + Return Values + Recursion
+* 🔃 Functions + Return Values + Recursion + Function Pointers
 * 🔀 Branch + Switch Instructions
-* 🔁 Loops (Which unwind the call stack when necessary)
+* 🔁 Loops (Which unwind scratch's call stack when necessary)
 * ⏺ Arrays and Structs (getelementptr support)
 * 🔡 Static Variables
+* 📚 [Partial cstdlib support](https://github.com/Classfied3D/newlib-scratch)
 * ⚡ Optimizations (Known Value Propagation, Assignment Elision)
 * 📝 Sprite3 file output
 
+## Project Showcase
+* [LLM from Scratch](https://github.com/Broyojo/llm_from_scratch) by [@Broyojo](https://github.com/Broyojo) - `llama2.c` running in scratch
+* [asm2scratch](https://github.com/RetrogradeDev/asm2scratch) by [@RetrogradeDev](https://github.com/RetrogradeDev) - early llvm2scratch fork to support compiling assembly directly instead
+
 ## Examples
-* [Hello World](https://scratch.mit.edu/projects/1201848279/)
-* [Integer Math](https://scratch.mit.edu/projects/1206058442/)
-* [Old Branching](https://scratch.mit.edu/projects/1206466346/)
-* [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099/)
-* [Recursion](https://scratch.mit.edu/projects/1211169662/)
-* [Arrays + Structs](https://scratch.mit.edu/projects/1226122280/)
-* [Pi Calculator](https://scratch.mit.edu/projects/1233764273/)
+* [Hello World](https://scratch.mit.edu/projects/1201848279)
+* [Integer Math](https://scratch.mit.edu/projects/1206058442)
+* [Old Branching](https://scratch.mit.edu/projects/1206466346)
+* [New Branching + Assignment Elision](https://scratch.mit.edu/projects/1208872099)
+* [Recursion](https://scratch.mit.edu/projects/1211169662)
+* [Arrays + Structs](https://scratch.mit.edu/projects/1226122280)
+* [Pi Calculator](https://scratch.mit.edu/projects/1233764273)
+* [Function Pointers](https://scratch.mit.edu/projects/1298975442)
 
 ## Installation
 

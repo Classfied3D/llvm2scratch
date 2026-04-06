@@ -41,6 +41,9 @@ class Config:
                                                            # future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
+  min_func_ptr_id: int = stack_size + 1 # Starting ptr addr for functions. Could be independent from stack
+                                        # using LLVM datalayout
+
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_var = "!stack" # Name of the scratch list for the stack list
   stack_size_var = "!stack size" # Name of the scratch variable for the stack size
@@ -57,7 +60,9 @@ class Config:
   previous_stack_size_local = "prev stack size" # Name of the local variable to store the previous stack size
   special_locals = {return_address_local, previous_stack_size_local} # All special local vars
 
-  tmp_prefix = "tmp " # Name of temp variables before a number is added to them
+  func_ptr_parameter = "func ptr addr" # Name of the parameter to pass func ptr addr to
+
+  tmp_prefix = "%!tmp:" # Name of temp variables before a number is added to them
   zero_indexed_suffix = " (0 indexed)"
   one_indexed_suffix = " (1 indexed)"
 
@@ -67,9 +72,22 @@ class Context:
   proj: sb3.Project
   cfg: Config
   fn_info: dict[str, FuncInfo] = field(default_factory=dict)
+  fn_ptr_sig_info: list[FuncPtrSigInfo] = field(default_factory=list)
+  fn_ptr_sigs: list[tuple[ir.FuncTy, list[str]]] = field(default_factory=list)
   globvar_to_ptr: dict[str, int] = field(default_factory=dict)
   highest_return_size: int | None = None
   next_fn_id: int = 0
+
+@dataclass
+class FuncPtrSigInfo:
+  # ID for the signature of the function pointer when being called
+  signature_id: int
+  # Descriptions for following in FuncInfo
+  can_call: set[str]
+  return_addresses: list[str]
+  returns_to_address: bool
+  takes_return_address: bool
+  could_recurse: bool
 
 @dataclass
 class FuncInfo:
@@ -86,7 +104,8 @@ class FuncInfo:
   return_addresses: list[str] = field(default_factory=list)
   # If the function returns using an id to an address
   returns_to_address: bool = False
-  # If the function takes a return address as a parameter
+  # If the function takes a return address as a parameter. This can be false while
+  # returns_to_address is true if this function only can return to one possible "address"
   takes_return_address: bool = False
   # List of label names that will contain a check to reset the stack
   checked_blocks: list[str] = field(default_factory=list)
@@ -312,7 +331,8 @@ def transValue(val: ir.Value,
       return ValueAndBlocks(sb3.Known(0))
 
     case ir.FunctionVal():
-      raise CompException(f"Function pointers are not yet supported (reference to @{val.name})")
+      # Return a pointer corresponding to an id given to each func ptr reference
+      return ValueAndBlocks(sb3.Known(getFuncPtrAddr(val.name, ctx)))
 
     case ir.ConstExprVal():
       expr = val.expr
@@ -369,7 +389,8 @@ def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
   else:
     assert bctx is not None
     fn_name = bctx.fn.name
-    if bctx is not None and name in [param.var_name for param in bctx.available_params]:
+
+    if name in [param.var_name for param in bctx.available_params]:
       var_type = "param"
     else:
       var_type = "var"
@@ -386,6 +407,12 @@ def localizeCallId(call_id: int, label: str, fn_name: str, recursive: bool = Fal
   if not recursive:
     return f"{fn_name}:{label}:return addr {call_id}"
   return f"{fn_name}:{label}:recursive call {call_id}"
+
+def localizeFuncPtrSig(signature_id: int) -> str:
+  return f"!fn pointer signature:{signature_id}"
+
+def localizeFuncPtrSigCallback(signature_id: int) -> str:
+  return f"{localizeFuncPtrSig(signature_id)}:callback"
 
 def localizeSizedParameters(params: list[Variable], sizes: list[int]) -> list[str]:
   assert len(params) == len(sizes)
@@ -792,17 +819,20 @@ def transSimpleCall(name: str, arguments: list[sb3.Value],
 
   return call_blocks, set_value_blocks
 
-def transComplexCall(caller: FuncInfo, callee: FuncInfo,
+def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
                      args: list[ir.Value], result: Variable | None,
                      result_size: int | None, following_instrs: list[ir.Instr],
                      ctx: Context, bctx: BlockInfo) -> tuple[Context, BlockInfo]:
   """
   Translates a function call. Deals with functions with return
-  addresses and recursion. May change the function that instructions
-  are being added to.
+  addresses, recursion and function pointers. May change the function
+  that instructions are being added to.
   """
 
   assert bctx.label is not None
+
+  # If a function pointer, call the 'signature' corresponding to how we called the function
+  callee_name = callee.name if isinstance(callee, FuncInfo) else localizeFuncPtrSig(callee.signature_id)
 
   # Include the return value in variables which aren't depended on
   starting_var_use = BlockVarUse() if result is None else BlockVarUse(modifies={result.var_name})
@@ -854,7 +884,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
         next_var_use.depends | ctx.cfg.special_locals
       ))
 
-    call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
+    call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
     bctx.code.add(arg_value_blocks)
     bctx.code.add(call_blocks)
 
@@ -889,7 +919,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       bctx.code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
 
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
-      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
+      call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
       bctx.code.add(assign_blocks)
@@ -908,7 +938,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo,
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
       arguments.append(sb3.Known(return_addr_id))
 
-      call_blocks, assign_blocks = transSimpleCall(callee.name, arguments, result, result_size, ctx)
+      call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
 
@@ -1972,7 +2002,7 @@ def getValueFuncPtrRefs(value: ir.Value, global_names: list[str]) -> set[str]:
       # Nothing else contains a func ptr or nested values
       return set()
 
-def getFuncPtrRefs(mod: ir.Module) -> list[str]:
+def getFuncPtrRefs(mod: ir.Module) -> list[tuple[ir.FuncTy, list[str]]]:
   global_names = list(mod.global_vars.keys())
   all_refs = set()
 
@@ -1986,7 +2016,69 @@ def getFuncPtrRefs(mod: ir.Module) -> list[str]:
           all_refs |= getValueFuncPtrRefs(val, global_names)
 
   # Sort alphabetically to get a consistent compiled result
-  return sorted(list(all_refs))
+  sorted_refs = sorted(list(all_refs))
+
+  # TODO: vararg support
+  func_ptrs: list[tuple[ir.FuncTy, list[str]]] = []
+  for fn_name in sorted_refs:
+    fn = mod.functions[fn_name]
+    signature = ir.FuncTy(fn.return_type, [arg.type for arg in fn.params])
+    found = -1
+    for index, (signature_other, _) in enumerate(func_ptrs):
+      if signature == signature_other:
+        found = index
+        break
+    if found == -1:
+      func_ptrs.append((signature, [fn_name]))
+    else:
+      func_ptrs[found][1].append(fn_name)
+
+  return func_ptrs
+
+def getFuncPtrAddr(ptr: str, ctx: Context) -> int:
+  addr = ctx.cfg.min_func_ptr_id
+  for (_, ptrs) in ctx.fn_ptr_sigs:
+    if ptr in ptrs:
+      return addr + ptrs.index(ptr)
+    addr += len(ptrs)
+
+  raise CompException(f"Could not find function pointer for {ptr}")
+
+def getFuncPtrSignatureInfo(signature: ir.FuncTy, ctx: Context) -> tuple[int, list[str]]:
+  """
+  Returns (func ptr signature id, func ptrs) for a func ptr signature (inclusive)
+  """
+  for signature_id, (signature_other, ptrs) in enumerate(ctx.fn_ptr_sigs):
+    if signature_other == signature:
+      return signature_id, ptrs
+
+  raise CompException(f"Could not find function signature for {signature}")
+
+def transReturnAddr(return_address: sb3.Value, info: FuncInfo | FuncPtrSigInfo, ctx: Context) -> sb3.BlockList:
+  """
+  Returns instructions to return back to the caller function from the "address" it passed in
+  """
+  assert info.returns_to_address
+
+  blocks = sb3.BlockList()
+  if info.takes_return_address:
+    return_to_addr_code = OrderedDict()
+    for i, addr in enumerate(info.return_addresses):
+      return_to_addr_code[i] = sb3.BlockList([sb3.ProcedureCall(addr, [])])
+
+    return_table = binarySearch(return_address, return_to_addr_code, are_branches_sorted=True)
+    blocks.add(return_table)
+  elif len(info.return_addresses) > 0:
+    # If the function doesn't take a return address then it must always return to the same place
+    assert len(info.return_addresses) == 1
+    blocks.add(sb3.BlockList([sb3.ProcedureCall(info.return_addresses[0], [])]))
+  else:
+    pass # TODO FIX: if a function ever returns here the stack will unwind which may be unexpected
+         # so the stop all block could be used. This happens with the main function for example
+
+  blocks.end = True
+
+  return blocks
 
 def transTerminatorInstr(instr: ir.Instr,
                          ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
@@ -2003,7 +2095,7 @@ def transTerminatorInstr(instr: ir.Instr,
   blocks = sb3.BlockList()
   match instr:
     case ir.Unreachable(): # Never reached if not UB
-      pass
+      blocks.end = True
 
     case ir.Ret(): # Return from a func
       if instr.value is not None:
@@ -2031,21 +2123,8 @@ def transTerminatorInstr(instr: ir.Instr,
                                                                             False, bctx).getValue()))
 
       if bctx.fn.returns_to_address:
-        if bctx.fn.takes_return_address:
-          return_address = localizeVar(ctx.cfg.return_address_local, False, bctx)
-          return_to_addr_code = OrderedDict()
-          for i, addr in enumerate(bctx.fn.return_addresses):
-            return_to_addr_code.update({i: sb3.BlockList([sb3.ProcedureCall(addr, [])])})
-
-          return_table = binarySearch(return_address.getValue(), return_to_addr_code, are_branches_sorted=True)
-          blocks.add(return_table)
-        elif len(bctx.fn.return_addresses) > 0:
-          # If the function doesn't take a return address then it must always return to the same place
-          assert len(bctx.fn.return_addresses) == 1
-          blocks.add(sb3.BlockList([sb3.ProcedureCall(bctx.fn.return_addresses[0], [])]))
-        else:
-          pass # TODO FIX: if a function ever returns here the stack will unwind which may be unexpected
-               # so the stop all block could be used. This happens with the main function
+        return_addr = localizeVar(ctx.cfg.return_address_local, False, bctx)
+        blocks.add(transReturnAddr(return_addr.getValue(), bctx.fn, ctx))
 
       blocks.end = True
 
@@ -2128,6 +2207,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case _:
       raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
+
   return blocks, ctx
 
 def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, \
@@ -2203,6 +2283,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   branches_to_first: dict[str, bool] = {}
   phi_assignments: defaultdict[str, defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]] = \
     defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: list())))
+  fn_ptr_sig_called_by: list[set[str]] = [set() for _ in range(len(ctx.fn_ptr_sigs))]
+  fn_ptr_sig_return_addrs: list[list[str]] = [[] for _ in range(len(ctx.fn_ptr_sigs))]
 
   defined_funcs: list[ir.Function] = list(filter(lambda fn: len(fn.blocks) > 0, mod.functions.values()))
   defined_func_names: list[str] = [fn.name for fn in defined_funcs]
@@ -2215,16 +2297,35 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       for instr in block.instrs:
         match instr:
           case ir.Call():
-            if not isinstance(instr.func, ir.FunctionVal):
-              raise CompException("Function pointers not supported")
-            called_name = instr.func.name
-            if called_name not in defined_func_names:
-              call_id += 1 # Note: external funcs still contribute to call ids even if unused
-              continue
-            calls.add(called_name)
-            return_addresses.setdefault(called_name, list())
-            return_addresses[called_name].append(localizeCallId(call_id, block.label, fn.name))
-            call_id += 1
+            localized_call_id = localizeCallId(call_id, block.label, fn.name)
+
+            if isinstance(instr.func, ir.FunctionVal):
+              # Direct function call
+              could_call = [instr.func.name]
+              is_direct_call = True
+            else:
+              # Function Pointer
+              # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
+              # the call instruction's vararg support
+              signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
+              signature_id, could_call = getFuncPtrSignatureInfo(signature, ctx)
+
+              # If function pointer which could only be one thing, then treat as a direct call
+              if len(could_call) == 1:
+                is_direct_call = True
+              else:
+                fn_ptr_sig_called_by[signature_id].add(fn.name)
+                fn_ptr_sig_return_addrs[signature_id].append(localized_call_id)
+
+            if is_direct_call and could_call[0] in defined_func_names:
+              return_addresses.setdefault(could_call[0], list())
+              return_addresses[could_call[0]].append(localized_call_id)
+
+            for called_name in could_call:
+              if called_name in defined_func_names:
+                calls.add(called_name)
+
+            call_id += 1 # Note: external funcs still contribute to call ids even if unused
 
           case ir.Alloca():
             branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type)
@@ -2300,11 +2401,6 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     total_alloca_size[fn.name] = alloc_size if known_alloc_size else None
 
-    # FUTURE OPTI: could check to see if in a non-recursive environment, there are enough
-    # branches that it is faster to recurse backward. However this happens rarely, it is
-    # difficult to gauge if it will actually have a net positive impact (will force callers
-    # to return to an address, the longest path may only be taken some of the times).
-
     fn_branches_to_first = False
     if len(fn.blocks) > 0:
       first_block_label = list(fn.blocks.values())[0].label
@@ -2314,6 +2410,29 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   for fn_name in returns_to_address:
     # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
+
+  for signature_id, (_, could_call) in enumerate(ctx.fn_ptr_sigs):
+    # If the function pointer signature calls any function that returns to an address,
+    # it must return to an address also. All functions that can call a function signature
+    # have already been accounted for because they were treated as calling all function
+    # pointers with that signature directly
+    sig_returns_to_address = any(returns_to_address[call] for call in could_call)
+    sig_return_addrs = fn_ptr_sig_return_addrs[signature_id]
+    sig_takes_ret_addr = sig_returns_to_address and len(sig_return_addrs) > 1
+    sig_could_call_total = set(could_call)
+
+    # Give each function it calls a callback return address
+    for call in could_call:
+      sig_could_call_total |= call_graph[call][0]
+      return_addresses.setdefault(call, list())
+      return_addresses[call].append(localizeFuncPtrSigCallback(signature_id))
+
+    sig_called_by = fn_ptr_sig_called_by[signature_id]
+    sig_could_recurse = len(sig_could_call_total & sig_called_by) > 0
+
+    ctx.fn_ptr_sig_info.append(FuncPtrSigInfo(
+      signature_id, sig_could_call_total, sig_return_addrs,
+      sig_returns_to_address, sig_takes_ret_addr, sig_could_recurse))
 
   for fn in defined_funcs:
     # If we know the total size a function allocates and that it doesn't call any functions
@@ -2329,7 +2448,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     param_names = []
     param_sizes = []
-    for arg in fn.args:
+    for arg in fn.params:
       param_names.append(arg.name)
       param_sizes.append(getByteSize(arg.type))
 
@@ -2345,6 +2464,81 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
                                     skip_stack_size_change, block_var_use[fn.name],
                                     branches_to_first.get(fn.name, False), phi_assignments[fn.name])
     ctx.next_fn_id += 1
+
+  return ctx
+
+def transFuncPtrSigs(ctx: Context) -> Context:
+  addr = ctx.cfg.min_func_ptr_id
+  for signature_id, (signature, could_call) in enumerate(ctx.fn_ptr_sigs):
+    # If theres only one function this signature could call, then it would be called directly instead
+    if len(could_call) == 1:
+      # Always 1 but to be explicit:
+      addr += len(could_call)
+      continue
+
+    info = ctx.fn_ptr_sig_info[signature_id]
+    sig_name = localizeFuncPtrSig(signature_id)
+
+    arg_count = 0
+    for arg in signature.params:
+      arg_count += getByteSize(arg)
+    arguments = [f"%{n}" for n in range(arg_count)]
+
+    return_address = Variable(ctx.cfg.return_address_local, "param", sig_name)
+    func_ptr_addr = Variable(ctx.cfg.func_ptr_parameter, "param", sig_name)
+    params = [func_ptr_addr.getUnidxedRawVarName(), *deepcopy(arguments)]
+    if info.takes_return_address:
+      params.append(return_address.getUnidxedRawVarName())
+
+    blocks = sb3.BlockList([
+      sb3.ProcedureDef(sig_name, params),
+    ])
+
+    if info.returns_to_address:
+      blocks.add(sb3.EditCounter("incr"))
+      new_return_addr = Variable(ctx.cfg.return_address_local, "var", sig_name)
+      if info.takes_return_address:
+        if not info.could_recurse:
+          blocks.add(new_return_addr.setValue(return_address.getValue()))
+        else:
+          blocks.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(1)))
+          blocks.add(storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, 0, 1, return_address.getValue()))
+      return_addr = new_return_addr
+
+    callback = localizeFuncPtrSigCallback(signature_id)
+
+    branches = OrderedDict()
+    for name in could_call:
+      branch = sb3.BlockList()
+      branch.add(sb3.ProcedureCall(name, [sb3.GetParameter(arg) for arg in arguments]))
+
+      # If we return to an address and the callee doesn't then jump to our callback ourselves
+      if info.returns_to_address and not ctx.fn_info[name].returns_to_address:
+        branch.add(sb3.ProcedureCall(callback, []))
+
+      branches[addr] = branch
+      addr += 1
+
+    blocks.add(binarySearch(func_ptr_addr.getValue(), branches))
+
+    ctx.proj.code.append(blocks)
+
+    if info.returns_to_address:
+      blocks = sb3.BlockList([
+        sb3.ProcedureDef(callback, []),
+        sb3.EditCounter("incr"),
+      ])
+
+      if info.could_recurse and info.takes_return_address:
+        blocks.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(-1)))
+        return_addr_val = loadFromStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, 1, 1)
+        assert isinstance(return_addr_val, sb3.Value)
+      else:
+        return_addr_val = return_addr.getValue()
+
+      blocks.add(transReturnAddr(return_addr_val, info, ctx))
+
+      ctx.proj.code.append(blocks)
 
   return ctx
 
@@ -2444,21 +2638,36 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       for instr_index, instr in enumerate(block.instrs[:-1]):
         assert bctx is not None
         if isinstance(instr, ir.Call): # Call instructions handled here because they can change where code is ran
-          if not isinstance(instr.func, ir.FunctionVal):
-            raise CompException("Function pointers not supported")
-
-          callee_name = instr.func.name
-          args = instr.args
-
           if instr.tail_kind == ir.CallTailKind.MustTail:
             raise CompException("Tail calls not supported")
+
+          callee_info = None
+          args = instr.args
+
+          if not isinstance(instr.func, ir.FunctionVal):
+            # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
+            # the call instruction's vararg support
+            signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
+            signature_id, could_call = getFuncPtrSignatureInfo(signature, ctx)
+
+            if len(could_call) == 1:
+              # Treat as a direct call instead
+              callee_info = ctx.fn_info[could_call[0]]
+            else:
+              callee_info = ctx.fn_ptr_sig_info[signature_id]
+              # Pass function pointer to function
+              args = [instr.func, *args]
+
+          else:
+            callee_info = ctx.fn_info[instr.func.name] if instr.intrinsic is None else None
 
           if instr.intrinsic is not None:
             instr_code = transIntrinsic(instr.intrinsic, args, ctx, bctx)
             bctx.code.add(instr_code)
             bctx.next_call_id += 1
+
           else:
-            callee_info = ctx.fn_info[callee_name]
+            assert callee_info is not None
             result = None if instr.result is None else transVar(instr.result, bctx)
             result_size = None if instr.result is None else getByteSize(instr.return_type)
             following_instrs = block.instrs[instr_index + 1:]
@@ -2476,6 +2685,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       is_first_block = False
       if info.total_alloca_size == None:
         total_fn_allocated = bctx.allocated
+
+  ctx = transFuncPtrSigs(ctx)
 
   return ctx
 
@@ -2593,7 +2804,6 @@ def addForeignFunctions(ctx: Context) -> Context:
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_scratch2str", ["input", "str", "count"], sb3.BlockList([
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     # Subtract one here so that i can be one indexed (which letter_n_of is)
     sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParameter(localizeParameter("str")), sb3.Known(1))),
     sb3.EditVar("set", "i", sb3.Known(1)),
@@ -2706,12 +2916,18 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   mod: ir.Module = parser.parseAssembly(llvm) if isinstance(llvm, str) else llvm
 
   # Starting code
-  initblocks = sb3.BlockList([sb3.OnStartFlag()])
+  ctx.proj.code.append(sb3.BlockList([
+    sb3.OnStartFlag(),
+    # Put startup code in initialization function
+    sb3.ProcedureCall("!init", []),
+  ]))
+  initblocks = sb3.BlockList([sb3.ProcedureDef("!init", [])])
 
   # Reset call stack
   initblocks.add(sb3.EditCounter("clear"))
 
-  # print(getFuncPtrRefs(mod))
+  # Get function pointer info
+  ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
 
   # Setup stack
   globblocks, ctx = transGlobals(mod, ctx)
@@ -2748,7 +2964,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Call main func call to init code
   if not "main" in ctx.fn_info:
     raise CompException("No main function") # TODO FIX: add libs
-  main_params_len = len(ctx.fn_info["main"].params) + int(ctx.fn_info["main"].takes_return_address)
+  main_params_len = sum(ctx.fn_info["main"].param_sizes) + int(ctx.fn_info["main"].takes_return_address)
   initblocks.add(sb3.ProcedureCall("main", [sb3.Known("")] * main_params_len))
 
   # Add init code

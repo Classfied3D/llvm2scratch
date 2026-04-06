@@ -116,7 +116,7 @@ class VoidTy(Type):
 @dataclass
 class FuncTy(Type):
   return_type: Type
-  args: list[Type]
+  params: list[Type]
 
 @dataclass
 class IntegerTy(VecTargetTy, AggTargetTy):
@@ -398,7 +398,7 @@ class Block():
 class Function():
   name: str
   return_type: Type
-  args: list[ArgumentVal]
+  params: list[ArgumentVal]
   intrinsic: Intrinsic | None
   blocks: dict[str, Block]
 
