@@ -1578,12 +1578,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
-      if not isinstance(instr.left.type, ir.IntegerTy):
+      if not (isinstance(instr.left.type, ir.IntegerTy) or isinstance(instr.left.type, ir.PointerTy)):
         raise CompException(f"Instruction {instr} with opcode add only supports "
-                            f"integers, got type {type(instr.left.type)}")
+                            f"integers or pointers, got type {type(instr.left.type)}")
       assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
 
-      width = instr.left.type.width
+      width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else ctx.cfg.ptr_size_bits
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
         raise CompException(f"Instruction icmp currently supports "
