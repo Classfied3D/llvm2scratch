@@ -683,6 +683,61 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
   return IdxbleValueAndBlocks(IdxbleValue(best_sum_nodes), best_blocks)
 
+def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond, cfg: Config) -> sb3.BooleanValue:
+  special_signed_handling = cfg.opti and \
+                            mode in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
+                            not isinstance(left, sb3.Known) and \
+                            not isinstance(right, sb3.Known)
+
+  modulus = -(2 ** width)
+
+  # Like undoTwosComplement but can remove the extra addition at the end because algebra
+  # Simplify because instructions are optimized for known values
+  reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
+    sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(modulus)))
+
+  # Subtracting half the modulus after reversing two's complement
+  reverse_twos_complement_and_sub_half = lambda val: \
+    sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 0.5)), sb3.Known(modulus))
+
+  if not special_signed_handling:
+    if mode in {ir.ICmpCond.Sgt, ir.ICmpCond.Sge, ir.ICmpCond.Slt, ir.ICmpCond.Sle}:
+      left = reverse_twos_complement(left)
+      right = reverse_twos_complement(right)
+
+    match mode:
+      case ir.ICmpCond.Eq:
+        return sb3.BoolOp("=", left, right)
+      case ir.ICmpCond.Ne:
+        return sb3.BoolOp("not", sb3.BoolOp("=", left, right))
+      case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
+        return sb3.BoolOp(">", left, right)
+      case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
+        return sb3.BoolOp("<", left, right)
+      case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
+        if isinstance(left, sb3.Known):
+          return sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
+        elif isinstance(right, sb3.Known):
+          return sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
+        else:
+          return sb3.BoolOp("not", sb3.BoolOp("<", left, right))
+      case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
+        if isinstance(left, sb3.Known):
+          return sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
+        elif isinstance(right, sb3.Known):
+          return sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
+        else:
+          return sb3.BoolOp("not", sb3.BoolOp(">", left, right))
+      case _:
+        raise CompException(f"icmp does not support comparsion mode {mode}")
+  else:
+    # We can skip adding a number for greater equal/less equal by adjusting the values
+    # of the two's complement reversal
+    if mode is ir.ICmpCond.Sge:
+      return sb3.BoolOp(">", reverse_twos_complement(left), reverse_twos_complement_and_sub_half(right))
+    else:
+      return sb3.BoolOp("<", reverse_twos_complement_and_sub_half(left), reverse_twos_complement(right))
+
 def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
   ptr = sb3.GetVar(stack_size_var)
   if offset > 0:
@@ -1581,7 +1636,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if not (isinstance(instr.left.type, ir.IntegerTy) or isinstance(instr.left.type, ir.PointerTy)):
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"integers or pointers, got type {type(instr.left.type)}")
-      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
 
       width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else ctx.cfg.ptr_size_bits
       # TODO FIX: support larger values
@@ -1589,64 +1643,14 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-      special_signed_handling = ctx.cfg.opti and \
-                                instr.cond in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
-                                not isinstance(left, sb3.Known) and \
-                                not isinstance(right, sb3.Known)
+      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
 
-      modulus = -(2 ** width)
+      result = intCompare(left, right, width, instr.cond, ctx.cfg)
 
-      # Like undoTwosComplement but can remove the extra addition at the end because algebra
-      # Simplify because instructions are optimized for known values
-      reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
-        sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(modulus)))
+      # Bool as int will cast to an int if needed (so the bool is treated as 1 instead of 'true')
+      casted_result = sb3.Op("bool_as_int", result)
 
-      # Subtracting half the modulus after reversing two's complement
-      reverse_twos_complement_and_sub_half = lambda val: \
-        sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 0.5)), sb3.Known(modulus))
-
-      if not special_signed_handling:
-        if instr.cond in {ir.ICmpCond.Sgt, ir.ICmpCond.Sge, ir.ICmpCond.Slt, ir.ICmpCond.Sle}:
-          left = reverse_twos_complement(left)
-          right = reverse_twos_complement(right)
-
-        match instr.cond:
-          case ir.ICmpCond.Eq:
-            res_val = sb3.BoolOp("=", left, right)
-          case ir.ICmpCond.Ne:
-            res_val = sb3.BoolOp("not", sb3.BoolOp("=", left, right))
-          case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
-            res_val = sb3.BoolOp(">", left, right)
-          case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
-            res_val = sb3.BoolOp("<", left, right)
-          case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
-            if isinstance(left, sb3.Known):
-              res_val = sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
-            elif isinstance(right, sb3.Known):
-              res_val = sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
-            else:
-              res_val = sb3.BoolOp("not", sb3.BoolOp("<", left, right))
-          case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
-            if isinstance(left, sb3.Known):
-              res_val = sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
-            elif isinstance(right, sb3.Known):
-              res_val = sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
-            else:
-              res_val = sb3.BoolOp("not", sb3.BoolOp(">", left, right))
-          case _:
-            raise CompException(f"icmp does not support comparsion mode {instr.cond}")
-      else:
-        # We can skip adding a number for greater equal/less equal by adjusting the values
-        # of the two's complement reversal
-        if instr.cond is ir.ICmpCond.Sge:
-          res_val = sb3.BoolOp(">", reverse_twos_complement(left), reverse_twos_complement_and_sub_half(right))
-        else:
-          res_val = sb3.BoolOp("<", reverse_twos_complement_and_sub_half(left), reverse_twos_complement(right))
-
-      # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
-      res_val = sb3.Op("bool_as_int", res_val)
-
-      blocks.add(res_var.setValue(res_val))
+      blocks.add(res_var.setValue(casted_result))
 
     case ir.FCmp(): # Compare two float values
       left = transValue(instr.left, ctx, bctx)
@@ -2207,21 +2211,25 @@ def transTerminatorInstr(instr: ir.Instr,
 
   return blocks, ctx
 
-def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, \
-                   bctx: BlockInfo) -> sb3.BlockList:
+def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variable | None, \
+                   ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
   blocks = sb3.BlockList()
 
   # For some intrinsics, they are no-op, etc and we don't need to translate args
   match intrinsic:
-    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd:
+    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl:
       return blocks
 
+  metadata: list[ir.MetadataVal] = []
   values: list[sb3.Value] = []
   for arg in args:
-    val = transValue(arg, ctx, bctx)
-    assert isinstance(val, ValueAndBlocks)
-    blocks.add(val.blocks)
-    values.append(val.value)
+    if not isinstance(arg, ir.MetadataVal):
+      val = transValue(arg, ctx, bctx)
+      assert isinstance(val, ValueAndBlocks)
+      blocks.add(val.blocks)
+      values.append(val.value)
+    else:
+      metadata.append(arg)
 
   match intrinsic:
     case ir.Intrinsic.MemCpy:
@@ -2262,6 +2270,24 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], ctx: Context, 
             sb3.EditVar("change", ptr_offset, sb3.Known(1))
           ]))
         ]))
+
+    case ir.Intrinsic.UMin | ir.Intrinsic.UMax | ir.Intrinsic.SMin | ir.Intrinsic.SMax:
+      match intrinsic:
+        case ir.Intrinsic.UMin: mode = ir.ICmpCond.Ult
+        case ir.Intrinsic.UMax: mode = ir.ICmpCond.Ugt
+        case ir.Intrinsic.SMin: mode = ir.ICmpCond.Slt
+        case ir.Intrinsic.SMax: mode = ir.ICmpCond.Sgt
+
+      left, right = values
+      ty = args[0].type
+      assert isinstance(ty, ir.IntegerTy)
+      width = ty.width
+      assert result is not None
+
+      cond = intCompare(left, right, width, mode, ctx.cfg)
+      blocks.add(sb3.BlockList([
+        sb3.ControlFlow("if_else", cond, sb3.BlockList([result.setValue(left)]), sb3.BlockList([result.setValue(right)]))
+      ]))
 
     case _:
       raise CompException(f"Unsupported intrinsic {intrinsic}")
@@ -2640,6 +2666,9 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
           callee_info = None
           args = instr.args
+          result = None if instr.result is None else transVar(instr.result, bctx)
+          result_size = None if instr.result is None else getByteSize(instr.return_type)
+          following_instrs = block.instrs[instr_index + 1:]
 
           if not isinstance(instr.func, ir.FunctionVal):
             # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
@@ -2659,16 +2688,12 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             callee_info = ctx.fn_info[instr.func.name] if instr.intrinsic is None else None
 
           if instr.intrinsic is not None:
-            instr_code = transIntrinsic(instr.intrinsic, args, ctx, bctx)
+            instr_code = transIntrinsic(instr.intrinsic, args, result, ctx, bctx)
             bctx.code.add(instr_code)
             bctx.next_call_id += 1
 
           else:
             assert callee_info is not None
-            result = None if instr.result is None else transVar(instr.result, bctx)
-            result_size = None if instr.result is None else getByteSize(instr.return_type)
-            following_instrs = block.instrs[instr_index + 1:]
-
             ctx, bctx = transComplexCall(info, callee_info, args, result, result_size, following_instrs, ctx, bctx)
         else:
           instr_code, ctx, bctx = transInstr(instr, ctx, bctx)
