@@ -30,7 +30,7 @@ class Config:
   """Config options to pass to the compiler"""
   opti: bool = True # If optimisations for scratch should be applied
   invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
-  stack_size: int = 512 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
+  stack_size: int = 1024 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
   label_stack_size: int = 512 # Max amount of labels on the recursion stack, max 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before reseting
@@ -2444,11 +2444,12 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     sig_takes_ret_addr = sig_returns_to_address and len(sig_return_addrs) > 1
     sig_could_call_total = set(could_call)
 
-    # Give each function it calls a callback return address
-    for call in could_call:
-      sig_could_call_total |= call_graph[call][0]
-      return_addresses.setdefault(call, list())
-      return_addresses[call].append(localizeFuncPtrSigCallback(signature_id))
+    # Give each function it calls a callback return address, unless it is called directly
+    if len(could_call) != 1:
+      for call in could_call:
+        sig_could_call_total |= call_graph[call][0]
+        return_addresses.setdefault(call, list())
+        return_addresses[call].append(localizeFuncPtrSigCallback(signature_id))
 
     sig_called_by = fn_ptr_sig_called_by[signature_id]
     sig_could_recurse = len(sig_could_call_total & sig_called_by) > 0
