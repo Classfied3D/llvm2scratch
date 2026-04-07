@@ -113,7 +113,10 @@ int main(void) {
   }
 
   int f = factorial_recurse(10);
+  SB3_say_dbl(f);
+
   int g = sum_to_one_digit(473);
+  SB3_say_dbl(g);
 
   char str[] = "hello world";
 

@@ -1942,8 +1942,6 @@ def getFuncBranchesVarUse(func: ir.Function,
     name: getBlockVarUse(block.instrs, phi_info[name]) for name, block in func.blocks.items()
   }
 
-  memo: dict[tuple[str, frozenset[str]], BlockVarUse] = {}
-
   res: dict[str, BlockVarUse] = {}
 
   # Update dictionary for all dependents
@@ -1956,8 +1954,6 @@ def getFuncBranchesVarUse(func: ir.Function,
     stack: list[tuple[str, set[str], set[str]]] = [(start_label,
                                                     set(label_var_use[start_label].depends),
                                                     set(label_var_use[start_label].modifies))]
-    # Track visited states per block to prevent infinite loops
-    visited_states: dict[str, set[frozenset[str]]] = {label: set() for label in func.blocks}
 
     agg_depends: set[str] = set()
     agg_modifies: set[str] = set()
@@ -1965,15 +1961,16 @@ def getFuncBranchesVarUse(func: ir.Function,
 
     while stack:
       label, depends_so_far, modifies_so_far = stack.pop()
-      state_key = frozenset(depends_so_far | modifies_so_far)
-      if state_key in visited_states[label]:
-        continue
-      visited_states[label].add(state_key)
 
       block_use = label_var_use[label]
+      new_depends = block_use.depends - modifies_so_far
+      new_modifies = block_use.modifies - modifies_so_far
+
+      # Skip if this block adds nothing new on this path
+      if not (new_depends - agg_depends) and not (new_modifies - agg_modifies):
+        continue
 
       # Update dependencies (only if not modified already)
-      new_depends = block_use.depends - modifies_so_far
       depends_so_far = depends_so_far | new_depends
       modifies_so_far = modifies_so_far | block_use.modifies
 
