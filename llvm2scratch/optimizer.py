@@ -35,9 +35,24 @@ GET_COUNTER_COST = 0.190
 ANSWER_COST = 0.331
 KNOWN_COST = 0 # Included in the cost of the block that uses it
 
+@dataclass
+class OptimizationInfo:
+  name: str
+  description: str
+
 class Optimization(Enum):
-  ASSIGNMENT_ELISION = 1
-  KNOWN_VALUE_PROPAGATION = 2
+  ASSIGNMENT_ELISION =      OptimizationInfo("assignment-elision",
+    "Reduce expensive 'Set Variable' usage by inlining variable assignments")
+  KNOWN_VALUE_PROPAGATION = OptimizationInfo("known-value-prop",
+    "Various transformations on values and blocks under certain values")
+
+  @property
+  def name(self) -> str:
+    return self.value.name
+
+  @property
+  def description(self) -> str:
+    return self.value.description
 
 ALL_OPTIMIZATIONS = set(Optimization)
 

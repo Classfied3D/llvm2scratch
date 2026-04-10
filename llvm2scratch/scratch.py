@@ -14,6 +14,8 @@ import math
 DEFAULT_BROADCAST_MESSAGE = "message1"
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
+# https://github.com/scratchfoundation/scratch-editor/blob/develop/packages/scratch-vm/src/util/uid.js#L11
+VALID_UID_CHARACTERS = "!#%()*+,-./:;=?@[]^_`{|}~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 SHORT_OP_TO_OPCODE = {
   # Control
   "if": "control_if",
@@ -60,7 +62,15 @@ Id = str
 class ScratchConfig(NamedTuple):
   # TODO add an option to replace hacked blocks with a working version that isn't hacked
   # (since they're used for better performance anyway)
-  invis_blocks: bool = False # Prevent blocks from rendering; stops editor lag
+
+  minify: bool = True             # Optimize project.json's size by simplifing uids, removing falsy fields, etc
+
+  minify_break_glow: bool = False # Removing the parent key when minifing prevents blocks in the same
+                                  # sprite from glowing correctly due to a js error - minify futher and
+                                  # allow this error to occur
+
+  hide_blocks: bool = False       # Prevent blocks from rendering in the editor by setting shadow: true on top
+                                  # level blocks: stops editor lag
 
 @dataclass
 class Project:
@@ -90,48 +100,53 @@ class ScratchContext:
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
+  # IDs of length 1 can cause issues for some reason
+  generated_ids: int = len(VALID_UID_CHARACTERS)
   exported: bool = False
 
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
     if not isinstance(block, LateBlock):
       metaless, self = block.getRaw(id, self)
-      if self.cfg.invis_blocks: meta.shadow = True
-      self.blocks[id] = meta.addRawMeta(metaless)
+      # Only blocks without parents need shadow: true to hide them
+      if self.cfg.hide_blocks and meta.parent is None: meta.shadow = True
+      self.blocks[id] = meta.addRawMeta(metaless, self)
     else:
       self.late_blocks.append((id, block, meta))
 
   def addBlockList(self, blocks: BlockList, parent: Id | None=None) -> Id | None:
     """Returns the id of the first block in the list"""
-    lastId = parent
-    firstId = currId = genId()
-    nextId = genId()
+    last_id = parent
+    first_id = curr_id = self.genId()
+    next_id = self.genId()
     end = False
 
     for (i, block) in enumerate(blocks.blocks):
-      if i == len(blocks.blocks) - 1: nextId = None
+      if i == len(blocks.blocks) - 1: next_id = None
 
-      assert currId is not None
+      is_start = last_id is None
 
-      if lastId is not None and block.isStart(): raise ScratchCompException(f"Starting block {type(block)} has blocks before it")
+      assert curr_id is not None
+
+      if last_id is not None and block.isStart(): raise ScratchCompException(f"Starting block {type(block)} has blocks before it")
       if end: raise ScratchCompException(f"Reached ending block {type(block)} but more blocks are left")
 
       end = block.isEnd()
 
-      meta = BlockMeta(lastId, nextId)
-      self.addBlock(currId, block, meta)
+      meta = BlockMeta(last_id, next_id)
+      self.addBlock(curr_id, block, meta)
 
-      lastId = currId
-      currId = nextId
-      nextId = genId()
+      last_id = curr_id
+      curr_id = next_id
+      next_id = self.genId()
 
-    if len(blocks.blocks) == 0: firstId = None
+    if len(blocks.blocks) == 0: first_id = None
 
-    return firstId
+    return first_id
 
   def addOrGetVar(self, var_name: str, default_val: Known | None = None) -> Id:
     if default_val is None: default_val = Known(0)
     if not var_name in self.vars:
-      id = genId()
+      id = self.genId()
       self.vars.update({var_name: (id, default_val)})
     else:
       id = self.vars[var_name][0]
@@ -140,7 +155,7 @@ class ScratchContext:
   def addOrGetList(self, list_name: str, default_val: list[int | float | str | bool] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
-      id = genId()
+      id = self.genId()
       self.lists.update({list_name: (id, default_val)})
     else:
       id = self.lists[list_name][0]
@@ -159,7 +174,7 @@ class ScratchContext:
     if name in self.broadcasts:
       return self.broadcasts[name]
 
-    id = genId()
+    id = self.genId()
     self.broadcasts[name] = id
     return id
 
@@ -172,9 +187,7 @@ class ScratchContext:
 
     raw_vars = {}
     for name, (id, value) in self.vars.items():
-      raw_vars.update({
-        id: [name, value.getRawVarInit()]
-      })
+      raw_vars[id] = [name, value.getRawVarInit()]
 
     raw_lists = {}
     for name, (id, values) in self.lists.items():
@@ -197,6 +210,23 @@ class ScratchContext:
       "lists": raw_lists,
       "blocks": raw_blocks,
     }
+
+  def genId(self) -> Id:
+    if not self.cfg.minify:
+      return random.randbytes(16).hex()
+    else:
+      n = self.generated_ids
+      self.generated_ids += 1
+
+      base = len(VALID_UID_CHARACTERS)
+      if n == 0:
+        return VALID_UID_CHARACTERS[0]
+      digits = []
+      while n:
+        digits.append(VALID_UID_CHARACTERS[n % base])
+        n //= base
+
+      return "".join(reversed(digits))
 
 class ScratchCast(Enum):
   """How the block will cast a value. Affects number coercion and boolean casting"""
@@ -238,12 +268,25 @@ class BlockMeta:
   x: int = 0
   y: int = 0
 
-  def addRawMeta(self, metaless: dict) -> dict:
-    metaless.update({
-      "parent": self.parent, "next": self.next,
-      "topLevel": self.parent is None, "shadow": self.shadow,
-      "x": self.x, "y": self.y,
-    })
+  def addRawMeta(self, metaless: dict, ctx: ScratchContext) -> dict:
+    if self.parent is not None or not ctx.cfg.minify_break_glow:
+      metaless["parent"] = self.parent
+
+    if self.parent is None or not ctx.cfg.minify:
+      metaless["topLevel"] = self.parent is None
+
+    if self.next is not None or not ctx.cfg.minify:
+      metaless["next"] = self.next
+
+    if self.shadow or not ctx.cfg.minify:
+      metaless["shadow"] = self.shadow
+
+    if (self.x != 0 or not ctx.cfg.minify) and not ctx.cfg.hide_blocks:
+      metaless["x"] = self.x
+
+    if (self.y != 0 or not ctx.cfg.minify) and not ctx.cfg.hide_blocks:
+      metaless["y"] = self.y
+
     return metaless
 
 class BlockList:
@@ -311,9 +354,27 @@ class Known(Value):
     return self.known.__repr__()
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    raw = self.getRawVarInit(preserve_booleans=False)
+
+    val = [(10 if isinstance(self.known, str) else 4), raw]
+
+    return [1, val], ctx
+
+  def getRawVarInit(self, preserve_booleans=True) -> str | float | bool:
+    """
+    Get the raw value to set a var to when it starts with this value
+    preserve_booleans - if enabled store booleans as strings, otherwise
+    cast to int
+    """
+    if preserve_booleans and isinstance(self.known, bool):
+      return "true" if self.known else "false"
+
     raw = self.known
     if not isinstance(self.known, str):
-      raw = float(raw)
+      if int(raw) == float(raw):
+        raw = int(raw)
+      else:
+        raw = float(raw)
 
     if raw == float("+inf"):
       raw = "Infinity"
@@ -322,15 +383,7 @@ class Known(Value):
     elif isinstance(raw, float) and math.isnan(raw):
       raw = "NaN"
 
-    return [1, [(10 if isinstance(self.known, str) else 4), raw]], ctx
-
-  def getRawVarInit(self) -> str | float | bool:
-    """Get the raw value to set a var to when it starts with this value"""
-    if isinstance(self.known, bool): return "true" if self.known else "false"
-    try:
-      return float(self.known)
-    except ValueError:
-      return self.known
+    return raw
 
 class KnownBool(Known, BooleanValue):
   def __init__(self, known: bool):
@@ -344,7 +397,7 @@ class KnownBool(Known, BooleanValue):
       return None, ctx # If false
     return BoolOp("not", KnownBool(False)).getRawBoolValue(parent, ctx)
 
-  def getRawVarInit(self) -> str:
+  def getRawVarInit(self, preserve_booleans=True) -> str:
     """Get the raw value to set a var to when it starts with this value"""
     return "true" if self.known else "false"
 
@@ -460,13 +513,13 @@ class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    id = genId()
+    id = ctx.genId()
 
     ctx.addBlock(id, RawBlock({
       "opcode": "control_get_counter"
     }), BlockMeta(parent))
 
-    return [3, id, [10, ""]], ctx
+    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 @dataclass
 class EditCounter(Block):
@@ -496,13 +549,13 @@ class Ask(Block):
 @dataclass
 class GetAnswer(Value):
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    id = genId()
+    id = ctx.genId()
 
     ctx.addBlock(id, RawBlock({
       "opcode": "sensing_answer"
     }), BlockMeta(parent))
 
-    return [3, id, [10, ""]], ctx
+    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 @dataclass
 class GetOfList(Value):
@@ -511,7 +564,7 @@ class GetOfList(Value):
   value: Value
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    id = genId()
+    id = ctx.genId()
     list_id = ctx.addOrGetList(self.list_name)
 
     raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_INT if self.op == "atindex" else ScratchCast.TO_STR))
@@ -524,7 +577,7 @@ class GetOfList(Value):
       "fields": {"LIST": [self.list_name, list_id]},
     }), BlockMeta(parent))
 
-    return [3, id, [10, ""]], ctx
+    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_to_float",
@@ -547,7 +600,7 @@ class Op(Value):
     if self.op == "bool_as_int" and cast == ScratchCast.TO_INT:
       return self.left.getRawValue(parent, ctx, cast)
 
-    id = genId()
+    id = ctx.genId()
 
     right = self.right if self.op != "str_to_float" else Known(0)
 
@@ -597,7 +650,7 @@ class Op(Value):
       "fields": fields
     }), BlockMeta(parent))
 
-    return [3, id, [10, ""]], ctx
+    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
 @dataclass
@@ -617,7 +670,7 @@ class BoolOp(BooleanValue):
       raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    id = genId()
+    id = ctx.genId()
 
     raw_right = None
     if self.op in ["not", "and", "or"]:
@@ -662,7 +715,7 @@ class GetVar(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
-    return [3, [12, self.var_name, id], [10, ""]], ctx
+    return [3, [12, self.var_name, id]] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 @dataclass
 class EditVar(Block):
@@ -717,25 +770,26 @@ class ProcedureDef(StartBlock):
   run_without_refresh: bool = True
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    proto_id = genId()
-    param_ids = [genId() for _ in self.params]
+    proto_id = ctx.genId()
+    param_ids = [ctx.genId() for _ in self.params]
 
     ctx.addFunc(self.name, param_ids, self.run_without_refresh)
 
     param_block_ids = []
     for param in self.params:
-      param_block_id = genId()
+      param_block_id = ctx.genId()
       param_block_ids.append(param_block_id)
       ctx.addBlock(param_block_id, RawBlock({
         "opcode": "argument_reporter_string_number",
         "fields": {"VALUE": [sanitizeProcName(param, True), None]}
       }), BlockMeta(proto_id))
 
-    ctx.addBlock(proto_id, RawBlock({
+    data = {
       "opcode": "procedures_prototype",
       "inputs": dict(zip(param_ids, [list((1, id)) for id in param_block_ids])),
       "mutation": {
         "tagName": "mutation",
+        # Seems to be necessary - while project is still able to run, loading project causes a crash
         "children": [],
         "proccode": sanitizeProcName(self.name, False) + (" %s" * len(self.params)),
         "argumentids": json.dumps(param_ids),
@@ -743,7 +797,10 @@ class ProcedureDef(StartBlock):
         "argumentdefaults": json.dumps(["" for _ in self.params]),
         "warp": json.dumps(self.run_without_refresh)
       }
-    }), BlockMeta(my_id, None, True))
+    }
+    if ctx.cfg.minify and len(data["inputs"]) == 0:
+      del data["inputs"]
+    ctx.addBlock(proto_id, RawBlock(data), BlockMeta(my_id, None, True))
 
     return {
       "opcode": "procedures_definition",
@@ -781,14 +838,14 @@ class GetParameter(Value):
   param_name: str
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    id = genId()
+    id = ctx.genId()
 
     ctx.addBlock(id, RawBlock({
       "opcode": "argument_reporter_string_number",
       "fields": {"VALUE": [sanitizeProcName(self.param_name, True), None]}
     }), BlockMeta(parent))
 
-    return [3, id, [10, ""]], ctx
+    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
 
 class ScratchCompException(Exception):
@@ -853,9 +910,6 @@ def scratchCompare(left: Known, right: Known) -> float:
     right_val = scratchCastToStr(right).lower()
     return 0 if left_val == right_val else (-1 if left_val < right_val else 1)
 
-def genId() -> Id:
-  return random.randbytes(16).hex()
-
 def exportSpriteData(ctx: ScratchContext) -> str:
   res = {
     "isStage": False,
@@ -890,7 +944,8 @@ def exportSpriteData(ctx: ScratchContext) -> str:
 
   res.update(ctx.getRaw())
 
-  return json.dumps(res)
+  # Use minified json
+  return json.dumps(res, separators=(",", ":"))
 
 def exportScratchFile(ctx: ScratchContext, path: str) -> None:
   """Exports scratch code to a .sprite3 file"""

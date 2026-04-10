@@ -11,7 +11,7 @@ import math
 
 from . import graph_util as util
 from . import scratch as sb3
-from . import optimizer
+from . import optimizer as opt
 from . import parser
 from . import ir
 
@@ -29,24 +29,24 @@ class DebugInfo:
 class Config:
   """Config options to pass to the compiler"""
   opti: bool = True # If optimisations for scratch should be applied
-  invis_blocks: bool = False # Prevent scratch editor from rendering blocks; reduces lag
-  stack_size: int = 1024 # Amount of 'bytes' on 'stack' list (one byte is VARIABLE_MAX_BITS bits), max 200,000
-  label_stack_size: int = 512 # Max amount of labels on the recursion stack, max 200,000
-  binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
-  max_branch_recursion: int = 1_000_000 # Maximum amount of times a checked function can recurse before reseting
-                                        # scratch's call stack via a broadcast
-  ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
+  opti_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
 
+  memory_size: int = 1024 # Number of 'bytes' on 'memory' list; max value is 200,000
+  local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
+  binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
+  max_branch_recursion: int = 1_000_000 # Maximum depth of scratch's call stack before resetting it
+
+  scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch
+                                                                               # serializer
   debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
                                                            # future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
-  min_func_ptr_id: int = stack_size + 1 # Starting ptr addr for functions. Could be independent from stack
-                                        # using LLVM datalayout
+  ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
 
   return_var = "!return value" # Name of the scratch variable for returing values
   stack_var = "!stack" # Name of the scratch list for the stack list
-  stack_size_var = "!stack size" # Name of the scratch variable for the stack size
+  stack_pointer_var = "!stack pointer" # Name of the scratch variable for the stack pointer
   local_stack_var = "!local stack" # Name of the scratch list to store variables that will be used recursively
   local_stack_size_var = "!local stack size" # Name of the scratch variable to store the label stack's size
   debug_branch_log_var = "!!debug_branch_log" # Name of the scratch list to store debug info (using underscores
@@ -77,6 +77,9 @@ class Context:
   globvar_to_ptr: dict[str, int] = field(default_factory=dict)
   highest_return_size: int | None = None
   next_fn_id: int = 0
+  # Starting ptr addr for functions. Could be independent from stack
+  # using LLVM datalayout
+  min_func_ptr_addr: int = 0
 
 @dataclass
 class FuncPtrSigInfo:
@@ -434,7 +437,7 @@ def genTempVar(ctx: Context) -> str:
 
 def shouldOptimiseValueUse(val: sb3.Value, times_used: float) -> bool:
   """Returns if a value that is used multiple times should be stored"""
-  return not optimizer.shouldElide(val, times_used)
+  return not opt.shouldElide(val, times_used)
 
 def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAndBlocks:
   if shouldOptimiseValueUse(val, times_used):
@@ -601,7 +604,7 @@ def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value
 
   carried_sum = sb3.Op(op, raw_sum, carry)
   # When using known values, the optimizer can subtract values from both sides
-  if ctx.cfg.opti: carried_sum = optimizer.completeSimplifyValue(carried_sum)
+  if ctx.cfg.opti: carried_sum = opt.completeSimplifyValue(carried_sum)
 
   return carried_sum
 
@@ -617,8 +620,8 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
   if ctx.cfg.opti:
     # Optimize the values beforehand - helps with finding optimial calculation after optimizations
-    left = IdxbleValue([optimizer.completeSimplifyValue(l) for l in left.vals])
-    right = IdxbleValue([optimizer.completeSimplifyValue(r) for r in right.vals])
+    left = IdxbleValue([opt.completeSimplifyValue(l) for l in left.vals])
+    right = IdxbleValue([opt.completeSimplifyValue(r) for r in right.vals])
 
   best_cost = float("inf")
   best_blocks = sb3.BlockList()
@@ -643,7 +646,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
         if i == 0:
           raw = sb3.Op(op_literal, left.vals[0], right.vals[0])
-          cost += optimizer.getValueCost(raw)
+          cost += opt.getValueCost(raw)
         else:
           earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
           prev_stored = max(earlier_stored) if earlier_stored else None
@@ -664,7 +667,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
           temp_name = genTempVar(ctx)
           stored_temp_names[i] = temp_name
           blocks.add(sb3.EditVar("set", temp_name, raw))
-          cost += optimizer.SET_VAR_COST + optimizer.getValueCost(raw)
+          cost += opt.SET_VAR_COST + opt.getValueCost(raw)
 
         if i in stored_temp_names:
           expr_for_mod = sb3.GetVar(stored_temp_names[i])
@@ -672,7 +675,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
           expr_for_mod = raw
 
         mod_node = sb3.Op("mod", expr_for_mod, sb3.Known(modulus))
-        cost += optimizer.getValueCost(mod_node)
+        cost += opt.getValueCost(mod_node)
 
         sum_nodes.append(mod_node)
 
@@ -693,7 +696,7 @@ def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond,
 
   # Like undoTwosComplement but can remove the extra addition at the end because algebra
   # Simplify because instructions are optimized for known values
-  reverse_twos_complement = lambda val: optimizer.completeSimplifyValue(
+  reverse_twos_complement = lambda val: opt.completeSimplifyValue(
     sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(modulus)))
 
   # Subtracting half the modulus after reversing two's complement
@@ -1046,7 +1049,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                    # optimization because the extra add/subtract can be ignored
       bctx.allocated += size
 
-      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_size_var, offset)))
+      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_pointer_var, offset)))
 
     case ir.Load(): # Load a value from an address on the stack
       address = transValue(instr.address, ctx, bctx)
@@ -2037,7 +2040,7 @@ def getFuncPtrRefs(mod: ir.Module) -> list[tuple[ir.FuncTy, list[str]]]:
   return func_ptrs
 
 def getFuncPtrAddr(ptr: str, ctx: Context) -> int:
-  addr = ctx.cfg.min_func_ptr_id
+  addr = ctx.min_func_ptr_addr
   for (_, ptrs) in ctx.fn_ptr_sigs:
     if ptr in ptrs:
       return addr + ptrs.index(ptr)
@@ -2118,9 +2121,9 @@ def transTerminatorInstr(instr: ir.Instr,
       # the stack size var
       if not bctx.fn.skip_stack_size_change:
         if bctx.fn.total_alloca_size is not None:
-          blocks.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(-bctx.fn.total_alloca_size)))
+          blocks.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-bctx.fn.total_alloca_size)))
         else:
-          blocks.add(sb3.EditVar("set", ctx.cfg.stack_size_var, localizeVar(ctx.cfg.previous_stack_size_local,
+          blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, localizeVar(ctx.cfg.previous_stack_size_local,
                                                                             False, bctx).getValue()))
 
       if bctx.fn.returns_to_address:
@@ -2492,7 +2495,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   return ctx
 
 def transFuncPtrSigs(ctx: Context) -> Context:
-  addr = ctx.cfg.min_func_ptr_id
+  addr = ctx.min_func_ptr_addr
   for signature_id, (signature, could_call) in enumerate(ctx.fn_ptr_sigs):
     # If theres only one function this signature could call, then it would be called directly instead
     if len(could_call) == 1:
@@ -2612,7 +2615,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
       # Store the previous stack size if necessary
       if is_first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
         starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params, info.param_sizes))
-          .setValue(sb3.GetVar(ctx.cfg.stack_size_var)))
+          .setValue(sb3.GetVar(ctx.cfg.stack_pointer_var)))
 
       if is_first_block and info.branches_to_first:
         # Work out what variables might be depended on in future
@@ -2650,7 +2653,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         to_allocate = info.block_alloca_size[block.label]
 
       if to_allocate != 0 and not info.skip_stack_size_change:
-        starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_size_var, sb3.Known(to_allocate)))
+        starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
       available_params, av_param_sizes = (info.params, info.param_sizes) if is_first_block else ([], [])
@@ -2718,7 +2721,7 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   blocks.add(sb3.EditList("deleteall", ctx.cfg.stack_var, None, None))
 
-  if ctx.cfg.stack_size > SCRATCH_LIST_LIMIT:
+  if ctx.cfg.memory_size > SCRATCH_LIST_LIMIT:
     raise CompException("Stack is too large to fit in one list, multiple lists not implemented")
 
   # Set up static values
@@ -2764,8 +2767,8 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
       ptr += total_size
 
   blocks.add(sb3.BlockList([
-    sb3.EditVar("set", ctx.cfg.stack_size_var, sb3.Known(ptr)),
-    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.stack_size - (ptr - 1)), sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(ptr)),
+    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.memory_size - (ptr - 1)), sb3.BlockList([
       sb3.EditList("addto", ctx.cfg.stack_var, None, sb3.Known(0))
     ])),
   ]))
@@ -2776,7 +2779,7 @@ def initLocalStack(ctx: Context) -> sb3.BlockList:
   return sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.local_stack_size_var, sb3.Known(0)),
     sb3.EditList("deleteall", ctx.cfg.local_stack_var, None, None),
-    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.label_stack_size), sb3.BlockList([
+    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.local_stack_size), sb3.BlockList([
       sb3.EditList("addto", ctx.cfg.local_stack_var, None, sb3.Known(0)),
     ]))
   ])
@@ -2924,16 +2927,22 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
   ]), ctx)
 
+  ctx = addFunc("sbrk", ["a"], sb3.BlockList(), ctx)
+  ctx = addFunc("isatty", ["a"], sb3.BlockList(), ctx)
+  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList(), ctx)
+  ctx = addFunc("close", ["a"], sb3.BlockList(), ctx)
+  ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList(), ctx)
+  ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList(), ctx)
+  ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList(), ctx)
+
   return ctx
 
 def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:
   """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
   if cfg is None: cfg = Config()
   debug_info = cfg.debug_info
-  scfg = sb3.ScratchConfig(
-    invis_blocks=cfg.invis_blocks)
 
-  ctx = Context(sb3.Project(scfg), cfg)
+  ctx = Context(sb3.Project(cfg.scratch_config), cfg)
 
   # Parse llvm
   mod: ir.Module = parser.parseAssembly(llvm) if isinstance(llvm, str) else llvm
@@ -2950,6 +2959,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   initblocks.add(sb3.EditCounter("clear"))
 
   # Get function pointer info
+  ctx.min_func_ptr_addr = cfg.memory_size + 1
   ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
 
   # Setup stack
@@ -2995,8 +3005,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
 
   # Optimise scratch project
   if cfg.opti:
-    ctx.proj = optimizer.optimize(ctx.proj,
+    ctx.proj = opt.optimize(ctx.proj,
+                                  all_opti = cfg.opti_passes,
                                   dont_remove = getDontRemove(ctx),
-                                  ignore_external_change = {ctx.cfg.stack_size_var})
+                                  ignore_external_change = {ctx.cfg.stack_pointer_var})
 
   return ctx.proj, debug_info
