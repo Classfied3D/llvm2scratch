@@ -81,8 +81,6 @@ minify options:
                         correctly due to a js error - minify futher and allow this error to occur
 ```
 
-Where input is a .ll file for LLVM 19
-
 ## Info
 
 ### How multiplication works

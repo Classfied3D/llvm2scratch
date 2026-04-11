@@ -13,7 +13,7 @@ def main():
   if not os.path.exists("./output"):
     os.mkdir("output")
 
-  subprocess.run([cc, "-S", "-m32", "-Os", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "demo.ll"],
+  subprocess.run([cc, "-S", "-m32", "-Oz", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "demo.ll"],
                  cwd=os.path.join(script_dir, "input"))
 
   with open("input/demo.ll", "r") as file:

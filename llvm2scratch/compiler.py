@@ -53,7 +53,6 @@ class Config:
                                               # to avoid spaces in exported filename for convenience)
 
   ascii_lookup_var = "!ascii lookup"
-  binop_lookup_var = "!binop lookup"
   pow2_lookup_var = "!pow2 lookup"
 
   return_address_local = "return address" # Name of the local variable or parameter to the id of func the return to
@@ -1435,7 +1434,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
               blocks.add(rblocks)
 
             lookup_size = 2 ** ctx.cfg.binop_lookup_bits
-            name = f"{ctx.cfg.binop_lookup_var} {instr.opcode}{ctx.cfg.zero_indexed_suffix}"
+            name = f"{instr.opcode.value.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
 
             if name not in ctx.proj.lists:
               lookup: list[int | float | str | bool] = []
@@ -2872,14 +2871,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
   ctx = addFunc("SB3_say_char", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex",
       (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
       sb3.GetParameter(localizeParameter("input")))),
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
   ]), ctx)
 
   ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
