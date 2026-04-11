@@ -1434,7 +1434,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
               blocks.add(rblocks)
 
             lookup_size = 2 ** ctx.cfg.binop_lookup_bits
-            name = f"{instr.opcode.value.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
+            name = f"!{instr.opcode.value.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
 
             if name not in ctx.proj.lists:
               lookup: list[int | float | str | bool] = []

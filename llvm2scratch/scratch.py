@@ -104,6 +104,7 @@ class ScratchContext:
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
   generated_ids: int = 0
+  generated_var_ids: int = 0
   exported: bool = False
 
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
@@ -148,7 +149,7 @@ class ScratchContext:
   def addOrGetVar(self, var_name: str, default_val: Known | None = None) -> Id:
     if default_val is None: default_val = Known(0)
     if not var_name in self.vars:
-      id = self.genId()
+      id = self.genId(True)
       self.vars.update({var_name: (id, default_val)})
     else:
       id = self.vars[var_name][0]
@@ -157,7 +158,7 @@ class ScratchContext:
   def addOrGetList(self, list_name: str, default_val: list[int | float | str | bool] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
-      id = self.genId()
+      id = self.genId(True)
       self.lists.update({list_name: (id, default_val)})
     else:
       id = self.lists[list_name][0]
@@ -176,7 +177,7 @@ class ScratchContext:
     if name in self.broadcasts:
       return self.broadcasts[name]
 
-    id = self.genId()
+    id = self.genId(True)
     self.broadcasts[name] = id
     return id
 
@@ -223,15 +224,18 @@ class ScratchContext:
       n //= base
     return "".join(reversed(digits))
 
-  def genId(self) -> Id:
+  def genId(self, is_var_id=False) -> Id:
     if not self.cfg.minify:
       return random.randbytes(16).hex()
     else:
       invalid = True
       while invalid:
-        id = self.numericToStrUID(self.generated_ids)
+        id = self.numericToStrUID(self.generated_var_ids if is_var_id else self.generated_ids)
         invalid = id in PALETTE_UIDS
-        self.generated_ids += 1
+        if is_var_id:
+          self.generated_var_ids += 1
+        else:
+          self.generated_ids += 1
       return id
 
 class ScratchCast(Enum):
