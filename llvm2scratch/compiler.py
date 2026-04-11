@@ -2924,7 +2924,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
   ]), ctx)
 
-  ctx = addFunc("sbrk", ["a"], sb3.BlockList(), ctx)
+  ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("Hi"))]), ctx)
   ctx = addFunc("isatty", ["a"], sb3.BlockList(), ctx)
   ctx = addFunc("fstat", ["a", "b"], sb3.BlockList(), ctx)
   ctx = addFunc("close", ["a"], sb3.BlockList(), ctx)

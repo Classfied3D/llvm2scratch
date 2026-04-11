@@ -16,6 +16,9 @@ EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
 # https://github.com/scratchfoundation/scratch-editor/blob/develop/packages/scratch-vm/src/util/uid.js#L11
 VALID_UID_CHARACTERS = "!#%()*+,-./:;=?@[]^_`{|}~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+# List of UIDs 5 or less characters long reserved by the block palette
+# https://github.com/scratchfoundation/scratch-editor/blob/develop/packages/scratch-gui/src/lib/make-toolbox-xml.js
+PALETTE_UIDS = ["while", "timer", "of", "movex", "movey", "setx", "sety"]
 SHORT_OP_TO_OPCODE = {
   # Control
   "if": "control_if",
@@ -100,8 +103,7 @@ class ScratchContext:
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
-  # IDs of length 1 can cause issues for some reason
-  generated_ids: int = len(VALID_UID_CHARACTERS)
+  generated_ids: int = 0
   exported: bool = False
 
   def addBlock(self, id: Id, block: Block, meta: BlockMeta) -> None:
@@ -211,22 +213,26 @@ class ScratchContext:
       "blocks": raw_blocks,
     }
 
+  def numericToStrUID(self, n: int) -> str:
+    base = len(VALID_UID_CHARACTERS)
+    if n == 0:
+      return VALID_UID_CHARACTERS[0]
+    digits = []
+    while n:
+      digits.append(VALID_UID_CHARACTERS[n % base])
+      n //= base
+    return "".join(reversed(digits))
+
   def genId(self) -> Id:
     if not self.cfg.minify:
       return random.randbytes(16).hex()
     else:
-      n = self.generated_ids
-      self.generated_ids += 1
-
-      base = len(VALID_UID_CHARACTERS)
-      if n == 0:
-        return VALID_UID_CHARACTERS[0]
-      digits = []
-      while n:
-        digits.append(VALID_UID_CHARACTERS[n % base])
-        n //= base
-
-      return "".join(reversed(digits))
+      invalid = True
+      while invalid:
+        id = self.numericToStrUID(self.generated_ids)
+        invalid = id in PALETTE_UIDS
+        self.generated_ids += 1
+      return id
 
 class ScratchCast(Enum):
   """How the block will cast a value. Affects number coercion and boolean casting"""
