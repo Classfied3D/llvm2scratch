@@ -75,6 +75,12 @@ def main():
     help="Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is 512")
   parser.add_argument("--max-branch-recursion", type=int, default=1_000_000,
     help="Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000")
+  parser.add_argument(
+    "--debug-scratch-code",
+    type=Path,
+    default=None,
+    help="Output scratch code to a text file so it can be viewed"
+  )
 
   args = parser.parse_args()
 
@@ -115,7 +121,12 @@ def main():
 
   with open(args.input, "r") as file:
     proj, _ = compiler.compile(file.read(), cfg)
-    proj.export(args.output)
+
+  if args.debug_scratch_code is not None:
+    with open(args.debug_scratch_code, "w") as file:
+      file.write(proj.stringify())
+
+  proj.export(args.output)
 
 if __name__ == "__main__":
   main()

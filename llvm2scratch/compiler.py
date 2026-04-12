@@ -38,8 +38,6 @@ class Config:
 
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch
                                                                                # serializer
-  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
-                                                           # future compilations for optimization
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
   ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
@@ -79,6 +77,8 @@ class Context:
   # Starting ptr addr for functions. Could be independent from stack
   # using LLVM datalayout
   min_func_ptr_addr: int = 0
+  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
+                                                           # future compilations for optimization
 
 @dataclass
 class FuncPtrSigInfo:
@@ -2314,6 +2314,11 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   defined_funcs: list[ir.Function] = list(filter(lambda fn: len(fn.blocks) > 0, mod.functions.values()))
   defined_func_names: list[str] = [fn.name for fn in defined_funcs]
 
+  for fn in mod.functions.values():
+    if fn.intrinsic is not None: continue
+    returns_to_address[fn.name] = False
+    call_graph[fn.name] = (set(), True)
+
   for fn in defined_funcs:
     calls: set[str] = set() # What the function calls
     for block in fn.blocks.values():
@@ -2883,6 +2888,10 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.Say(sb3.GetParameter(localizeParameter("input"))),
   ]), ctx)
 
+  ctx = addFunc("SB3_wait", ["duration"], sb3.BlockList([
+    sb3.Wait(sb3.GetParameter(localizeParameter("duration"))),
+  ]), ctx)
+
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
   # count  (int): The maximum length of the string.
@@ -2924,20 +2933,20 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
   ]), ctx)
 
-  ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("Hi"))]), ctx)
-  ctx = addFunc("isatty", ["a"], sb3.BlockList(), ctx)
-  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList(), ctx)
-  ctx = addFunc("close", ["a"], sb3.BlockList(), ctx)
-  ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList(), ctx)
-  ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList(), ctx)
-  ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList(), ctx)
+
+  ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)
+  ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
+  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
+  ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
+  ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
+  ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("write called"))]), ctx)
+  ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
 
   return ctx
 
 def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:
   """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
   if cfg is None: cfg = Config()
-  debug_info = cfg.debug_info
 
   ctx = Context(sb3.Project(cfg.scratch_config), cfg)
 
@@ -2955,6 +2964,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Reset call stack
   initblocks.add(sb3.EditCounter("clear"))
 
+  # Add foreign functions
+  ctx = addForeignFunctions(ctx)
+
   # Get function pointer info
   ctx.min_func_ptr_addr = cfg.memory_size + 1
   ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
@@ -2963,9 +2975,6 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   globblocks, ctx = transGlobals(mod, ctx)
   initblocks.add(globblocks)
   initblocks.add(initLocalStack(ctx))
-
-  # Add foreign functions
-  ctx = addForeignFunctions(ctx)
 
   # Translate functions
   ctx = transFuncs(mod, ctx)
@@ -2989,7 +2998,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
       branch_debug_info.append((info.fn_id, info.name))
     branch_debug_info.sort(key=lambda info: info[0])
 
-    debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
+    ctx.debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
 
   # Call main func call to init code
   if not "main" in ctx.fn_info:
@@ -3007,4 +3016,4 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
                                   dont_remove = getDontRemove(ctx),
                                   ignore_external_change = {ctx.cfg.stack_pointer_var})
 
-  return ctx.proj, debug_info
+  return ctx.proj, ctx.debug_info

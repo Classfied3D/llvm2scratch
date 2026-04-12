@@ -85,6 +85,9 @@ class Project:
     """Exports the project into a .sprite3 file"""
     exportScratchFile(self.getCtx(), filename)
 
+  def stringify(self):
+    return "\n\n".join(l.stringify() for l in self.code)
+
   def getCtx(self) -> ScratchContext:
     """Converts the project into a ScratchContext which can be used to get the raw project"""
     ctx = ScratchContext(self.cfg) # pyright: ignore[reportCallIssue] this error only appears sometimes??
@@ -149,7 +152,7 @@ class ScratchContext:
   def addOrGetVar(self, var_name: str, default_val: Known | None = None) -> Id:
     if default_val is None: default_val = Known(0)
     if not var_name in self.vars:
-      id = self.genId(True)
+      id = self.genId()
       self.vars.update({var_name: (id, default_val)})
     else:
       id = self.vars[var_name][0]
@@ -158,7 +161,7 @@ class ScratchContext:
   def addOrGetList(self, list_name: str, default_val: list[int | float | str | bool] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
-      id = self.genId(True)
+      id = self.genId()
       self.lists.update({list_name: (id, default_val)})
     else:
       id = self.lists[list_name][0]
@@ -177,7 +180,7 @@ class ScratchContext:
     if name in self.broadcasts:
       return self.broadcasts[name]
 
-    id = self.genId(True)
+    id = self.genId()
     self.broadcasts[name] = id
     return id
 
@@ -224,18 +227,15 @@ class ScratchContext:
       n //= base
     return "".join(reversed(digits))
 
-  def genId(self, is_var_id=False) -> Id:
+  def genId(self) -> Id:
     if not self.cfg.minify:
       return random.randbytes(16).hex()
     else:
       invalid = True
       while invalid:
-        id = self.numericToStrUID(self.generated_var_ids if is_var_id else self.generated_ids)
+        id = self.numericToStrUID(self.generated_ids)
         invalid = id in PALETTE_UIDS
-        if is_var_id:
-          self.generated_var_ids += 1
-        else:
-          self.generated_ids += 1
+        self.generated_ids += 1
       return id
 
 class ScratchCast(Enum):
@@ -253,6 +253,9 @@ class Block():
 
   def isEnd(self) -> bool:
     return False
+
+  def stringify(self) -> str:
+    raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
 class StartBlock(Block):
   def isStart(self) -> bool:
@@ -329,8 +332,11 @@ class BlockList:
       self.blocks += blocks.blocks.copy()
       self.end |= blocks.end
 
-  def __len__(self):
+  def __len__(self) -> int:
     return len(self.blocks)
+
+  def stringify(self) -> str:
+    return "\n".join(b.stringify() for b in self.blocks)
 
 @dataclass
 class RawBlock(Block):
@@ -344,6 +350,9 @@ class Value:
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     """Gets the json that can be put in the "inputs" field of a block"""
     raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
+
+  def stringify(self) -> str:
+    raise ScratchCompException("Cannot stringify for generic type 'Value'; must be a derived class")
 
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
@@ -395,6 +404,9 @@ class Known(Value):
 
     return raw
 
+  def stringify(self) -> str:
+    return f'"{self.known}"' if isinstance(self.known, str) else f"{self.getRawVarInit()}"
+
 class KnownBool(Known, BooleanValue):
   def __init__(self, known: bool):
     self.known = known
@@ -411,6 +423,9 @@ class KnownBool(Known, BooleanValue):
     """Get the raw value to set a var to when it starts with this value"""
     return "true" if self.known else "false"
 
+  def stringify(self):
+    return f"<{self.getRawVarInit()}>"
+
 # Looks
 @dataclass
 class Say(Block):
@@ -424,6 +439,9 @@ class Say(Block):
         "MESSAGE": raw_msg
       }
     }, ctx
+
+  def stringify(self) -> str:
+    return f"say {self.value.stringify()}"
 
 # Events
 # Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
@@ -450,6 +468,9 @@ class Broadcast(Block):
       "inputs": {"BROADCAST_INPUT": raw_value},
     }, ctx
 
+  def stringify(self) -> str:
+    return f"broadcast {self.value.stringify()}" + (" and wait" if self.wait else "")
+
 @dataclass
 class OnBroadcast(StartBlock):
   name: str
@@ -462,12 +483,18 @@ class OnBroadcast(StartBlock):
       "fields": {"BROADCAST_OPTION": [self.name, id]}
     }, ctx
 
+  def stringify(self) -> str:
+    return f"when I recieve {self.name}"
+
 # Control
 class OnStartFlag(StartBlock):
   def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return {
       "opcode": "event_whenflagclicked"
     }, ctx
+
+  def stringify(self) -> str:
+    return f"when green flag clicked"
 
 FlowOp = Literal["if", "if_else", "reptimes", "until", "while"]
 @dataclass
@@ -508,6 +535,21 @@ class ControlFlow(Block):
       "inputs": inputs
     }, ctx
 
+  def indent(self, input: BlockList) -> str:
+    return "\n".join("  " + x for x in input.stringify().split("\n"))
+
+  def stringify(self) -> str:
+    res = {
+      "if": "if",
+      "if_else": "if",
+      "until": "repeat until",
+      "while": "while",
+      "reptimes": "repeat",
+    }[self.op] + " " + self.value.stringify() + "\n" + self.indent(self.blocks)
+    if self.else_blocks is not None:
+      res += "\nelse\n" + self.indent(self.else_blocks)
+    return res
+
 @dataclass
 class StopScript(EndBlock):
   op: Literal["stopthis", "stopall"]
@@ -517,6 +559,9 @@ class StopScript(EndBlock):
       "opcode": "control_stop",
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
     }, ctx
+
+  def stringify(self) -> str:
+    return "stop this script" if self.op == "stopthis" else "stop all"
 
 @dataclass
 class GetCounter(Value):
@@ -531,6 +576,9 @@ class GetCounter(Value):
 
     return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
+  def stringify(self) -> str:
+    return "(counter)"
+
 @dataclass
 class EditCounter(Block):
   """Increment/Assign zero to the special 'hacked' counter block"""
@@ -542,12 +590,31 @@ class EditCounter(Block):
       "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
 
+  def stringify(self) -> str:
+    return "increment counter" if self.op == "incr" else "clear counter"
+
+@dataclass
+class Wait(Block):
+  duration: Value
+
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    raw_dur, ctx = self.duration.getRawValue(my_id, ctx, ScratchCast.TO_INT)
+    return {
+      "opcode": "control_wait",
+      "inputs": {
+        "DURATION": raw_dur
+      },
+    }, ctx
+
+  def stringify(self) -> str:
+    return f"wait {self.duration.stringify()} seconds"
+
 # Sensing
 @dataclass
 class Ask(Block):
   value: Value
 
-  def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     raw_msg, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
     return {
       "opcode": "sensing_askandwait",
@@ -555,6 +622,9 @@ class Ask(Block):
         "QUESTION": raw_msg
       }
     }, ctx
+
+  def stringify(self) -> str:
+    return f"ask {self.value.stringify()} and wait"
 
 @dataclass
 class GetAnswer(Value):
@@ -566,6 +636,9 @@ class GetAnswer(Value):
     }), BlockMeta(parent))
 
     return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+
+  def stringify(self) -> str:
+    return "(answer)"
 
 @dataclass
 class GetOfList(Value):
@@ -588,6 +661,12 @@ class GetOfList(Value):
     }), BlockMeta(parent))
 
     return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+
+  def stringify(self) -> str:
+    if self.op == "atindex":
+      return f"item {self.value.stringify()} of {self.list_name}"
+    else:
+      return f"item # of {self.value.stringify()} in {self.list_name}"
 
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_to_float",
@@ -662,6 +741,9 @@ class Op(Value):
 
     return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
 
+  def stringify(self) -> str:
+    return f"({self.op} {self.left.stringify()}{'' if self.right is None else ' ' + self.right.stringify()})"
+
 BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
 @dataclass
 class BoolOp(BooleanValue):
@@ -718,6 +800,12 @@ class BoolOp(BooleanValue):
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
 
+  def stringify(self) -> str:
+    if self.right is None:
+      return f"<{self.op} {self.left.stringify()}>"
+    else:
+      return f"<{self.left.stringify()} {self.op} {self.right.stringify()}>"
+
 # Variables
 @dataclass
 class GetVar(Value):
@@ -726,6 +814,9 @@ class GetVar(Value):
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id]] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+
+  def stringify(self) -> str:
+    return f"({self.var_name})"
 
 @dataclass
 class EditVar(Block):
@@ -742,6 +833,12 @@ class EditVar(Block):
       "inputs": {"VALUE": raw_val},
       "fields": {"VARIABLE": [self.var_name, id]}
     }, ctx
+
+  def stringify(self) -> str:
+    if self.op == "set":
+      return f"{self.var_name} = {self.value.stringify()}"
+    else:
+      return f"change {self.var_name} by {self.value.stringify()}"
 
 @dataclass
 class EditList(Block):
@@ -771,6 +868,27 @@ class EditList(Block):
       "inputs": inputs,
       "fields": {"LIST": [self.list_name, list_id]},
     }, ctx
+
+  def stringify(self) -> str:
+    match self.op:
+      case "addto":
+        assert self.item is not None
+        return f"add {self.item.stringify()} to {self.list_name}"
+      case "replaceat":
+        assert self.item is not None
+        assert self.index is not None
+        return f"replace item {self.index.stringify()} of {self.list_name} with {self.item.stringify()}"
+      case "insertat":
+        assert self.item is not None
+        assert self.index is not None
+        return f"insert {self.item.stringify()} at {self.item.stringify()} of {self.list_name}"
+      case "deleteat":
+        assert self.index is not None
+        return f"delete {self.index.stringify()} of {self.list_name}"
+      case "deleteall":
+        return f"delete all of {self.list_name}"
+      case _:
+        raise ValueError(f"Could not find operation {self.op}")
 
 # Procedures
 @dataclass
@@ -817,6 +935,9 @@ class ProcedureDef(StartBlock):
       "inputs": {"custom_block": [1, proto_id]}
     }, ctx
 
+  def stringify(self) -> str:
+    return " ".join(["define", self.name, *(f"({p})" for p in self.params)])
+
 @dataclass
 class ProcedureCall(LateBlock):
   proc_name: str
@@ -843,6 +964,9 @@ class ProcedureCall(LateBlock):
       }
     }, ctx
 
+  def stringify(self) -> str:
+    return " ".join(["call", self.proc_name, *(a.stringify() for a in self.arguments)])
+
 @dataclass
 class GetParameter(Value):
   param_name: str
@@ -856,6 +980,9 @@ class GetParameter(Value):
     }), BlockMeta(parent))
 
     return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+
+  def stringify(self) -> str:
+    return f"(param {self.param_name})"
 
 
 class ScratchCompException(Exception):

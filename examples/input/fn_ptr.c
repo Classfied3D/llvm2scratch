@@ -1,8 +1,6 @@
 #include "sb3api.h"
 
-__attribute__((noinline)) int add_one(int num) {
-  return num + 1;
-}
+__attribute__((noinline)) int add_one(int num) { return num + 1; }
 
 __attribute__((noinline)) int sum_to_one_digit(int n) {
   int sum = 0;
@@ -12,7 +10,8 @@ __attribute__((noinline)) int sum_to_one_digit(int n) {
     n /= 10;
   }
 
-  if (sum >= 10) return sum_to_one_digit(sum);
+  if (sum >= 10)
+    return sum_to_one_digit(sum);
 
   return sum;
 }
@@ -20,7 +19,8 @@ __attribute__((noinline)) int sum_to_one_digit(int n) {
 int main(void) {
   double number, output;
   SB3_ask_dbl(&number, "Enter a number");
-  SB3_ask_dbl(&output, "Enter a number >0.5 to sum to one digit then add one, otherwise add two");
+  SB3_ask_dbl(&output, "Enter a number >0.5 to sum to one digit then add one, "
+                       "otherwise add two");
 
   int (*fn_ptr)(int);
   if (output > 0.5) {
