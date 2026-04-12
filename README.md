@@ -66,6 +66,8 @@ options:
                         is 200,000; default is 512
   --max-branch-recursion MAX_BRANCH_RECURSION
                         Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000
+  --debug-scratch-code DEBUG_SCRATCH_CODE
+                        Output scratch code to a text file so it can be viewed
 
 optimization options:
   all, none             Self-explanatory
