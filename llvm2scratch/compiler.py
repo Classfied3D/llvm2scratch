@@ -1944,54 +1944,24 @@ def getFuncBranchesVarUse(func: ir.Function,
     phi_info: defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]
   ) -> dict[str, BlockVarUse]:
 
-  label_var_use: dict[str, BlockVarUse] = {
-    name: getBlockVarUse(block.instrs, phi_info[name]) for name, block in func.blocks.items()
-  }
-
-  res: dict[str, BlockVarUse] = {}
-
-  # Update dictionary for all dependents
   total_depends_var_sizes: dict[str, int] = {}
-  for var_use in label_var_use.values():
+  label_info: dict[str, util.NodeInfo] = {}
+  for name, block in func.blocks.items():
+    var_use = getBlockVarUse(block.instrs, phi_info[name])
     total_depends_var_sizes.update(var_use.depends_var_sizes)
+    label_info[name] = util.NodeInfo(
+      might_call=var_use.branches,
+      might_modify=var_use.modifies,
+      dependent=var_use.depends,
+    )
 
-  for start_label in func.blocks:
-    # Worklist (current label, depends so far, modifies so far)
-    stack: list[tuple[str, set[str], set[str]]] = [(start_label,
-                                                    set(label_var_use[start_label].depends),
-                                                    set(label_var_use[start_label].modifies))]
+  label_info = util.analyzeCallGraph(label_info)
 
-    agg_depends: set[str] = set()
-    agg_modifies: set[str] = set()
-    agg_branches: set[str] = set()
-
-    while stack:
-      label, depends_so_far, modifies_so_far = stack.pop()
-
-      block_use = label_var_use[label]
-      new_depends = block_use.depends - modifies_so_far
-      new_modifies = block_use.modifies - modifies_so_far
-
-      # Skip if this block adds nothing new on this path
-      if not (new_depends - agg_depends) and not (new_modifies - agg_modifies):
-        continue
-
-      # Update dependencies (only if not modified already)
-      depends_so_far = depends_so_far | new_depends
-      modifies_so_far = modifies_so_far | block_use.modifies
-
-      # Aggregate results for this start label
-      agg_depends |= new_depends
-      agg_modifies |= block_use.modifies
-      agg_branches |= block_use.branches
-
-      # Push successors with updated state
-      for succ in block_use.branches:
-        stack.append((succ, set(depends_so_far), set(modifies_so_far)))
-
-    res[start_label] = BlockVarUse(agg_depends, agg_modifies, agg_branches, total_depends_var_sizes)
-
-  return res
+  return {
+    name: BlockVarUse(
+      info.dependent, info.might_modify, info.might_call, total_depends_var_sizes
+    ) for name, info in label_info.items()
+  }
 
 def getValueFuncPtrRefs(value: ir.Value, global_names: list[str]) -> set[str]:
   match value:
@@ -2404,8 +2374,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       # Find what each block in the function could branch to
       branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
-    cycles = util.find_all_cycles(branches)
-    fn_check_locations = util.select_cycle_checks(cycles)
+    cycles = util.findAllCycles(branches)
+    fn_check_locations = util.selectCycleChecks(cycles)
     could_recurse = len(fn_check_locations) > 0
     # If the branches could create a loop, we must place stack checks, so we should return to an
     # address. Furthermore, a binary search and a call is usually faster than potentially
@@ -2416,7 +2386,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     # Any branch that may be called more than once
     repeating_branches: set[str] = set().union(*[set(branch) for branch in cycles])
     # Branches that are unavoidable
-    unavoidable_branches: set[str] = util.unavoidable_nodes(branches, first_label, "ret")
+    unavoidable_branches: set[str] = util.unavoidableNodes(branches, first_label, "ret")
     # Branches that are always ran once per func call
     ran_once_branches = unavoidable_branches - repeating_branches
 
@@ -2934,13 +2904,13 @@ def addForeignFunctions(ctx: Context) -> Context:
   ]), ctx)
 
 
-  ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)
-  ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
-  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
-  ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
-  ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
-  ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("write called"))]), ctx)
-  ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
+  #ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)
+  #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
+  #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
+  #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
+  #ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
+  #ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("write called"))]), ctx)
+  #ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
 
   return ctx
 
