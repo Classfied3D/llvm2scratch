@@ -1932,9 +1932,8 @@ def getBlockVarUse(instrs: list[ir.Instr],
 
   res.branches = getTerminatorInstrLabels(instrs[-1]) - {"ret"}
   if block_var_use is not None:
-    modified = deepcopy(res.modifies)
     for label in res.branches:
-      res.depends |= block_var_use[label].depends - modified
+      res.depends |= block_var_use[label].depends - res.modifies
       res.modifies |= block_var_use[label].modifies
       res.depends_var_sizes.update(block_var_use[label].depends_var_sizes)
 
@@ -1944,23 +1943,28 @@ def getFuncBranchesVarUse(func: ir.Function,
     phi_info: defaultdict[str, defaultdict[str, list[tuple[Variable, ir.Value]]]]
   ) -> dict[str, BlockVarUse]:
 
+  entrypoint = list(func.blocks.keys())[0]
+
   total_depends_var_sizes: dict[str, int] = {}
   label_info: dict[str, util.NodeInfo] = {}
   for name, block in func.blocks.items():
     var_use = getBlockVarUse(block.instrs, phi_info[name])
     total_depends_var_sizes.update(var_use.depends_var_sizes)
     label_info[name] = util.NodeInfo(
-      might_call=var_use.branches,
-      might_modify=var_use.modifies,
-      dependent=var_use.depends,
+      depends=var_use.depends,
+      modifies=var_use.modifies,
+      calls=var_use.branches,
+      direct_modifies=deepcopy(var_use.modifies),
+      direct_calls=deepcopy(var_use.branches),
     )
 
-  label_info = util.analyzeCallGraph(label_info)
+  ana = util.CallGraphAnalysis(entrypoint, label_info)
+  ana.analyze()
 
   return {
     name: BlockVarUse(
-      info.dependent, info.might_modify, info.might_call, total_depends_var_sizes
-    ) for name, info in label_info.items()
+      info.depends, info.modifies, info.calls, total_depends_var_sizes
+    ) for name, info in ana.info.items()
   }
 
 def getValueFuncPtrRefs(value: ir.Value, global_names: list[str]) -> set[str]:

@@ -6,30 +6,48 @@ import itertools
 
 @dataclass
 class NodeInfo:
-  might_call: set[str]
-  might_modify: set[str]
-  dependent: set[str]
-  use_counts: Counter[str] = field(default_factory=Counter)
+  depends: set[str]
+  modifies: set[str]
+  calls: set[str]
+  direct_modifies: set[str]
+  direct_calls: set[str]
 
-def analyzeCallGraph(fn_info: dict[str, NodeInfo]) -> dict[str, NodeInfo]:
-  g = nx.DiGraph()
-  for name, info in fn_info.items():
-    g.add_node(name)
-    for callee in info.might_call:
-      g.add_edge(name, callee)
+@dataclass
+class CallGraphAnalysis:
+  entrypoint: str
+  info: dict[str, NodeInfo]
+  analyzed: set[str] = field(default_factory=set)
 
-  tc = nx.transitive_closure(g)
+  def analyzeNode(self, name: str) -> bool:
+    changed = False
+    info = self.info[name]
+    for callee in info.direct_calls:
+      callee_info = self.info[callee]
 
-  result = deepcopy(fn_info)
-  for name in fn_info:
-    for callee in tc.successors(name):
-      callee_info = fn_info[callee]
-      result[name].might_call |= callee_info.might_call
-      result[name].might_modify |= callee_info.might_modify
-      result[name].dependent |= callee_info.dependent
-      result[name].use_counts += callee_info.use_counts
+      if callee not in self.analyzed:
+        self.analyzed.add(callee)
+        changed = self.analyzeNode(callee) or changed
+        callee_info = self.info[callee]
 
-  return result
+      new_modifies = callee_info.modifies - info.modifies
+      new_depends = (callee_info.depends - info.direct_modifies) - \
+        info.depends
+      new_calls = callee_info.calls - info.calls
+
+      if len(new_modifies | new_depends | new_calls) > 0:
+        changed = True
+
+        info.modifies |= new_modifies
+        info.depends |= new_depends
+        info.calls |= new_calls
+
+    self.info[name] = info
+
+    return changed
+
+  def analyze(self):
+    while self.analyzeNode(self.entrypoint):
+      self.analyzed = set()
 
 def minHittingSetExact(cycles: list[list[str]]) -> list[str]:
   """Exact minimum hitting set by brute-force (use only for small instances)."""
