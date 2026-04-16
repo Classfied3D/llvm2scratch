@@ -10,5 +10,5 @@ from .parser import parseAssembly
 
 __all__ = [
   "optimizer", "compiler", "scratch", "Config", "DebugInfo", "ScratchConfig", "Project", "compile", "parseAssembly",
-  "Optimization", ALL_OPTIMIZATIONS
+  "Optimization", "ALL_OPTIMIZATIONS",
 ]
