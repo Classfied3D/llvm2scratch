@@ -115,7 +115,7 @@ def main():
     opti_passes=passes,
     memory_size=args.memory_size,
     local_stack_size=args.local_stack_size,
-    max_branch_recursion=args.local_stack_size,
+    max_branch_recursion=args.max_branch_recursion,
     scratch_config=scfg,
   )
 

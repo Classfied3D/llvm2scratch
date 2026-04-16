@@ -89,6 +89,8 @@ class Intrinsic(Enum):
   MemCpyInline = "llvm.memcpy.inline"
   MemMove = "llvm.memmove"
   FAbs = "llvm.fabs"
+  FShl = "llvm.fshl"
+  FShr = "llvm.fshr"
   LifetimeStart = "llvm.lifetime.start"
   LifetimeEnd = "llvm.lifetime.end"
   NoAliasScopeDecl = "llvm.experimental.noalias.scope.decl"

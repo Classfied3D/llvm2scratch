@@ -135,6 +135,8 @@ def decodeIntrinsic(name: str) -> Intrinsic | None:
   matches = [item for item in Intrinsic if name.startswith(item.value)]
   if not matches:
     raise ValueError(f"Unknown intrinsic {name}")
+
+  # Choose the longest one, i.e if llvm.memcopy and llvm.memcopy.inline were selected, the latter would be chosen
   return max(matches, key=lambda x: len(x.value))
 
 def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, StructTy], func_names: list[str]) -> Instr:

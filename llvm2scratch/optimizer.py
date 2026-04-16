@@ -109,15 +109,15 @@ def getKnownAndUnknown(value: sb3.Op | sb3.BoolOp) -> tuple[sb3.Known, sb3.Value
     return value.right, value.left, False
   return None
 
-def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
+def partialSimplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
   """Optimise a value by using context"""
   did_opti_total = False
   match value:
     case sb3.BoolOp():
-      value.left, did_opti_1 = simplifyValue(value.left)
+      value.left, did_opti_1 = partialSimplifyValue(value.left)
       did_opti_2 = False
       if value.right is not None:
-        value.right, did_opti_2 = simplifyValue(value.right)
+        value.right, did_opti_2 = partialSimplifyValue(value.right)
       did_opti_total |= did_opti_1 or did_opti_2
 
       if value.op == "not":
@@ -221,10 +221,10 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
           value = sb3.BoolOp("not", unknown.left)
 
     case sb3.Op():
-      value.left, did_opti_1 = simplifyValue(value.left)
+      value.left, did_opti_1 = partialSimplifyValue(value.left)
       did_opti_2 = False
       if value.right is not None:
-        value.right, did_opti_2 = simplifyValue(value.right)
+        value.right, did_opti_2 = partialSimplifyValue(value.right)
       did_opti_total |= did_opti_1 or did_opti_2
 
       if isinstance(value.left, sb3.Known) and (isinstance(value.right, sb3.Known) or value.right is None):
@@ -302,7 +302,7 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
                 did_opti_total = True
 
     case sb3.GetOfList():
-      value.value, did_opti = simplifyValue(value.value)
+      value.value, did_opti = partialSimplifyValue(value.value)
       did_opti_total |= did_opti
       # TODO OPTI: known values of lists can be looked up (assuming the list stays constant)
 
@@ -310,10 +310,10 @@ def simplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
       did_opti_total |= False
   return value, did_opti_total
 
-def completeSimplifyValue(value: sb3.Value) -> sb3.Value:
+def simplifyValue(value: sb3.Value) -> sb3.Value:
   did_opti = True
   while did_opti:
-    value, did_opti = simplifyValue(value)
+    value, did_opti = partialSimplifyValue(value)
   return value
 
 def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList, bool]:
@@ -327,7 +327,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
       did_opti = False
       inputs = getInputs(block)
       for i, value in enumerate(inputs):
-        inputs[i], did_opti_value = simplifyValue(value)
+        inputs[i], did_opti_value = partialSimplifyValue(value)
         did_opti |= did_opti_value
       block = setInputs(block, inputs)
       did_opti_total |= did_opti

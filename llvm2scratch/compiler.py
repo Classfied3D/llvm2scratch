@@ -15,6 +15,7 @@ from . import optimizer as opt
 from . import parser
 from . import ir
 
+INTERMEDIATE_MAX_BITS = 53 # Max bits scratch's doubles can store
 VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
                        # up to 53 bits, some operations require extra precision
 SCRATCH_LIST_LIMIT = 200_000
@@ -444,14 +445,20 @@ def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAn
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
   return ValueAndBlocks(val)
 
-def makePow2LookupTable(size: int, is_one_indexed: bool, ctx: Context) -> tuple[str, Context]:
-  name = ctx.cfg.pow2_lookup_var + (ctx.cfg.one_indexed_suffix if is_one_indexed else ctx.cfg.zero_indexed_suffix)
-  if name not in ctx.proj.lists or size > len(ctx.proj.lists[name]):
-    pow2_lookup = []
-    for x in range(int(is_one_indexed) + size):
-      pow2_lookup.append(2 ** x)
-    ctx.proj.lists[name] = pow2_lookup
-  return name, ctx
+def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
+  """
+  Creates a pow2 lookup table for 2^n for -VARIABLE_MAX_BITS <= n <= VARIABLE_MAX_BITS.
+  Returns the name of the list and the offset needed to add to n to get the index
+  """
+  name = ctx.cfg.pow2_lookup_var
+  if name not in ctx.proj.lists:
+    ctx.proj.lists[name] = [2 ** x for x in range(-VARIABLE_MAX_BITS, VARIABLE_MAX_BITS + 1)]
+
+  # To calculate 2^x with x = -VARIABLE_MAX_BITS corresponds to the 1st item in the list (index of 1)
+  # Then f(x) = 1 => -VARIABLE_MAX_BITS + offset = 1 => offset = VARIABLE_MAX_BITS + 1
+  offset = VARIABLE_MAX_BITS + 1
+
+  return name, offset, ctx
 
 def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
@@ -466,21 +473,26 @@ def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
       sb3.Known(-(2 ** width))),
     sb3.Known(2 ** (width - 1) - 1))
 
-def intPow2(val: sb3.Value, max_val: int, ctx: Context) -> tuple[sb3.Value, Context]:
+def intPow2(val: sb3.Value, ctx: Context, manual_offset: int=0) -> tuple[sb3.Value, Context]:
+  """
+  Calculates pow2 of a value. Only valid for values -VARIABLE_MAX_BITS <= n <= VARIABLE_MAX_BITS,
+  but empty result can be used in a bitshift as zero, having no effect on the result.
+  manual_offset can be combined with the offset used with pow2 to calculate 2^(n-1) at no extra cost.
+  """
   if isinstance(val, sb3.Known):
     try:
-      return sb3.Known(2 ** int(val.known)), ctx
+      return sb3.Known(2 ** (int(val.known) + manual_offset)), ctx
     except ValueError:
       raise CompException("Cannot calculate pow2 of a known non-integer")
   else:
-    lookup, ctx = makePow2LookupTable(max_val, True, ctx) # Any value above the width will be treated as a zero
-                                                          # which has no effect on the result
-    return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(1))), ctx
+    lookup, offset, ctx = makePow2LookupTable(ctx) # Any value above the width will be treated as a zero
+                                                   # which has no effect on the result
+    return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(offset + manual_offset))), ctx
 
 def bitShift(direction: Literal["left", "right"],
              width: int, left: sb3.Value, right: sb3.Value,
              ctx: Context, can_shift_out=True) -> tuple[sb3.Value, Context]:
-  right_mul, ctx = intPow2(right, width, ctx)
+  right_mul, ctx = intPow2(right, ctx)
 
   if direction == "left":
     # Multipling by a power of two is safe because the internal double value scratch uses doesnt loose accuracy
@@ -603,7 +615,7 @@ def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value
 
   carried_sum = sb3.Op(op, raw_sum, carry)
   # When using known values, the optimizer can subtract values from both sides
-  if ctx.cfg.opti: carried_sum = opt.completeSimplifyValue(carried_sum)
+  if ctx.cfg.opti: carried_sum = opt.simplifyValue(carried_sum)
 
   return carried_sum
 
@@ -619,8 +631,8 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
   if ctx.cfg.opti:
     # Optimize the values beforehand - helps with finding optimial calculation after optimizations
-    left = IdxbleValue([opt.completeSimplifyValue(l) for l in left.vals])
-    right = IdxbleValue([opt.completeSimplifyValue(r) for r in right.vals])
+    left = IdxbleValue([opt.simplifyValue(l) for l in left.vals])
+    right = IdxbleValue([opt.simplifyValue(r) for r in right.vals])
 
   best_cost = float("inf")
   best_blocks = sb3.BlockList()
@@ -695,7 +707,7 @@ def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond,
 
   # Like undoTwosComplement but can remove the extra addition at the end because algebra
   # Simplify because instructions are optimized for known values
-  reverse_twos_complement = lambda val: opt.completeSimplifyValue(
+  reverse_twos_complement = lambda val: opt.simplifyValue(
     sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(modulus)))
 
   # Subtracting half the modulus after reversing two's complement
@@ -1389,7 +1401,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
           change = 2 ** width
 
-          right_mul, ctx = intPow2(right, width, ctx)
+          right_mul, ctx = intPow2(right, ctx)
 
           unwrapped_pos = sb3.Op("div", left, right_mul)
           val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
@@ -2208,6 +2220,24 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       metadata.append(arg)
 
   match intrinsic:
+    case ir.Intrinsic.UMin | ir.Intrinsic.UMax | ir.Intrinsic.SMin | ir.Intrinsic.SMax:
+      match intrinsic:
+        case ir.Intrinsic.UMin: mode = ir.ICmpCond.Ult
+        case ir.Intrinsic.UMax: mode = ir.ICmpCond.Ugt
+        case ir.Intrinsic.SMin: mode = ir.ICmpCond.Slt
+        case ir.Intrinsic.SMax: mode = ir.ICmpCond.Sgt
+
+      lft, rgt = values
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
+      ty = args[0].type
+      assert isinstance(ty, ir.IntegerTy)
+      assert result is not None
+
+      cond = intCompare(lft, rgt, ty.width, mode, ctx.cfg)
+      blocks.add(sb3.BlockList([
+        sb3.ControlFlow("if_else", cond, sb3.BlockList([result.setValue(lft)]), sb3.BlockList([result.setValue(rgt)]))
+      ]))
+
     case ir.Intrinsic.MemCpy:
       dest, src, length, volatile = values
 
@@ -2247,23 +2277,82 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
           ]))
         ]))
 
-    case ir.Intrinsic.UMin | ir.Intrinsic.UMax | ir.Intrinsic.SMin | ir.Intrinsic.SMax:
-      match intrinsic:
-        case ir.Intrinsic.UMin: mode = ir.ICmpCond.Ult
-        case ir.Intrinsic.UMax: mode = ir.ICmpCond.Ugt
-        case ir.Intrinsic.SMin: mode = ir.ICmpCond.Slt
-        case ir.Intrinsic.SMax: mode = ir.ICmpCond.Sgt
-
-      left, right = values
+    case ir.Intrinsic.FShl | ir.Intrinsic.FShr:
+      lft, rgt, shift = values
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value) and isinstance(shift, sb3.Value)
       ty = args[0].type
       assert isinstance(ty, ir.IntegerTy)
-      width = ty.width
       assert result is not None
 
-      cond = intCompare(left, right, width, mode, ctx.cfg)
-      blocks.add(sb3.BlockList([
-        sb3.ControlFlow("if_else", cond, sb3.BlockList([result.setValue(left)]), sb3.BlockList([result.setValue(right)]))
-      ]))
+      # If there is enough space so that the bits can be concatenated to fit in one value
+      short_version = ty.width * 2 < INTERMEDIATE_MAX_BITS
+
+      # e.g. in 8 bits a rotation of 9 bits is equivalent to a rotation of 1 bit
+      # simplify early so that intPow2 can use known values to lookup pow2 beforehand
+      shift = opt.simplifyValue(sb3.Op("mod", shift, sb3.Known(ty.width)))
+      shift_op = "mul" if intrinsic == ir.Intrinsic.FShl else "div"
+      pow2_width = sb3.Known(2 ** ty.width)
+
+      if short_version:
+        # Short version where there is enough space to concatinate bits e.g
+        # for 8 bit FSHL: floor((a + b / 256) * 2^(shift MOD 8)) MOD 256
+
+        pow2_shift, ctx = intPow2(shift, ctx)
+
+        # Shift either left or right by a fixed value
+        preshifted_lft = sb3.Op("mul", lft, pow2_width) if intrinsic == ir.Intrinsic.FShl else lft
+        preshifted_rgt = sb3.Op("div", rgt, pow2_width) if intrinsic == ir.Intrinsic.FShr else rgt
+
+        blocks.add(result.setValue(
+          sb3.Op("mod",
+            sb3.Op("floor",
+              sb3.Op(shift_op,
+                sb3.Op("add",
+                  preshifted_lft,
+                  preshifted_rgt,
+                ),
+                pow2_shift, # MUL/DIV
+              ) # FLOOR
+            ),
+            pow2_width # MOD
+        )))
+
+      else:
+        # Solution with highest intermediate bits the same as the original bits e.g
+        # for 8 bit FSHL: (a / 2^(shift MOD 8) MOD 256) + floor((b / 256) / 2^(shift MOD 8))
+        # since intPow gives us an offset with no extra cost, we can use this to multiply
+        # or divide by 2^n here
+
+        # Shift length is referenced twice, store if faster
+        shift, shift_blocks = flatAsTuple(optimizeValueUse(shift, 2, ctx))
+        blocks.add(shift_blocks)
+
+        if intrinsic == ir.Intrinsic.FShl:
+          lft_offset = 0
+          # Same as dividing by 2^n beforehand
+          rgt_offset = -ty.width
+        else:
+          # Same as multipling lft by 2^n beforehand, as we divide by 2^(shift + offset)
+          lft_offset = -ty.width
+          rgt_offset = 0
+
+        pow2_shift_plus_offset_lft, ctx = intPow2(shift, ctx, lft_offset)
+        pow2_shift_plus_offset_rgt, ctx = intPow2(shift, ctx, rgt_offset)
+
+        blocks.add(result.setValue(
+          sb3.Op("add",
+            sb3.Op("mod",
+              sb3.Op(shift_op,
+                lft,
+                pow2_shift_plus_offset_lft
+              ),
+              pow2_width
+            ),
+            sb3.Op("floor",
+              sb3.Op(shift_op,
+                rgt,
+                pow2_shift_plus_offset_rgt
+        )))))
 
     case _:
       raise CompException(f"Unsupported intrinsic {intrinsic}")
@@ -2986,8 +3075,8 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Optimise scratch project
   if cfg.opti:
     ctx.proj = opt.optimize(ctx.proj,
-                                  all_opti = cfg.opti_passes,
-                                  dont_remove = getDontRemove(ctx),
-                                  ignore_external_change = {ctx.cfg.stack_pointer_var})
+                            all_opti = cfg.opti_passes,
+                            dont_remove = getDontRemove(ctx),
+                            ignore_external_change = {ctx.cfg.stack_pointer_var})
 
   return ctx.proj, ctx.debug_info
