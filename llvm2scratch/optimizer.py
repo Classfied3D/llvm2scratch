@@ -29,10 +29,13 @@ LENGTH_OF_COST = 0.483
 CONTAINS_STR_COST = 1.272
 BOOL_AS_INT_COST = 0.304 # Bool to int use round on a boolean value, which is cheaper than a round on a fp value
 ROUND_COST = 1.250
+GET_LIST_COST = 5.814 # Unreliable benchmark
 GET_ITEM_COST = 1.679
 ITEM_NUM_COST = 4.920 # Unreliable benchmark
 GET_COUNTER_COST = 0.190
 ANSWER_COST = 0.331
+COSTUME_NUMBER_COST = 0.241
+COSTUME_NAME_COST = 0.654
 KNOWN_COST = 0 # Included in the cost of the block that uses it
 
 @dataclass
@@ -411,6 +414,8 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
       return {"counter:"}, Counter()
     case sb3.GetAnswer():
       return {"answer:"}, Counter()
+    case sb3.CostumeInfo():
+      return {"costume:"}, Counter()
     case sb3.Op() | sb3.BoolOp():
       depends, counts = getValueVarUse(value.left)
       if value.right is not None:
@@ -418,6 +423,8 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
         depends.update(new_depends)
         counts += new_counts
       result = depends, counts
+    case sb3.GetList():
+      result = {"list:" + value.list_name}, Counter()
     case sb3.GetOfList():
       use, counts = getValueVarUse(value.value)
       result = {"list:" + value.list_name} | use, counts
@@ -472,6 +479,10 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         info.always_modify.add(name)
       case sb3.Ask():
         name = "answer:"
+        info.might_modify.add(name)
+        info.always_modify.add(name)
+      case sb3.SwitchCostume():
+        name = "costume:"
         info.might_modify.add(name)
         info.always_modify.add(name)
       case sb3.ProcedureCall() | sb3.Broadcast():
@@ -530,6 +541,9 @@ def getValueCost(value: sb3.Value) -> float:
   match value:
     case sb3.Known():
       cost = KNOWN_COST
+    case sb3.CostumeInfo():
+      if value.op == "number":         cost = COSTUME_NUMBER_COST
+      elif value.op == "name":         cost = COSTUME_NAME_COST
     case sb3.GetCounter():             cost = GET_COUNTER_COST
     case sb3.GetAnswer():              cost = ANSWER_COST
     case sb3.Op():
@@ -550,6 +564,7 @@ def getValueCost(value: sb3.Value) -> float:
       else:
         raise OptimizerException(f"Unknown BoolOp opcode, {value.op}")
     case sb3.GetVar():                 cost = GET_VAR_COST
+    case sb3.GetList():                cost = GET_LIST_COST
     case sb3.GetOfList():
       cost = GET_ITEM_COST if value.op == "atindex" else ITEM_NUM_COST
     case sb3.GetParameter():           cost = GET_PARAM_COST
@@ -574,7 +589,8 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
-    case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | sb3.GetAnswer():
+    case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | \
+         sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList():
       result = value
       did_opti = False
     case sb3.GetVar():

@@ -3,20 +3,16 @@
 
 static int a = 7;
 static long long ll_a = 149876583280495765;
-static char* message = "loldefault";
+static char *message = "loldefault";
 
 typedef struct SensorData {
   int temp;
   int humidity;
 } SensorData;
 
-int add_one(int num) {
-  return num + 1;
-}
+int add_one(int num) { return num + 1; }
 
-long long add_one_ll(long long num) {
-  return num + 1;
-}
+long long add_one_ll(long long num) { return num + 1; }
 
 void do_nothing(void) {}
 
@@ -26,13 +22,15 @@ int test_branch(int num) {
 
   int a = 3;
 
-  if (num != 1) a = 50;
+  if (num != 1)
+    a = 50;
 
   return a + num;
 }
 
 int factorial_recurse(int n) {
-  if (n == 1) return 1;
+  if (n == 1)
+    return 1;
   return factorial_recurse(n - 1) * n;
 }
 
@@ -44,25 +42,26 @@ int sum_to_one_digit(int n) {
     n /= 10;
   }
 
-  if (sum >= 10) return sum_to_one_digit(sum);
+  if (sum >= 10)
+    return sum_to_one_digit(sum);
   return sum;
 }
 
-void numberize(char* str) {
+void numberize(char *str) {
   for (int i = 0; str[i] != '\0'; i++) {
     switch (str[i]) {
-      case 'a':
-        str[i] = '4';
-        break;
-      case 'e':
-        str[i] = '3';
-        break;
-      case 'l':
-        str[i] = '1';
-        break;
-      case 'o':
-        str[i] = '0';
-        break;
+    case 'a':
+      str[i] = '4';
+      break;
+    case 'e':
+      str[i] = '3';
+      break;
+    case 'l':
+      str[i] = '1';
+      break;
+    case 'o':
+      str[i] = '0';
+      break;
     }
   }
 }
@@ -94,22 +93,22 @@ int main(void) {
 
   unsigned int e = 221;
   switch (e) {
-    case 0:
-      SB3_say_str("0");
-      break;
-    case 1:
-      SB3_say_str("1");
-      break;
-    case 20:
-      SB3_say_str("20");
-      break;
-    case 21:
-      SB3_say_str("21");
-      break;
-    default:
-      // Should say "default"
-      SB3_say_str(message + 3);
-      break;
+  case 0:
+    SB3_say_str("0");
+    break;
+  case 1:
+    SB3_say_str("1");
+    break;
+  case 20:
+    SB3_say_str("20");
+    break;
+  case 21:
+    SB3_say_str("21");
+    break;
+  default:
+    // Should say "default"
+    SB3_say_str(message + 3);
+    break;
   }
 
   int f = factorial_recurse(10);
@@ -148,14 +147,14 @@ int main(void) {
 
   ll_a += 55;
 
-  char answer[32];
-  SB3_ask_str(answer, "Give me a string", 32);
-  SB3_say_str(answer);
-
   // SB3_ask_dbl works a bit like scanf
   double answer_dbl;
   SB3_ask_dbl(&answer_dbl, "Give me a number");
   SB3_say_dbl(answer_dbl);
+
+  char answer[32];
+  SB3_ask_str(answer, "Give me a string", 32);
+  SB3_say_str(answer);
 
   return 0;
 }

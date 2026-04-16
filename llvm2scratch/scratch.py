@@ -80,6 +80,7 @@ class Project:
   cfg: ScratchConfig
   code: list[BlockList] = field(default_factory=list)
   lists: dict[str, list[int | float | str | bool]] = field(default_factory=dict)
+  costumes: list[str] = field(default_factory=list)
 
   def export(self, filename: str) -> None:
     """Exports the project into a .sprite3 file"""
@@ -88,6 +89,11 @@ class Project:
   def stringify(self):
     return "\n\n".join(l.stringify() for l in self.code)
 
+  def addCostume(self, name: str) -> int:
+    """Adds a costume and returns its costume number"""
+    self.costumes.append(name)
+    return len(self.costumes)
+
   def getCtx(self) -> ScratchContext:
     """Converts the project into a ScratchContext which can be used to get the raw project"""
     ctx = ScratchContext(self.cfg) # pyright: ignore[reportCallIssue] this error only appears sometimes??
@@ -95,6 +101,7 @@ class Project:
       ctx.addOrGetList(name, scratch_list)
     for block_list in self.code:
       ctx.addBlockList(block_list)
+    ctx.costumes.extend(self.costumes)
     return ctx
 
 @dataclass
@@ -106,6 +113,7 @@ class ScratchContext:
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
   late_blocks: list[tuple[Id, LateBlock, BlockMeta]] = field(default_factory=list)
+  costumes: list[str] = field(default_factory=list)
   generated_ids: int = 0
   generated_var_ids: int = 0
   exported: bool = False
@@ -211,10 +219,17 @@ class ScratchContext:
     for id, block in self.blocks.items():
       raw_blocks.update({id: block})
 
+    raw_costumes = []
+    # A costume must be defined for the sprite to load
+    costume_names = [""] if len(self.costumes) == 0 else self.costumes
+    for name in costume_names:
+      raw_costumes.append(makeEmptyCostume(name))
+
     return {
       "variables": raw_vars,
       "lists": raw_lists,
       "blocks": raw_blocks,
+      "costumes": raw_costumes,
     }
 
   def numericToStrUID(self, n: int) -> str:
@@ -443,6 +458,53 @@ class Say(Block):
   def stringify(self) -> str:
     return f"say {self.value.stringify()}"
 
+@dataclass
+class SwitchCostume(Block):
+  name: Value
+
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    if isinstance(self.name, Known):
+      name_str = scratchCastToStr(self.name)
+
+      proto_id = ctx.genId()
+      # Add prototype costume
+      ctx.addBlock(proto_id, RawBlock( {
+        "opcode": "looks_costume",
+        "fields": {"COSTUME": [name_str, None]},
+      }), BlockMeta(my_id, None, True))
+
+      raw_name = [1, proto_id]
+
+    else:
+      raw_name, ctx = self.name.getRawValue(my_id, ctx, ScratchCast.TO_STR)
+
+    return {
+      "opcode": "looks_switchcostumeto",
+      "inputs": {"COSTUME": raw_name},
+    }, ctx
+
+  def stringify(self) -> str:
+    return f"switch costume to {self.name.stringify()}"
+
+@dataclass
+class CostumeInfo(Value):
+  op: Literal["name", "number"]
+
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    id = ctx.genId()
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": "looks_costumenumbername",
+      "fields": {
+        "NUMBER_NAME": [self.op, None]
+      }
+    }), BlockMeta(parent))
+
+    return [3, id], ctx
+
+  def stringify(self) -> str:
+    return f"(costume {self.op})"
+
 # Events
 # Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
 @dataclass
@@ -574,7 +636,7 @@ class GetCounter(Value):
       "opcode": "control_get_counter"
     }), BlockMeta(parent))
 
-    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, id], ctx
 
   def stringify(self) -> str:
     return "(counter)"
@@ -635,7 +697,7 @@ class GetAnswer(Value):
       "opcode": "sensing_answer"
     }), BlockMeta(parent))
 
-    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, id], ctx
 
   def stringify(self) -> str:
     return "(answer)"
@@ -660,7 +722,7 @@ class GetOfList(Value):
       "fields": {"LIST": [self.list_name, list_id]},
     }), BlockMeta(parent))
 
-    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, id], ctx
 
   def stringify(self) -> str:
     if self.op == "atindex":
@@ -739,7 +801,7 @@ class Op(Value):
       "fields": fields
     }), BlockMeta(parent))
 
-    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, id], ctx
 
   def stringify(self) -> str:
     return f"({self.op} {self.left.stringify()}{'' if self.right is None else ' ' + self.right.stringify()})"
@@ -813,7 +875,7 @@ class GetVar(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
-    return [3, [12, self.var_name, id]] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, [12, self.var_name, id]], ctx
 
   def stringify(self) -> str:
     return f"({self.var_name})"
@@ -839,6 +901,17 @@ class EditVar(Block):
       return f"{self.var_name} = {self.value.stringify()}"
     else:
       return f"change {self.var_name} by {self.value.stringify()}"
+
+@dataclass
+class GetList(Value):
+  list_name: str
+
+  def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    id = ctx.addOrGetList(self.list_name)
+    return [3, [13, self.list_name, id]], ctx
+
+  def stringify(self) -> str:
+    return f"(list {self.list_name})"
 
 @dataclass
 class EditList(Block):
@@ -912,6 +985,7 @@ class ProcedureDef(StartBlock):
         "fields": {"VALUE": [sanitizeProcName(param, True), None]}
       }), BlockMeta(proto_id))
 
+    # Add prototype shadow
     data = {
       "opcode": "procedures_prototype",
       "inputs": dict(zip(param_ids, [list((1, id)) for id in param_block_ids])),
@@ -979,7 +1053,7 @@ class GetParameter(Value):
       "fields": {"VALUE": [sanitizeProcName(self.param_name, True), None]}
     }), BlockMeta(parent))
 
-    return [3, id] + ([] if ctx.cfg.minify else [[10, ""]]), ctx
+    return [3, id], ctx
 
   def stringify(self) -> str:
     return f"(param {self.param_name})"
@@ -1047,6 +1121,17 @@ def scratchCompare(left: Known, right: Known) -> float:
     right_val = scratchCastToStr(right).lower()
     return 0 if left_val == right_val else (-1 if left_val < right_val else 1)
 
+def makeEmptyCostume(name: str) -> dict:
+  return {
+    "name": name,
+    "bitmapResolution": 1,
+    "dataFormat": "svg",
+    "assetId": EMPTY_SVG_HASH,
+    "md5ext": f"{EMPTY_SVG_HASH}.svg",
+    "rotationCenterX": 0,
+    "rotationCenterY": 0
+  }
+
 def exportSpriteData(ctx: ScratchContext) -> str:
   res = {
     "isStage": False,
@@ -1058,15 +1143,7 @@ def exportSpriteData(ctx: ScratchContext) -> str:
     "currentCostume": 0,
     "costumes":[
       # A costume must be defined for the sprite to load
-      {
-        "name": "",
-        "bitmapResolution": 1,
-        "dataFormat": "svg",
-        "assetId": EMPTY_SVG_HASH,
-        "md5ext": f"{EMPTY_SVG_HASH}.svg",
-        "rotationCenterX": 0,
-        "rotationCenterY": 0
-      }
+      makeEmptyCostume("")
     ],
     "sounds": [],
     "volume": 100,

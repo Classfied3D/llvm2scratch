@@ -53,6 +53,7 @@ class Config:
 
   ascii_lookup_var = "!ascii lookup"
   pow2_lookup_var = "!pow2 lookup"
+  lowercase_var = "!lowercase"
 
   return_address_local = "return address" # Name of the local variable or parameter to the id of func the return to
   previous_stack_size_local = "prev stack size" # Name of the local variable to store the previous stack size
@@ -1437,7 +1438,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             # If there would be no carry
             res_val = sb3.Op("add", left, right)
           else:
-            # TODO OPTI: gen (11-bit) tables/use mod for known values
+            # TODO: use mod for known values
             if width > ctx.cfg.binop_lookup_bits:
               uses = width / ctx.cfg.binop_lookup_bits
               left, lblocks = flatAsTuple(optimizeValueUse(left, uses, ctx))
@@ -2867,6 +2868,12 @@ def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context)
   return ctx
 
 def addForeignFunctions(ctx: Context) -> Context:
+  uppercase_costume_name = "uppercase"
+  lowercase = "abcdefghijklmnopqrstuvwxyz"
+  ctx.proj.lists[ctx.cfg.lowercase_var] = list(lowercase)
+  ctx.proj.addCostume(uppercase_costume_name)
+  lc_costume_num = ctx.proj.addCostume(lowercase)
+
   ascii_lookup = []
   for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
     char = chr(x)
@@ -2875,6 +2882,27 @@ def addForeignFunctions(ctx: Context) -> Context:
     else:
       ascii_lookup.append(char)
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
+
+  # Checks if an ASCII alphabet character is uppercase or not
+  # The caller is responsible for setting the costume back to the original
+  ctx = addFunc("!helper_is_lowercase", ["char", "alphabet_pos"], sb3.BlockList([
+    sb3.EditVar("set", "original",
+      sb3.GetOfList("atindex", ctx.cfg.lowercase_var, sb3.GetParameter(localizeParameter("alphabet_pos"))),
+    ),
+    sb3.EditList("replaceat", ctx.cfg.lowercase_var,
+      sb3.GetParameter(localizeParameter("alphabet_pos")),
+      sb3.GetParameter(localizeParameter("char"))),
+    sb3.SwitchCostume(sb3.Known(uppercase_costume_name)),
+    sb3.SwitchCostume(sb3.GetList(ctx.cfg.lowercase_var)),
+    sb3.EditList("replaceat", ctx.cfg.lowercase_var,
+      sb3.GetParameter(localizeParameter("alphabet_pos")),
+      sb3.GetVar("original")),
+    sb3.EditVar("set", ctx.cfg.return_var,
+      sb3.Op("bool_as_int", sb3.BoolOp("=",
+        sb3.CostumeInfo("number"),
+        sb3.Known(lc_costume_num),
+      ))),
+  ]), ctx)
 
   # Converts a C string to a Scratch string.
   # Not meant to be used in C as it doesn't support Scratch strings.
@@ -2921,13 +2949,27 @@ def addForeignFunctions(ctx: Context) -> Context:
     ])),
 
     sb3.ControlFlow("reptimes", sb3.GetVar("char"), sb3.BlockList([
-      # TODO: Case sensitivity (using costumes).
-      # This would also help for Scratch 2.0 support.
-      #   (although that's more than probably not planned, but I personally just really like Scratch 2.)
-      sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.GetOfList("indexof",
-        (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-        sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input")))
-        )),
+      sb3.EditVar("set", "ascii",
+        sb3.GetOfList("indexof",
+          (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
+          sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input"))))),
+      sb3.ControlFlow("if",
+        sb3.BoolOp("and",
+          sb3.BoolOp(">", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1)),
+          sb3.BoolOp("<", sb3.GetVar("ascii"), sb3.Known(ord("Z") + 1)),
+        ),
+        sb3.BlockList([
+          # TODO set costume back to original in after helper_scratch2str finishes
+          sb3.ProcedureCall("!helper_is_lowercase", [
+            sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input"))),
+            sb3.Op("sub", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1))
+          ]),
+          sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar(ctx.cfg.return_var), sb3.Known(1)), sb3.BlockList([
+            sb3.EditVar("change", "ascii", sb3.Known(ord("a") - ord("A"))),
+          ])),
+        ])
+      ),
+      sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.GetVar("ascii")),
       sb3.EditVar("change", "i", sb3.Known(1)),
     ])),
     # End of string

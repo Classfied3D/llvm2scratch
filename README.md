@@ -39,9 +39,9 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Usage
 
 ```
-usage: llvm2scratch [-h] [-o OUTPUT] [-O {all,none,compiler,assignment-elision,known-value-prop}]
-                    [-M {all,none,general,break-glow}] [--hide-blocks] [--memory-size MEMORY_SIZE]
-                    [--local-stack-size LOCAL_STACK_SIZE] [--max-branch-recursion MAX_BRANCH_RECURSION]
+usage: llvm2scratch [-h] [-o OUTPUT] [-O {all,none,compiler,assignment-elision,known-value-prop}] [-M {all,none,general,break-glow}] [--hide-blocks]
+                    [--memory-size MEMORY_SIZE] [--local-stack-size LOCAL_STACK_SIZE] [--max-branch-recursion MAX_BRANCH_RECURSION]
+                    [--debug-scratch-code DEBUG_SCRATCH_CODE]
                     input
 
 Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)
@@ -57,13 +57,11 @@ options:
                         Optimizations to apply; defaults to all; see below
   -M {all,none,general,break-glow}
                         Minify settings to apply; defaults to general; see below
-  --hide-blocks         Prevent blocks from rendering in the editor by setting shadow: true on top level
-                        blocks; stops editor lag
+  --hide-blocks         Prevent blocks from rendering in the editor by setting shadow: true on top level blocks; stops editor lag
   --memory-size MEMORY_SIZE
                         Number of 'bytes' on 'memory' list; max value is 200,000; default is 1024
   --local-stack-size LOCAL_STACK_SIZE
-                        Number of 'bytes' on local stack list for storing registers when recursing; max value
-                        is 200,000; default is 512
+                        Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is 512
   --max-branch-recursion MAX_BRANCH_RECURSION
                         Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000
   --debug-scratch-code DEBUG_SCRATCH_CODE
@@ -71,16 +69,15 @@ options:
 
 optimization options:
   all, none             Self-explanatory
-  compiler              Enable compiler-level optimizations (e.g. addressing globals with address instead of by
-                        variable)
+  compiler              Enable compiler-level optimizations (e.g. addressing globals with address instead of by variable)
   assignment-elision    Reduce expensive 'Set Variable' usage by inlining variable assignments
   known-value-prop      Various transformations on values and blocks under certain values
 
 minify options:
   all, none             Self-explanatory
   general               Optimize project.json's size by simplifing uids, removing falsy fields, etc
-  break-glow            Removing the parent key when minifing prevents blocks in the same sprite from glowing
-                        correctly due to a js error - minify futher and allow this error to occur
+  break-glow            Removing the parent key when minifing prevents blocks in the same sprite from glowing correctly due to a js error - minify futher and
+                        allow this error to occur
 ```
 
 ## Info
@@ -140,10 +137,14 @@ Cntin Str: 1.272
 Round Int: 0.304
 Round Flt: 1.250
 
+Get List:  5.814 (Unreliable)
 Item:      1.679
-Item #:    4.920 (Unreliable benchmark)
+Item #:    4.920 (Unreliable)
 
 Counter:   0.190
 
 Answer:    0.331
+
+Cost Num:  0.241
+Cost Name: 0.654
 ```
