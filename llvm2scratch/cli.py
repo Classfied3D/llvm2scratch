@@ -44,8 +44,14 @@ def main():
   parser.add_argument(
     "-o", "--output",
     type=Path,
-    default="out.sprite3",
-    help="Path to the output sprite3 file"
+    default="out.sb3",
+    help="Path to the output file (.sb3 or .sprite3)"
+  )
+  parser.add_argument(
+    "--format",
+    choices=["infer", *(f.value for f in scratch.Format)],
+    default="infer",
+    help="File format of output file. By default this infered by the output file's extension."
   )
   parser.add_argument(
     "-O",
@@ -63,12 +69,6 @@ def main():
     default=None,
     help="Minify settings to apply; defaults to general; see below"
   )
-  parser.add_argument(
-    "--hide-blocks",
-    action="store_true",
-    default=False,
-    help="Prevent blocks from rendering in the editor by setting shadow: true on top level blocks; stops editor lag"
-  )
   parser.add_argument("--memory-size", type=int, default=1024,
     help="Number of 'bytes' on 'memory' list; max value is 200,000; default is 1024")
   parser.add_argument("--local-stack-size", type=int, default=512,
@@ -80,6 +80,15 @@ def main():
     type=Path,
     default=None,
     help="Output scratch code to a text file so it can be viewed"
+  )
+  parser.add_argument(
+    "--hide-blocks",
+    action="store_true",
+    default=False,
+    help="Prevent blocks from rendering in the editor by setting shadow: true on top level blocks; "
+         "stops editor lag. Not recommended due to increased project size and this seems to stop some"
+         "projects from running. Instead export to a project instead of a sprite and don't click on the"
+         "sprite."
   )
 
   args = parser.parse_args()
@@ -126,7 +135,16 @@ def main():
     with open(args.debug_scratch_code, "w") as file:
       file.write(proj.stringify())
 
-  proj.export(args.output)
+  if args.format == "infer":
+    extension = str(args.output).rsplit(".")[-1]
+    if extension == "sb3":       format = scratch.Format.Project3
+    elif extension == "sprite3": format = scratch.Format.Sprite3
+    else: raise ValueError(f"Could not infer output file format from extension \"{extension}\". "
+                           "Either use a valid extension or set --format")
+  else:
+    format = args.format
+
+  proj.export(args.output, format)
 
 if __name__ == "__main__":
   main()

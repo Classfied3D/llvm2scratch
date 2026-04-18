@@ -18,7 +18,7 @@ def main():
 
   with open("input/demo.ll", "r") as file:
     proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(opti=True))
-    proj.export("output/out.sprite3")
+    proj.export("output/out.sb3", llvm2scratch.Format.Project3)
 
 if __name__ == "__main__":
   main()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Literal, NamedTuple
+from typing import Literal
 from enum import Enum
 
 import zipfile
@@ -11,6 +11,18 @@ import random
 import json
 import math
 
+MAIN_SPRITE_NAME = "DONT OPEN" # Incorrect grammar so it can fit in sprite name box lol
+EMPTY_SPRITE_NAME = "Empty"
+MESSAGE = """\
+WARNING: The 'DONT OPEN' sprite may contain a lot of blocks and cause the scratch editor to crash! \
+Make a backup of the project before opening! Also, opening it may cause any project.json tweaks enabled \
+to break (not all projects use these so it should be fine).
+
+This project was compiled from C, C++, Rust or other languages using llvm2scratch. The author of the \
+project should have included the source code used to compile it, so check the project description! \
+If you really want to read the generated scratch code (which is quite difficult to understand), the \
+author may have also provided a text version.\
+"""
 DEFAULT_BROADCAST_MESSAGE = "message1"
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
@@ -62,7 +74,12 @@ SHORT_OP_TO_OPCODE = {
 
 Id = str
 
-class ScratchConfig(NamedTuple):
+class Format(Enum):
+  Project3 = "project3"
+  Sprite3 = "sprite3"
+
+@dataclass
+class ScratchConfig():
   # TODO add an option to replace hacked blocks with a working version that isn't hacked
   # (since they're used for better performance anyway)
 
@@ -82,9 +99,9 @@ class Project:
   lists: dict[str, list[int | float | str | bool]] = field(default_factory=dict)
   costumes: list[str] = field(default_factory=list)
 
-  def export(self, filename: str) -> None:
-    """Exports the project into a .sprite3 file"""
-    exportScratchFile(self.getCtx(), filename)
+  def export(self, filename: str, format: Format) -> None:
+    """Exports the project into a .sb3/.sprite3 file"""
+    exportScratchFile(self.getCtx(), filename, format)
 
   def stringify(self):
     return "\n\n".join(l.stringify() for l in self.code)
@@ -272,14 +289,17 @@ class Block():
   def stringify(self) -> str:
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
+@dataclass
 class StartBlock(Block):
   def isStart(self) -> bool:
     return True
 
+@dataclass
 class EndBlock(Block):
   def isEnd(self) -> bool:
     return True
 
+@dataclass
 class LateBlock(Block):
   """A block which requires info about the whole program to be added e.g. the id of function parameters which might not yet be defined"""
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
@@ -317,6 +337,7 @@ class BlockMeta:
 
     return metaless
 
+@dataclass
 class BlockList:
   blocks: list[Block]
   end: bool
@@ -360,6 +381,7 @@ class RawBlock(Block):
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return self.contents, ctx
 
+@dataclass
 class Value:
   """Something that can be in a blocks input e.g. x in Say(x)"""
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
@@ -369,11 +391,13 @@ class Value:
   def stringify(self) -> str:
     raise ScratchCompException("Cannot stringify for generic type 'Value'; must be a derived class")
 
+@dataclass
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     raise ScratchCompException("Cannot export for generic type 'BooleanValue'; must be a derived class")
 
+@dataclass
 class Known(Value):
   """Something that can be typed in a block input e.g. x in Say(x)"""
   known: str | float | bool
@@ -422,6 +446,7 @@ class Known(Value):
   def stringify(self) -> str:
     return f'"{self.known}"' if isinstance(self.known, str) else f"{self.getRawVarInit()}"
 
+@dataclass
 class KnownBool(Known, BooleanValue):
   def __init__(self, known: bool):
     self.known = known
@@ -550,6 +575,7 @@ class OnBroadcast(StartBlock):
     return f"when I recieve {self.name}"
 
 # Control
+@dataclass
 class OnStartFlag(StartBlock):
   def getRaw(self, my_id: str, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     return {
@@ -1133,14 +1159,16 @@ def makeEmptyCostume(name: str) -> dict:
     "rotationCenterY": 0
   }
 
-def exportSpriteData(ctx: ScratchContext) -> str:
-  res = {
-    "isStage": False,
-    "name": "Sprite",
+def exportEmptySprite(name: str="", is_stage: bool=False) -> dict:
+  assert len(name) > 0 or is_stage
+  res: dict = {
+    "isStage": is_stage,
+    "name": "Stage" if is_stage else name,
     "variables": {},
     "lists": {},
     "broadcasts": {},
     "blocks": {},
+    "comments": {},
     "currentCostume": 0,
     "costumes":[
       # A costume must be defined for the sprite to load
@@ -1148,22 +1176,74 @@ def exportSpriteData(ctx: ScratchContext) -> str:
     ],
     "sounds": [],
     "volume": 100,
+    "layerOrder": 0 if is_stage else 1,
     "visible": True,
-    "x": 0,
-    "y": 0,
-    "size": 100,
-    "direction": 90,
-    "draggable": False,
-    "rotationStyle": "all around"
   }
 
-  res.update(ctx.getRaw())
+  if not is_stage:
+    res.update({
+      "x": 0,
+      "y": 0,
+      "size": 100,
+      "direction": 90,
+      "draggable": False,
+      "rotationStyle": "all around",
+    })
+  else:
+    res.update({
+      "tempo": 60,
+      "videoTransparency": 50,
+      "videoState": "on",
+      "textToSpeechLanguage": None,
+    })
+
+  return res
+
+def exportData(ctx: ScratchContext, format: Format) -> str:
+  sprite = exportEmptySprite(MAIN_SPRITE_NAME)
+  sprite.update(ctx.getRaw())
+
+  match format:
+    case Format.Sprite3:
+      res = sprite
+    case Format.Project3:
+      buffer_sprite = exportEmptySprite(EMPTY_SPRITE_NAME)
+      buffer_sprite["comments"] = {
+        "coolcommentid": {
+          "blockId": None,
+          "x": 50,
+          "y": 50,
+          "width": 500,
+          "height": 300,
+          "minimized": False,
+          "text": MESSAGE
+        }
+      }
+
+      stage = exportEmptySprite(is_stage=True)
+
+      res = {
+        "targets": [
+          stage, buffer_sprite, sprite
+        ],
+        "monitors": [],
+        "extensions": [],
+        "meta": {
+          "semver": "3.0.0",
+          "vm": "13.6.10",
+          "agent": "Project compiled with llvm2scratch!"
+        }
+      }
 
   # Use minified json
   return json.dumps(res, separators=(",", ":"))
 
-def exportScratchFile(ctx: ScratchContext, path: str) -> None:
-  """Exports scratch code to a .sprite3 file"""
+def exportScratchFile(ctx: ScratchContext, path: str, format: Format) -> None:
+  """Exports scratch code to a .sb3/.sprite3 file"""
+  match format:
+    case Format.Project3: folder, file = "Project", "project.json"
+    case Format.Sprite3:  folder, file = "Sprite", "sprite.json"
+
   with zipfile.ZipFile(path, "w") as zipf:
-    zipf.writestr("Sprite/sprite.json", exportSpriteData(ctx))
-    zipf.writestr(f"Sprite/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)
+    zipf.writestr(f"{folder}/{file}", exportData(ctx, format))
+    zipf.writestr(f"{folder}/{EMPTY_SVG_HASH}.svg", EMPTY_SVG)

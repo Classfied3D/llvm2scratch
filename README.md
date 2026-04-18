@@ -13,7 +13,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 - 🔡 Static Variables
 - 📚 [Partial cstdlib support](https://github.com/Classfied3D/newlib-scratch)
 - ⚡ Optimizations (Known Value Propagation, Assignment Elision)
-- 📝 Sprite3 file output
+- 📝 .sb3/.sprite3 file output
 
 ## Project Showcase
 
@@ -39,9 +39,11 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Usage
 
 ```
-usage: llvm2scratch [-h] [-o OUTPUT] [-O {all,none,compiler,assignment-elision,known-value-prop}] [-M {all,none,general,break-glow}] [--hide-blocks]
-                    [--memory-size MEMORY_SIZE] [--local-stack-size LOCAL_STACK_SIZE] [--max-branch-recursion MAX_BRANCH_RECURSION]
-                    [--debug-scratch-code DEBUG_SCRATCH_CODE]
+usage: llvm2scratch [-h] [-o OUTPUT] [--format {infer,project3,sprite3}]
+                    [-O {all,none,compiler,assignment-elision,known-value-prop}]
+                    [-M {all,none,general,break-glow}] [--memory-size MEMORY_SIZE]
+                    [--local-stack-size LOCAL_STACK_SIZE] [--max-branch-recursion MAX_BRANCH_RECURSION]
+                    [--debug-scratch-code DEBUG_SCRATCH_CODE] [--hide-blocks]
                     input
 
 Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)
@@ -52,32 +54,40 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -o OUTPUT, --output OUTPUT
-                        Path to the output sprite3 file
+                        Path to the output file (.sb3 or .sprite3)
+  --format {infer,project3,sprite3}
+                        File format of output file. By default this infered by the output file's
+                        extension.
   -O {all,none,compiler,assignment-elision,known-value-prop}
                         Optimizations to apply; defaults to all; see below
   -M {all,none,general,break-glow}
                         Minify settings to apply; defaults to general; see below
-  --hide-blocks         Prevent blocks from rendering in the editor by setting shadow: true on top level blocks; stops editor lag
   --memory-size MEMORY_SIZE
                         Number of 'bytes' on 'memory' list; max value is 200,000; default is 1024
   --local-stack-size LOCAL_STACK_SIZE
-                        Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is 512
+                        Number of 'bytes' on local stack list for storing registers when recursing; max
+                        value is 200,000; default is 512
   --max-branch-recursion MAX_BRANCH_RECURSION
                         Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000
   --debug-scratch-code DEBUG_SCRATCH_CODE
                         Output scratch code to a text file so it can be viewed
+  --hide-blocks         Prevent blocks from rendering in the editor by setting shadow: true on top level
+                        blocks; stops editor lag. Not recommended due to increased project size and this
+                        seems to stop someprojects from running. Instead export to a project instead of a
+                        sprite and don't click on thesprite.
 
 optimization options:
   all, none             Self-explanatory
-  compiler              Enable compiler-level optimizations (e.g. addressing globals with address instead of by variable)
+  compiler              Enable compiler-level optimizations (e.g. addressing globals with address instead
+                        of by variable)
   assignment-elision    Reduce expensive 'Set Variable' usage by inlining variable assignments
   known-value-prop      Various transformations on values and blocks under certain values
 
 minify options:
   all, none             Self-explanatory
   general               Optimize project.json's size by simplifing uids, removing falsy fields, etc
-  break-glow            Removing the parent key when minifing prevents blocks in the same sprite from glowing correctly due to a js error - minify futher and
-                        allow this error to occur
+  break-glow            Removing the parent key when minifing prevents blocks in the same sprite from
+                        glowing correctly due to a js error - minify futher and allow this error to occur
 ```
 
 ## Info
