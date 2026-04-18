@@ -75,7 +75,7 @@ class BlockListInfo:
 def getInputs(block: sb3.Block) -> list[sb3.Value]:
   """Gets all inputs a block takes. Does not check contents of if blocks etc, this must be done manually"""
   match block:
-    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast():
+    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast() | sb3.SwitchCostume():
       return [block.value]
     case sb3.EditList():
       inputs = []
@@ -90,7 +90,7 @@ def getInputs(block: sb3.Block) -> list[sb3.Value]:
 def setInputs(block: sb3.Block, inputs: list[sb3.Value]) -> sb3.Block:
   """Sets the inputs a block takes. Uses the same order as getInputs"""
   match block:
-    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast():
+    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast() | sb3.SwitchCostume():
       assert len(inputs) == 1
       block.value = inputs[0]
     case sb3.EditList():

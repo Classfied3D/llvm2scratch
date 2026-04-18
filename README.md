@@ -110,7 +110,6 @@ minify options:
 - Opti: unused param elision
 - Opti: known list (lookup table) progagation
 - Opti: remove Repeat(Known(1))
-- Opti: Group allocations at start of branch, if fixed allocation then dellocate by fixed amount
 - Opti: `set a (a + n)` -> `change a by n`
 - Opti: `set a (a * 2)` -> `change a by a`
 

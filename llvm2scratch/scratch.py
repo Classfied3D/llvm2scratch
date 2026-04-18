@@ -460,11 +460,12 @@ class Say(Block):
 
 @dataclass
 class SwitchCostume(Block):
-  name: Value
+  # Name of costume to switch to
+  value: Value
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    if isinstance(self.name, Known):
-      name_str = scratchCastToStr(self.name)
+    if isinstance(self.value, Known):
+      name_str = scratchCastToStr(self.value)
 
       proto_id = ctx.genId()
       # Add prototype costume
@@ -476,7 +477,7 @@ class SwitchCostume(Block):
       raw_name = [1, proto_id]
 
     else:
-      raw_name, ctx = self.name.getRawValue(my_id, ctx, ScratchCast.TO_STR)
+      raw_name, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
 
     return {
       "opcode": "looks_switchcostumeto",
@@ -484,7 +485,7 @@ class SwitchCostume(Block):
     }, ctx
 
   def stringify(self) -> str:
-    return f"switch costume to {self.name.stringify()}"
+    return f"switch costume to {self.value.stringify()}"
 
 @dataclass
 class CostumeInfo(Value):

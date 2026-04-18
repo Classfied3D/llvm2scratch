@@ -2928,6 +2928,8 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Subtract one here so that i can be one indexed (which letter_n_of is)
     sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParameter(localizeParameter("str")), sb3.Known(1))),
     sb3.EditVar("set", "i", sb3.Known(1)),
+    # TODO should use cost variable no idea why not setting
+    sb3.EditVar("set", "cost", sb3.CostumeInfo("number")),
 
     # Default: full string.
 
@@ -2974,6 +2976,8 @@ def addForeignFunctions(ctx: Context) -> Context:
     ])),
     # End of string
     sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.Known(0)),
+
+    sb3.SwitchCostume(sb3.GetVar("cost")),
 
     # Return value is set above.
   ]), ctx)
