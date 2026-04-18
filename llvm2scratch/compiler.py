@@ -3042,6 +3042,10 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
   ]), ctx)
 
+  # Returns the days since 2000 in UTC time
+  ctx = addFunc("SB3_days_since_2000", [], sb3.BlockList([
+     sb3.EditVar("set", ctx.cfg.return_var, sb3.DaysSince2000()),
+  ]), ctx)
 
   #ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)
   #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)

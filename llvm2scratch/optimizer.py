@@ -405,7 +405,7 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
     return _value_varuse_cache[key]
 
   match value:
-    case sb3.Known() | sb3.GetParameter():
+    case sb3.Known() | sb3.GetParameter() | sb3.DaysSince2000():
       result = set(), Counter()
     case sb3.GetVar():
       name = "var:" + value.var_name
@@ -545,7 +545,6 @@ def getValueCost(value: sb3.Value) -> float:
       if value.op == "number":         cost = COSTUME_NUMBER_COST
       elif value.op == "name":         cost = COSTUME_NAME_COST
     case sb3.GetCounter():             cost = GET_COUNTER_COST
-    case sb3.GetAnswer():              cost = ANSWER_COST
     case sb3.Op():
       if value.op in ["add", "sub", "mul", "div"]: cost = MATHOP_COST
       elif value.op == "mod":          cost = MOD_COST
@@ -563,6 +562,9 @@ def getValueCost(value: sb3.Value) -> float:
       elif value.op == "contains":     cost = CONTAINS_STR_COST
       else:
         raise OptimizerException(f"Unknown BoolOp opcode, {value.op}")
+    case sb3.GetAnswer():              cost = ANSWER_COST
+    # Temporary solution to prevent it from being elided across another var
+    case sb3.DaysSince2000():          cost = float("inf")
     case sb3.GetVar():                 cost = GET_VAR_COST
     case sb3.GetList():                cost = GET_LIST_COST
     case sb3.GetOfList():
@@ -590,7 +592,7 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
     case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | \
-         sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList():
+         sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList() | sb3.DaysSince2000():
       result = value
       did_opti = False
     case sb3.GetVar():

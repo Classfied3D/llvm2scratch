@@ -730,32 +730,18 @@ class GetAnswer(Value):
     return "(answer)"
 
 @dataclass
-class GetOfList(Value):
-  op: Literal["atindex", "indexof"]
-  list_name: str
-  value: Value
-
+class DaysSince2000(Value):
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.genId()
-    list_id = ctx.addOrGetList(self.list_name)
-
-    raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_INT if self.op == "atindex" else ScratchCast.TO_STR))
-
-    input_name = "INDEX" if self.op == "atindex" else "ITEM"
 
     ctx.addBlock(id, RawBlock({
-      "opcode": SHORT_OP_TO_OPCODE[self.op],
-      "inputs": {input_name: raw_value},
-      "fields": {"LIST": [self.list_name, list_id]},
+      "opcode": "sensing_dayssince2000"
     }), BlockMeta(parent))
 
     return [3, id], ctx
 
   def stringify(self) -> str:
-    if self.op == "atindex":
-      return f"item {self.value.stringify()} of {self.list_name}"
-    else:
-      return f"item # of {self.value.stringify()} in {self.list_name}"
+    return "(days since 2000)"
 
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_to_float",
@@ -939,6 +925,34 @@ class GetList(Value):
 
   def stringify(self) -> str:
     return f"(list {self.list_name})"
+
+@dataclass
+class GetOfList(Value):
+  op: Literal["atindex", "indexof"]
+  list_name: str
+  value: Value
+
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    id = ctx.genId()
+    list_id = ctx.addOrGetList(self.list_name)
+
+    raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_INT if self.op == "atindex" else ScratchCast.TO_STR))
+
+    input_name = "INDEX" if self.op == "atindex" else "ITEM"
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": SHORT_OP_TO_OPCODE[self.op],
+      "inputs": {input_name: raw_value},
+      "fields": {"LIST": [self.list_name, list_id]},
+    }), BlockMeta(parent))
+
+    return [3, id], ctx
+
+  def stringify(self) -> str:
+    if self.op == "atindex":
+      return f"item {self.value.stringify()} of {self.list_name}"
+    else:
+      return f"item # of {self.value.stringify()} in {self.list_name}"
 
 @dataclass
 class EditList(Block):
