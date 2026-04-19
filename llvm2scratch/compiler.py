@@ -2192,8 +2192,8 @@ def transTerminatorInstr(instr: ir.Instr,
         label_proc_name = localizeLabel(label_name, bctx.fn)
 
         branch_blocks = sb3.BlockList()
-        branch_blocks.add(sb3.ProcedureCall(label_proc_name, []))
         branch_blocks.add(assignPhiNodes(phi_info[label_name], ctx, bctx))
+        branch_blocks.add(sb3.ProcedureCall(label_proc_name, []))
 
         case_vs_label[case_val] = branch_blocks
 
