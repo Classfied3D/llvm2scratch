@@ -1743,20 +1743,31 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
-      true_blocks = true_val.blocks
-      false_blocks = false_val.blocks
-      if isinstance(true_val, ValueAndBlocks):
-        assert isinstance(false_val, ValueAndBlocks)
-        true_blocks.add(res_var.setValue(true_val.value))
-        false_blocks.add(res_var.setValue(false_val.value))
-      else:
-        assert isinstance(true_val, IdxbleValueAndBlocks)
-        assert isinstance(false_val, IdxbleValueAndBlocks)
-        true_blocks.add(res_var.setAllValues(true_val.value))
-        false_blocks.add(res_var.setAllValues(false_val.value))
-
       blocks.add(cond.blocks)
-      blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), true_blocks, false_blocks))
+
+      if isinstance(true_val, ValueAndBlocks) and isinstance(true_val.value, sb3.Known) and \
+         isinstance(false_val.value, sb3.Known) and isinstance(true_val.value.known, float) and \
+         isinstance(false_val.value.known, float):
+        # TODO: Support multi-width vars for this, if it is faster than the if method
+        assert len(true_val.blocks) == 0 and len(false_val.blocks) == 0
+
+        # Result = false_value + (true_value - false_value) * cond
+        diff = sb3.Known(true_val.value.known - false_val.value.known)
+        blocks.add(res_var.setValue(sb3.Op("add", false_val.value, sb3.Op("mul", cond.value, diff))))
+      else:
+        true_blocks = true_val.blocks
+        false_blocks = false_val.blocks
+        if isinstance(true_val, ValueAndBlocks):
+          assert isinstance(false_val, ValueAndBlocks)
+          true_blocks.add(res_var.setValue(true_val.value))
+          false_blocks.add(res_var.setValue(false_val.value))
+        else:
+          assert isinstance(true_val, IdxbleValueAndBlocks)
+          assert isinstance(false_val, IdxbleValueAndBlocks)
+          true_blocks.add(res_var.setAllValues(true_val.value))
+          false_blocks.add(res_var.setAllValues(false_val.value))
+
+        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), true_blocks, false_blocks))
 
     case ir.Phi(): # Choose a value based on which block control came from
       pass # Phi assignments are dealt with in the brancher function
