@@ -856,9 +856,11 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
   on_reset = sb3.BlockList()
 
   on_reset = assignParameters(params, param_sizes, next_var_use_depends)
+  # NB for future modifications, the call/broadcast should be next to the stop script so it is treated by the optimizer as an
+  # "ending call"
   on_reset.add(sb3.BlockList([
-    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
     sb3.EditCounter("clear"),
+    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
     sb3.StopScript("stopthis")]))
 
   blocks.add(sb3.ControlFlow("if",

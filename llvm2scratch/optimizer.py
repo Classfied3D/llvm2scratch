@@ -68,8 +68,8 @@ class BlockListInfo:
   might_modify: set[str] # What the blocklist might modify
   always_modify: set[str] # What the blocklist definitely modifies
   dependent: set[str] # What variables the blocklist might depend on
-  might_call: set[str] # What the function might call
-  always_call: set[str] # What the function always calls
+  might_call: set[tuple[str, bool]] # What the function might call and if it is an ending call
+  always_call: set[tuple[str, bool]] # What the function always calls and if it is an ending call
   use_counts: Counter[str] = field(default_factory=Counter)
 
 def getInputs(block: sb3.Block) -> list[sb3.Value]:
@@ -435,16 +435,21 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
   return result
 
 def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListInfo] | None=None,
-  ignore_external_change: set[str] | None=None) -> BlockListInfo:
-  """Returns what a block list sometimes modifies, always modifies and depends on.
+  ignore_external_change: set[str] | None=None, is_ending_blocklist=True) -> BlockListInfo:
+  """
+  Returns what a block list sometimes modifies, always modifies and depends on.
   Ignore external change: a set of variables in which even though might be modified outside
-  the function lead to no overall change (e.g. current stack size)."""
+  the function lead to no overall change (e.g. current stack size).
+
+  If this blocklist is a repeating substack or a substack not at the end on a toplevel blocklist,
+  set is_ending_blocklist to False
+  """
   info = BlockListInfo(set(), set(), set(), set(), set())
 
   if ignore_external_change is None:
     ignore_external_change = set()
 
-  for block in blocklist.blocks:
+  for i, block in enumerate(blocklist.blocks):
     # Work out what any values used depend on
     all_value_dependent: set[str] = set()
     for value in getInputs(block):
@@ -456,6 +461,12 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
       else:
         info.use_counts += counts
     info.dependent |= all_value_dependent - info.always_modify
+
+    is_end_of_blocklist = i == len(blocklist.blocks) - 1
+    # If the next block is a stop this script block, then this block is an ending block, regardless
+    # of if in a non-ending substack
+    is_ending: bool = (is_end_of_blocklist and is_ending_blocklist) or \
+                      (not is_end_of_blocklist and blocklist.blocks[i + 1] == sb3.StopScript("stopthis"))
 
     match block:
       case sb3.EditVar():
@@ -486,16 +497,19 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
         info.might_modify.add(name)
         info.always_modify.add(name)
       case sb3.ProcedureCall() | sb3.Broadcast():
-        if isinstance(block , sb3.ProcedureCall):
+        if isinstance(block, sb3.ProcedureCall):
           name = "func:" + block.proc_name
         else:
           if not isinstance(block.value, sb3.Known):
             raise OptimizerException("Broadcasted address expected to be constant/known")
           name = "broadcast:" + sb3.scratchCastToStr(block.value)
-        info.might_call.add(name)
-        info.always_call.add(name)
+        info.might_call.add((name, is_ending))
+        info.always_call.add((name, is_ending))
 
-        if func_info is not None:
+        # Ending calls should not affect elisions, as elisions cannot happen across them,
+        # so we can just ignore anything they might do once the recursive function info is
+        # calculated
+        if func_info is not None and not is_ending:
           callee_info = func_info[name]
           info.dependent |= callee_info.dependent - info.always_modify
           info.might_modify |= callee_info.might_modify - ignore_external_change
@@ -504,12 +518,12 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
       case sb3.ControlFlow():
         match block.op:
           case "if" | "reptimes" | "until" | "while":
-            b_info = getBlockListVarUse(block.blocks, func_info)
+            b_info = getBlockListVarUse(
+              block.blocks, func_info, ignore_external_change, is_ending and block.op == "if")
 
             info.dependent    |= b_info.dependent - info.always_modify
             info.might_modify |= b_info.might_modify
-            info.might_call   |= b_info.might_call
-            info.always_call  |= b_info.always_call
+            info.might_call   |= b_info.might_call | b_info.always_call
 
             if block.op == "if":
               # Assume called half the times
@@ -519,8 +533,8 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
               info.use_counts += Counter({key: float("inf") for key in b_info.use_counts})
           case "if_else":
             assert block.else_blocks is not None
-            b1_info = getBlockListVarUse(block.blocks, func_info)
-            b2_info = getBlockListVarUse(block.else_blocks, func_info)
+            b1_info = getBlockListVarUse(block.blocks, func_info, ignore_external_change, is_ending)
+            b2_info = getBlockListVarUse(block.else_blocks, func_info, ignore_external_change, is_ending)
 
             info.dependent     |= (b1_info.dependent | b2_info.dependent) - info.always_modify
             info.might_modify  |= b1_info.might_modify | b2_info.might_modify
@@ -701,14 +715,16 @@ def assignmentElision(proj: sb3.Project,
     name = worklist.popleft()
     info = recu_fn_info[name]
 
-    for callee in info.always_call:
-      info.always_modify |= recu_fn_info[callee].always_modify
-
-    for callee in info.might_call:
+    for callee, is_ending_call in info.might_call:
       callee_info = recu_fn_info[callee]
       info.might_modify |= callee_info.might_modify | callee_info.always_modify
-      info.dependent |= callee_info.dependent
+      info.dependent |= callee_info.dependent - (info.always_modify if is_ending_call else set())
       info.use_counts += callee_info.use_counts
+
+    for callee, _ in info.always_call:
+      # Make sure to do this after the first loop as we don't want to consider this ending
+      # call's always modify when deciding what we depend on
+      info.always_modify |= recu_fn_info[callee].always_modify
 
     if info != recu_fn_info[name]:
       recu_fn_info[name] = info
@@ -728,7 +744,7 @@ def assignmentElision(proj: sb3.Project,
       for other_name, other_info in fn_info.items():
         # FUTURE OPTI: across function value elison - would require working out where each function returns
         if other_name != name:
-          cannot_elide |= other_info.might_modify | other_info.always_call | other_info.dependent
+          cannot_elide |= other_info.dependent | other_info.might_modify | other_info.always_modify
 
       # Each variable that could be elided and its dependents
       to_elide: dict[str, tuple[set[str], sb3.Value]] = {}
@@ -737,8 +753,9 @@ def assignmentElision(proj: sb3.Project,
 
       var_use_counts: Counter[str] = Counter()
 
-      for block in blocklist.blocks:
-        use = getBlockListVarUse(sb3.BlockList([block]), recu_fn_info, ignore_external_change)
+      for i, block in enumerate(blocklist.blocks):
+        is_ending = i == len(blocklist.blocks) - 1
+        use = getBlockListVarUse(sb3.BlockList([block]), recu_fn_info, ignore_external_change, is_ending)
         var_use_counts += use.use_counts
 
         to_remove = []
