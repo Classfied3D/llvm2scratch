@@ -146,6 +146,8 @@ class ScratchContext:
 
   def addBlockList(self, blocks: BlockList, parent: Id | None=None) -> Id | None:
     """Returns the id of the first block in the list"""
+    if len(blocks.blocks) == 0: return None
+
     last_id = parent
     first_id = curr_id = self.genId()
     next_id = self.genId()
@@ -169,8 +171,6 @@ class ScratchContext:
       last_id = curr_id
       curr_id = next_id
       next_id = self.genId()
-
-    if len(blocks.blocks) == 0: first_id = None
 
     return first_id
 
@@ -317,7 +317,9 @@ class BlockMeta:
   y: int = 0
 
   def addRawMeta(self, metaless: dict, ctx: ScratchContext) -> dict:
-    if self.parent is not None or not ctx.cfg.minify_break_glow:
+    # It seems like the parent property is only used from glowing
+    # removing it seems to only break the glowing of scripts in the editor
+    if not ctx.cfg.minify_break_glow:
       metaless["parent"] = self.parent
 
     if self.parent is None or not ctx.cfg.minify:

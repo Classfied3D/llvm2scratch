@@ -18,6 +18,7 @@ def main():
     EditCounter("incr"),
     Say(GetCounter()),
     Broadcast(Op("length_of", GetVar("hello2")), True),
+    ControlFlow("if", KnownBool(False), BlockList()),
     StopScript("stopall"),
   ]))
 
