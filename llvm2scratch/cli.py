@@ -82,12 +82,20 @@ def main():
     help="Output scratch code to a text file so it can be viewed"
   )
   parser.add_argument(
+    "--replace-hacked-blocks",
+    action="store_true",
+    default=False,
+    help="Remove 'hacked' blocks not normally accessible from the editor such as 'counter' and 'while' "
+         "by replacing them with workarounds. See https://en.scratch-wiki.info/wiki/Hidden_Blocks. This "
+         "may lead to a reduction in performance"
+  )
+  parser.add_argument(
     "--hide-blocks",
     action="store_true",
     default=False,
     help="Prevent blocks from rendering in the editor by setting shadow: true on top level blocks; "
-         "stops editor lag. Not recommended due to increased project size and this seems to stop some"
-         "projects from running. Instead export to a project instead of a sprite and don't click on the"
+         "stops editor lag. Not recommended due to increased project size and this seems to stop some "
+         "projects from running. Instead export to a project instead of a sprite and don't click on the "
          "sprite."
   )
 

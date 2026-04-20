@@ -43,7 +43,7 @@ usage: llvm2scratch [-h] [-o OUTPUT] [--format {infer,project3,sprite3}]
                     [-O {all,none,compiler,assignment-elision,known-value-prop}]
                     [-M {all,none,general,break-glow}] [--memory-size MEMORY_SIZE]
                     [--local-stack-size LOCAL_STACK_SIZE] [--max-branch-recursion MAX_BRANCH_RECURSION]
-                    [--debug-scratch-code DEBUG_SCRATCH_CODE] [--hide-blocks]
+                    [--debug-scratch-code DEBUG_SCRATCH_CODE] [--replace-hacked-blocks] [--hide-blocks]
                     input
 
 Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)
@@ -71,10 +71,14 @@ options:
                         Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000
   --debug-scratch-code DEBUG_SCRATCH_CODE
                         Output scratch code to a text file so it can be viewed
+  --replace-hacked-blocks
+                        Remove 'hacked' blocks not normally accessible from the editor such as 'counter'
+                        and 'while' by replacing them with workarounds. See https://en.scratch-
+                        wiki.info/wiki/Hidden_Blocks. This may lead to a reduction in performance
   --hide-blocks         Prevent blocks from rendering in the editor by setting shadow: true on top level
                         blocks; stops editor lag. Not recommended due to increased project size and this
-                        seems to stop someprojects from running. Instead export to a project instead of a
-                        sprite and don't click on thesprite.
+                        seems to stop some projects from running. Instead export to a project instead of
+                        a sprite and don't click on the sprite.
 
 optimization options:
   all, none             Self-explanatory

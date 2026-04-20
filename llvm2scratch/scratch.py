@@ -24,6 +24,7 @@ If you really want to read the generated scratch code (which is quite difficult 
 author may have also provided a text version.\
 """
 DEFAULT_BROADCAST_MESSAGE = "message1"
+COUNTER_REPLACEMENT_NAME = "!control:counter"
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
 EMPTY_SVG_HASH = hashlib.md5(EMPTY_SVG.encode("utf-8")).hexdigest()
 # https://github.com/scratchfoundation/scratch-editor/blob/develop/packages/scratch-vm/src/util/uid.js#L11
@@ -80,17 +81,18 @@ class Format(Enum):
 
 @dataclass
 class ScratchConfig():
-  # TODO add an option to replace hacked blocks with a working version that isn't hacked
-  # (since they're used for better performance anyway)
+  minify: bool = True              # Optimize project.json's size by simplifing uids, removing falsy fields, etc
 
-  minify: bool = True             # Optimize project.json's size by simplifing uids, removing falsy fields, etc
+  minify_break_glow: bool = False  # Removing the parent key when minifing prevents blocks in the same
+                                   # sprite from glowing correctly due to a js error - minify futher and
+                                   # allow this error to occur
 
-  minify_break_glow: bool = False # Removing the parent key when minifing prevents blocks in the same
-                                  # sprite from glowing correctly due to a js error - minify futher and
-                                  # allow this error to occur
+  hide_blocks: bool = False        # Prevent blocks from rendering in the editor by setting shadow: true on top
+                                   # level blocks: stops editor lag
 
-  hide_blocks: bool = False       # Prevent blocks from rendering in the editor by setting shadow: true on top
-                                  # level blocks: stops editor lag
+  allow_hacked_blocks: bool = True # Allow 'hacked' blocks not normally accessible from the editor such as 'counter'
+                                   # and 'while'. See https://en.scratch-wiki.info/wiki/Hidden_Blocks. This may lead
+                                   # to a performance reduction
 
 @dataclass
 class Project:
@@ -603,26 +605,31 @@ class ControlFlow(Block):
       raise ScratchCompException("An if-else statement must contain blocks in the else case")
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    if self.op in ["if", "if_else", "until", "while"]:
-      assert isinstance(self.value, BooleanValue)
-      raw_val, ctx = self.value.getRawBoolValue(my_id, ctx)
+    op, val = self.op, self.value
+    if self.op == "while" and not ctx.cfg.allow_hacked_blocks:
+      op = "until"
+      val = BoolOp("not", val)
+
+    if op in ["if", "if_else", "until", "while"]:
+      assert isinstance(val, BooleanValue)
+      raw_val, ctx = val.getRawBoolValue(my_id, ctx)
     else:
-      raw_val, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_INT)
+      raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_INT)
 
     blocks_id = ctx.addBlockList(self.blocks, my_id)
 
-    input_name = "TIMES" if self.op == "reptimes" else "CONDITION"
+    input_name = "TIMES" if op == "reptimes" else "CONDITION"
 
     inputs = {"SUBSTACK": [2, blocks_id]}
     if raw_val is not None: inputs.update({input_name: raw_val})
 
-    if self.op == "if_else":
+    if op == "if_else":
       assert self.else_blocks is not None
       else_blocks_id = ctx.addBlockList(self.else_blocks, my_id)
       inputs.update({"SUBSTACK2": [2, else_blocks_id]})
 
     return {
-      "opcode": SHORT_OP_TO_OPCODE[self.op],
+      "opcode": SHORT_OP_TO_OPCODE[op],
       "inputs": inputs
     }, ctx
 
@@ -659,6 +666,9 @@ class GetCounter(Value):
   """Get the value of the special 'hacked' counter block"""
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    if not ctx.cfg.allow_hacked_blocks:
+      return GetVar(COUNTER_REPLACEMENT_NAME).getRawValue(parent, ctx, cast)
+
     id = ctx.genId()
 
     ctx.addBlock(id, RawBlock({
@@ -677,6 +687,11 @@ class EditCounter(Block):
   op: Literal["incr", "clear"]
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    if not ctx.cfg.allow_hacked_blocks:
+      op = "change" if self.op == "incr" else "set"
+      val = Known(1 if self.op == "incr" else 0)
+      return EditVar(op, COUNTER_REPLACEMENT_NAME, val).getRaw(my_id, ctx)
+
     return {
       "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
