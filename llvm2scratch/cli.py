@@ -125,6 +125,7 @@ def main():
     minify=minify,
     minify_break_glow=minify_break_glow,
     hide_blocks=args.hide_blocks,
+    allow_hacked_blocks=not args.replace_hacked_blocks,
   )
 
   cfg = compiler.Config(
