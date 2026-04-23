@@ -98,7 +98,7 @@ class ScratchConfig():
 class Project:
   cfg: ScratchConfig
   code: list[BlockList] = field(default_factory=list)
-  lists: dict[str, list[int | float | str | bool]] = field(default_factory=dict)
+  lists: dict[str, list[Known]] = field(default_factory=dict)
   costumes: list[str] = field(default_factory=list)
 
   def export(self, filename: str, format: Format) -> None:
@@ -127,7 +127,7 @@ class Project:
 class ScratchContext:
   cfg: ScratchConfig = field(default_factory=ScratchConfig)
   vars: dict[str, tuple[Id, Known]] = field(default_factory=dict)
-  lists: dict[str, tuple[Id, list[int | float | str | bool]]] = field(default_factory=dict)
+  lists: dict[str, tuple[Id, list[Known]]] = field(default_factory=dict)
   broadcasts: dict[str, Id] = field(default_factory=dict)
   funcs: dict[str, tuple[list[Id], bool]] = field(default_factory=dict)
   blocks: dict[Id, dict] = field(default_factory=dict)
@@ -185,7 +185,7 @@ class ScratchContext:
       id = self.vars[var_name][0]
     return id
 
-  def addOrGetList(self, list_name: str, default_val: list[int | float | str | bool] | None = None) -> Id:
+  def addOrGetList(self, list_name: str, default_val: list[Known] | None = None) -> Id:
     if default_val is None: default_val = []
     if not list_name in self.lists:
       id = self.genId()
@@ -226,7 +226,7 @@ class ScratchContext:
     for name, (id, values) in self.lists.items():
       raw_lists[id] = [
         name,
-        ["true" if v is True else "false" if v is False else v for v in values]]
+        ["true" if v is True else "false" if v is False else v.getRawVarInit() for v in values]]
 
     raw_broadcasts = {}
     for name, id in self.broadcasts.items():
@@ -967,9 +967,27 @@ class GetOfList(Value):
 
   def stringify(self) -> str:
     if self.op == "atindex":
-      return f"item {self.value.stringify()} of {self.list_name}"
+      return f"(item {self.value.stringify()} of {self.list_name})"
     else:
-      return f"item # of {self.value.stringify()} in {self.list_name}"
+      return f"(item # of {self.value.stringify()} in {self.list_name})"
+
+@dataclass
+class GetListLength(Value):
+  list_name: str
+
+  def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
+    id = ctx.genId()
+    list_id = ctx.addOrGetList(self.list_name)
+
+    ctx.addBlock(id, RawBlock({
+      "opcode": "data_lengthoflist",
+      "fields": {"LIST": [self.list_name, list_id]},
+    }), BlockMeta(parent))
+
+    return [3, id], ctx
+
+  def stringify(self) -> str:
+    return f"(length of list {self.list_name})"
 
 @dataclass
 class EditList(Block):

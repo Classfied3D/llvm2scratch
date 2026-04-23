@@ -25,13 +25,14 @@ COMPARISON_COST = 0.929
 MATH_FUNC_COST = 1.607
 JOIN_COST = 1.091
 LETTER_OF_COST = 0.737
-LENGTH_OF_COST = 0.483
+LENGTH_OF_STR_COST = 0.483
 CONTAINS_STR_COST = 1.272
 BOOL_AS_INT_COST = 0.304 # Bool to int use round on a boolean value, which is cheaper than a round on a fp value
 ROUND_COST = 1.250
 GET_LIST_COST = 5.814 # Unreliable benchmark
 GET_ITEM_COST = 1.679
 ITEM_NUM_COST = 4.920 # Unreliable benchmark
+LIST_LEN_COST = 0.713
 GET_COUNTER_COST = 0.190
 ANSWER_COST = 0.331
 COSTUME_NUMBER_COST = 0.241
@@ -423,7 +424,9 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
         depends.update(new_depends)
         counts += new_counts
       result = depends, counts
-    case sb3.GetList():
+    case sb3.GetList() | sb3.GetListLength():
+      # TODO OPTI: not all list modifing operations modify length, this doesn't really
+      # matter for us though
       result = {"list:" + value.list_name}, Counter()
     case sb3.GetOfList():
       use, counts = getValueVarUse(value.value)
@@ -562,7 +565,7 @@ def getValueCost(value: sb3.Value) -> float:
     case sb3.Op():
       if value.op in ["add", "sub", "mul", "div"]: cost = MATHOP_COST
       elif value.op == "mod":          cost = MOD_COST
-      elif value.op == "length_of":    cost = LENGTH_OF_COST
+      elif value.op == "length_of":    cost = LENGTH_OF_STR_COST
       elif value.op == "letter_n_of":  cost = LETTER_OF_COST
       elif value.op == "join":         cost = JOIN_COST
       elif value.op == "rand_between": cost = RAND_COST
@@ -583,6 +586,7 @@ def getValueCost(value: sb3.Value) -> float:
     case sb3.GetList():                cost = GET_LIST_COST
     case sb3.GetOfList():
       cost = GET_ITEM_COST if value.op == "atindex" else ITEM_NUM_COST
+    case sb3.GetListLength():          cost = LIST_LEN_COST
     case sb3.GetParameter():           cost = GET_PARAM_COST
     case _:
       raise OptimizerException(f"Unknown value, {type(value)}")
@@ -606,7 +610,8 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
     case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | \
-         sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList() | sb3.DaysSince2000():
+         sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList() | \
+         sb3.DaysSince2000() | sb3.GetListLength():
       result = value
       did_opti = False
     case sb3.GetVar():

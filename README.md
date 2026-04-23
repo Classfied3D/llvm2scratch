@@ -150,9 +150,10 @@ Cntin Str: 1.272
 Round Int: 0.304
 Round Flt: 1.250
 
-Get List:  5.814 (Unreliable)
+Get List:  5.814 (Changes with size)
 Item:      1.679
-Item #:    4.920 (Unreliable)
+Item #:    4.920 (Changes with size)
+List Len:  0.713
 
 Counter:   0.190
 

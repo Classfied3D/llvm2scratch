@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
 from collections import OrderedDict, defaultdict
-from typing import Literal, Callable
+from typing import Literal, Callable, cast
 from copy import deepcopy
 
 import random
@@ -44,7 +44,8 @@ class Config:
   ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
 
   return_var = "!return value" # Name of the scratch variable for returing values
-  stack_var = "!stack" # Name of the scratch list for the stack list
+  mem_var = "!mem" # Name of the scratch list for the memory list
+  init_mem_var = "!mem init" # Name of the scratch list for the initialize memory list
   stack_pointer_var = "!stack pointer" # Name of the scratch variable for the stack pointer
   local_stack_var = "!local stack" # Name of the scratch list to store variables that will be used recursively
   local_stack_size_var = "!local stack size" # Name of the scratch variable to store the label stack's size
@@ -156,6 +157,9 @@ class ValueAndBlocks:
 class IdxbleValue:
   """A collection of values that can be indexed over (e.g. a string)"""
   vals: list[sb3.Value] = field(default_factory=list)
+
+  def stringify(self):
+    return str([v.stringify() for v in self.vals])
 
 @dataclass
 class IdxbleValueAndBlocks:
@@ -453,7 +457,7 @@ def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
   """
   name = ctx.cfg.pow2_lookup_var
   if name not in ctx.proj.lists:
-    ctx.proj.lists[name] = [2 ** x for x in range(-VARIABLE_MAX_BITS, VARIABLE_MAX_BITS + 1)]
+    ctx.proj.lists[name] = [sb3.Known(2 ** x) for x in range(-VARIABLE_MAX_BITS, VARIABLE_MAX_BITS + 1)]
 
   # To calculate 2^x with x = -VARIABLE_MAX_BITS corresponds to the 1st item in the list (index of 1)
   # Then f(x) = 1 => -VARIABLE_MAX_BITS + offset = 1 => offset = VARIABLE_MAX_BITS + 1
@@ -1076,10 +1080,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       var = transVar(instr.result, bctx)
       if byte_size == 1:
-        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.stack_var, address.value)))
+        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.mem_var, address.value)))
       else:
         blocks.add(var.setAllValues(IdxbleValue([
-          sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", address.value, sb3.Known(i))) for i in range(byte_size)
+          sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.Op("add", address.value, sb3.Known(i))) for i in range(byte_size)
         ])))
 
     case ir.Store(): # Copy a value to an address on the stack
@@ -1095,11 +1099,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
       if isinstance(value, sb3.Value):
-        blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.stack_var, address, value)]))
+        blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.mem_var, address, value)]))
       else:
         for offset, val in enumerate(value.vals):
           offset_val = sb3.Known(offset)
-          set_ptr = sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", address, offset_val), val)
+          set_ptr = sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val)
           blocks.add(set_ptr)
 
     case ir.UnaryOp(): # Do a calculation with one value
@@ -1460,7 +1464,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                   lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
                 case ir.BinaryOpcode.Xor:
                   lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
-              ctx.proj.lists[name] = lookup[1:] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
+              ctx.proj.lists[name] = [sb3.Known(v) for v in lookup[1:]] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
 
             results = []
             for offset in range(0, width, ctx.cfg.binop_lookup_bits):
@@ -2266,8 +2270,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
         for offset in range(int(length.known)):
           offset_val = sb3.Known(offset)
 
-          get_ptr = sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", src, offset_val))
-          set_ptr = sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", dest, offset_val), get_ptr)
+          get_ptr = sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.Op("add", src, offset_val))
+          set_ptr = sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", dest, offset_val), get_ptr)
 
           blocks.add(set_ptr)
       else:
@@ -2284,9 +2288,9 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
         blocks.add(sb3.BlockList([
           sb3.EditVar("set", ptr_offset, sb3.Known(0)),
           sb3.ControlFlow("reptimes", length, sb3.BlockList([
-            sb3.EditList("insertat", ctx.cfg.stack_var,
+            sb3.EditList("replaceat", ctx.cfg.mem_var,
               sb3.Op("add", dest, sb3.GetVar(ptr_offset)),
-              sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.Op("add", src, sb3.GetVar(ptr_offset)))),
+              sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.Op("add", src, sb3.GetVar(ptr_offset)))),
             sb3.EditVar("change", ptr_offset, sb3.Known(1))
           ]))
         ]))
@@ -2797,27 +2801,47 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
   return ctx
 
-def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
+def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
+  """
+  Initialize memory and get the addresses of global variables and function pointers
+  """
+
   blocks = sb3.BlockList()
 
-  blocks.add(sb3.EditList("deleteall", ctx.cfg.stack_var, None, None))
+  # Get function pointer info
+  ctx.min_func_ptr_addr = ctx.cfg.memory_size + 1
+  ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
 
+  # Initalize memory
   if ctx.cfg.memory_size > SCRATCH_LIST_LIMIT:
-    raise CompException("Stack is too large to fit in one list, multiple lists not implemented")
+    raise CompException("Stack is too large to fit in one list, multiple lists/hacked length not implemented yet")
 
-  # Set up static values
-  ptr = 1
+  # Get the sizes of global variables
+  total_size = 0
+  sizes: list[int] = []
   for glob in mod.global_vars.values():
+    size = getByteSize(glob.type)
+    sizes.append(size)
+    total_size += size
+
+  # e.g. if memory size is 2000 and size is 2, starting global addr = 2000 - 2 + 1 = 1999
+  # which corresponds to addresses 1999 and 2000 for storing
+  starting_global_addr = ctx.cfg.memory_size - total_size + 1
+  # Stack pointer will first point to the address before the first global addr and grow backward
+  starting_stack_pointer = starting_global_addr - 1
+
+  # Get addresses for each global
+  ptr = starting_global_addr
+  for i, glob in enumerate(mod.global_vars.values()):
     ctx.globvar_to_ptr[glob.name] = ptr
-    ptr += getByteSize(glob.type)
+    ptr += sizes[i]
 
-  ptr = 1
-  for glob in mod.global_vars.values():
+  init_mem: list[sb3.Known] = []
+  ptr = starting_global_addr
+  for i, glob in enumerate(mod.global_vars.values()):
     if not ctx.cfg.opti:
       globvar = localizeVar(glob.name, True, None)
       blocks.add(globvar.setValue(sb3.Known(ptr)))
-
-    total_size = getByteSize(glob.type)
 
     if glob.init is not None:
       blocks_and_value = transValue(glob.init, ctx, None, is_global_init=True)
@@ -2829,28 +2853,49 @@ def transGlobals(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
       else:
         unknown |= not isinstance(value, sb3.Known)
 
-      if unknown: raise CompException(f"Expected static value {glob} to have a compile time known value")
+      if unknown: raise CompException(f"Expected static value {glob} to have a compile time known value, got {value.stringify()}")
 
-      values: list[sb3.Value] = []
+      values: list[sb3.Known] = []
       match value:
         case sb3.Known():
-          size = total_size
           values.append(value)
         case IdxbleValue():
-          size = 1
-          values.extend(value.vals)
+          values.extend(cast(list[sb3.Known], value.vals))
+        case _:
+          raise AssertionError("Did not expect this path")
 
-      if size != 1: raise CompException("Cannot create value or values with a size in bytes > 1")
+      # TODO this will need correct spacing when memory spacing is changed
+      assert len(values) == sizes[i]
+      init_mem.extend(values)
 
-      for value in values:
-        blocks.add(sb3.EditList("addto", ctx.cfg.stack_var, None, value))
+      ptr += sizes[i]
 
-      ptr += total_size
+  ctx.proj.lists[ctx.cfg.init_mem_var] = init_mem
+
+  # If the memory list is saturated (has the correct amount of items) and replace at is valid on it (replace at wouldn't work on an empty list)
+  list_is_saturated = sb3.BoolOp("=", sb3.GetListLength(ctx.cfg.mem_var), sb3.Known(min(ctx.cfg.memory_size, SCRATCH_LIST_LIMIT)))
 
   blocks.add(sb3.BlockList([
-    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(ptr)),
-    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.memory_size - (ptr - 1)), sb3.BlockList([
-      sb3.EditList("addto", ctx.cfg.stack_var, None, sb3.Known(0))
+    # Reset stack pointer
+    # TODO start stack at starting_stack_pointer and grow backward
+    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(1)),
+
+    # Fill list if it is empty
+    sb3.ControlFlow("if", sb3.BoolOp("not", list_is_saturated), sb3.BlockList([
+      sb3.EditList("deleteall", ctx.cfg.mem_var, None, None),
+      sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.memory_size), sb3.BlockList([
+        sb3.EditList("addto", ctx.cfg.mem_var, None, sb3.Known(0))
+      ])),
+    ])),
+
+    # Reset the global values
+    # TODO this could use the for each block which is faster
+    sb3.EditVar("set", "ptr", sb3.Known(1)),
+    sb3.ControlFlow("reptimes", sb3.Known(total_size), sb3.BlockList([
+      sb3.EditList("replaceat", ctx.cfg.mem_var,
+        sb3.Op("add", sb3.Known(starting_global_addr - 1), sb3.GetVar("ptr")),
+        sb3.GetOfList("atindex", ctx.cfg.init_mem_var, sb3.GetVar("ptr"))),
+      sb3.EditVar("change", "ptr", sb3.Known(1)),
     ])),
   ]))
 
@@ -2883,7 +2928,7 @@ def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context)
 def addForeignFunctions(ctx: Context) -> Context:
   uppercase_costume_name = "uppercase"
   lowercase = "abcdefghijklmnopqrstuvwxyz"
-  ctx.proj.lists[ctx.cfg.lowercase_var] = list(lowercase)
+  ctx.proj.lists[ctx.cfg.lowercase_var] = [sb3.Known(char) for char in lowercase]
   ctx.proj.addCostume(uppercase_costume_name)
   lc_costume_num = ctx.proj.addCostume(lowercase)
 
@@ -2891,9 +2936,9 @@ def addForeignFunctions(ctx: Context) -> Context:
   for x in range(1, 256): # Ignore zero; improves perf as scratch lists are 1 indexed and zero signifies end of string
     char = chr(x)
     if char.encode("unicode_escape").decode("ascii").startswith("\\") and char != "\\":
-      ascii_lookup.append(f"\\{x:02X}")
+      ascii_lookup.append(sb3.Known(f"\\{x:02X}"))
     else:
-      ascii_lookup.append(char)
+      ascii_lookup.append(sb3.Known(char))
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
 
   # Checks if an ASCII alphabet character is uppercase or not
@@ -2922,7 +2967,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("!helper_str2scratch", ["input"], sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
     sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
-    sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+    sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", ctx.cfg.return_var,
         sb3.Op("join",
@@ -2931,7 +2976,7 @@ def addForeignFunctions(ctx: Context) -> Context:
             (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
             sb3.GetVar("char")))),
       sb3.EditVar("change", "ptr", sb3.Known(1)),
-      sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.stack_var, sb3.GetVar("ptr"))),
+      sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.GetVar("ptr"))),
     ])),
   ]), ctx)
 
@@ -2984,11 +3029,11 @@ def addForeignFunctions(ctx: Context) -> Context:
           ])),
         ])
       ),
-      sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.GetVar("ascii")),
+      sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.GetVar("ascii")),
       sb3.EditVar("change", "i", sb3.Known(1)),
     ])),
     # End of string
-    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.Known(0)),
+    sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.Known(0)),
 
     sb3.SwitchCostume(sb3.GetVar("cost")),
 
@@ -3049,7 +3094,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
-    sb3.EditList("replaceat", ctx.cfg.stack_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
+    sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
 
     # Return 1 if successful (casted value == original value), else 0
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
@@ -3082,24 +3127,20 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Starting code
   ctx.proj.code.append(sb3.BlockList([
     sb3.OnStartFlag(),
-    # Put startup code in initialization function
+    # Put startup code in initialization function for run without screen refresh
     sb3.ProcedureCall("!init", []),
   ]))
   initblocks = sb3.BlockList([sb3.ProcedureDef("!init", [])])
 
-  # Reset call stack
+  # Reset call stack counter
   initblocks.add(sb3.EditCounter("clear"))
 
   # Add foreign functions
   ctx = addForeignFunctions(ctx)
 
-  # Get function pointer info
-  ctx.min_func_ptr_addr = cfg.memory_size + 1
-  ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
-
-  # Setup stack
-  globblocks, ctx = transGlobals(mod, ctx)
-  initblocks.add(globblocks)
+  # Setup memory and get global/function ptr addresses
+  init_blocks, ctx = initMemory(mod, ctx)
+  initblocks.add(init_blocks)
   initblocks.add(initLocalStack(ctx))
 
   # Translate functions
@@ -3126,11 +3167,11 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
 
     ctx.debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
 
-  # Call main func call to init code
+  # Call main func in init code
   if not "main" in ctx.fn_info:
-    raise CompException("No main function") # TODO FIX: add libs
+    raise CompException("No main function") # TODO Libraries?
   main_params_len = sum(ctx.fn_info["main"].param_sizes) + int(ctx.fn_info["main"].takes_return_address)
-  initblocks.add(sb3.ProcedureCall("main", [sb3.Known("")] * main_params_len))
+  initblocks.add(sb3.ProcedureCall("main", [sb3.Known(0)] * main_params_len))
 
   # Add init code
   ctx.proj.code.append(initblocks)
