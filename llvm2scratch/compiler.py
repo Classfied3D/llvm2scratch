@@ -1464,7 +1464,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                   lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
                 case ir.BinaryOpcode.Xor:
                   lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
-              ctx.proj.lists[name] = [sb3.Known(v) for v in lookup[1:]] # since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
+              # Since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
+              ctx.proj.lists[name] = [sb3.Known(v) for v in lookup[1:]]
 
             results = []
             for offset in range(0, width, ctx.cfg.binop_lookup_bits):
@@ -2614,7 +2615,8 @@ def transFuncPtrSigs(ctx: Context) -> Context:
           blocks.add(new_return_addr.setValue(return_address.getValue()))
         else:
           blocks.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(1)))
-          blocks.add(storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, 0, 1, return_address.getValue()))
+          blocks.add(
+            storeOnStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, 0, 1, return_address.getValue()))
       return_addr = new_return_addr
 
     callback = localizeFuncPtrSigCallback(signature_id)
@@ -2699,7 +2701,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       # Store the previous stack size if necessary
       if is_first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
-        starting_fn_code.add(localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params, info.param_sizes))
+        starting_fn_code.add(
+          localizeVar(ctx.cfg.previous_stack_size_local, False, BlockInfo(info, info.params, info.param_sizes))
           .setValue(sb3.GetVar(ctx.cfg.stack_pointer_var)))
 
       if is_first_block and info.branches_to_first:
@@ -2806,35 +2809,35 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   Initialize memory and get the addresses of global variables and function pointers
   """
 
+  # Global memory is at the start of memory (to keep pointers at low values for project.json size)
+  starting_global_addr = 1
+  # Function pointers exists at fake addresses after the end of memory
+  starting_fn_ptr_addr = ctx.cfg.memory_size + 1
+
   blocks = sb3.BlockList()
 
   # Get function pointer info
-  ctx.min_func_ptr_addr = ctx.cfg.memory_size + 1
+  ctx.min_func_ptr_addr = starting_fn_ptr_addr
   ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
 
   # Initalize memory
   if ctx.cfg.memory_size > SCRATCH_LIST_LIMIT:
     raise CompException("Stack is too large to fit in one list, multiple lists/hacked length not implemented yet")
 
-  # Get the sizes of global variables
-  total_size = 0
+  # Get the size and addresses of global variables
+  ptr = starting_global_addr
   sizes: list[int] = []
   for glob in mod.global_vars.values():
     size = getByteSize(glob.type)
     sizes.append(size)
-    total_size += size
-
-  # e.g. if memory size is 2000 and size is 2, starting global addr = 2000 - 2 + 1 = 1999
-  # which corresponds to addresses 1999 and 2000 for storing
-  starting_global_addr = ctx.cfg.memory_size - total_size + 1
-  # Stack pointer will first point to the address before the first global addr and grow backward
-  starting_stack_pointer = starting_global_addr - 1
-
-  # Get addresses for each global
-  ptr = starting_global_addr
-  for i, glob in enumerate(mod.global_vars.values()):
     ctx.globvar_to_ptr[glob.name] = ptr
-    ptr += sizes[i]
+    ptr += size
+
+  total_size = ptr - 1
+
+  # Stack pointer will first point to the end of memory and grow backward
+  starting_stack_pointer = ptr #ctx.cfg.memory_size
+  # starting_heap_pointer = ptr
 
   init_mem: list[sb3.Known] = []
   ptr = starting_global_addr
@@ -2872,15 +2875,18 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   ctx.proj.lists[ctx.cfg.init_mem_var] = init_mem
 
-  # If the memory list is saturated (has the correct amount of items) and replace at is valid on it (replace at wouldn't work on an empty list)
-  list_is_saturated = sb3.BoolOp("=", sb3.GetListLength(ctx.cfg.mem_var), sb3.Known(min(ctx.cfg.memory_size, SCRATCH_LIST_LIMIT)))
+  # If the memory list is saturated (has the correct amount of items) and
+  # replace at is valid on it (replace at wouldn't work on an empty list)
+  list_is_saturated = sb3.BoolOp("=",
+    sb3.GetListLength(ctx.cfg.mem_var),
+    sb3.Known(min(ctx.cfg.memory_size, SCRATCH_LIST_LIMIT)))
 
   blocks.add(sb3.BlockList([
     # Reset stack pointer
     # TODO start stack at starting_stack_pointer and grow backward
-    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(1)),
+    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(starting_stack_pointer)),
 
-    # Fill list if it is empty
+    # Saturate memory - it needs to be filled for replace var to work
     sb3.ControlFlow("if", sb3.BoolOp("not", list_is_saturated), sb3.BlockList([
       sb3.EditList("deleteall", ctx.cfg.mem_var, None, None),
       sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.memory_size), sb3.BlockList([
@@ -2980,6 +2986,11 @@ def addForeignFunctions(ctx: Context) -> Context:
     ])),
   ]), ctx)
 
+  # True if the limit is high enough.
+  enough_space = sb3.BoolOp("<",
+    sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))),
+    sb3.GetParameter(localizeParameter("count")))
+
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_scratch2str", ["input", "str", "count"], sb3.BlockList([
@@ -2991,9 +3002,8 @@ def addForeignFunctions(ctx: Context) -> Context:
 
     # Default: full string.
 
-    sb3.ControlFlow("if_else", sb3.BoolOp("<", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))), sb3.GetParameter(localizeParameter("count"))), sb3.BlockList([
+    sb3.ControlFlow("if_else", enough_space, sb3.BlockList([
       # The limit is high enough.
-      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
       # Re-using the "char" variable for counting how many letters should be copied.
       # I think it makes sense, right?
       # Also, according to @Classified3D and the README, calculating the length twice is the fastest option.
@@ -3002,7 +3012,6 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Else
     sb3.BlockList([
       # The limit is lower than the inputted string.
-      sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(0)),
       # Return False and reduce the letter count.
       # Doing -1 to account for the NULL at the end.
       sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParameter(localizeParameter("count")), sb3.Known(1))),
@@ -3036,6 +3045,8 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", sb3.GetVar("ptr"), sb3.GetVar("i")), sb3.Known(0)),
 
     sb3.SwitchCostume(sb3.GetVar("cost")),
+
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", enough_space)),
 
     # Return value is set above.
   ]), ctx)
