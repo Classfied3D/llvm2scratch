@@ -1058,16 +1058,21 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       assert bctx.label is not None
       if bctx.fn.skip_stack_size_change:
+        # If we skip increasing the stack pointer, don't subtract to componsate for the extra memory
         offset = 0
       elif bctx.fn.total_alloca_size is None:
+        # Go back to the offset before adding the total size
         offset = -bctx.fn.block_alloca_size[bctx.label]
       else:
         offset = -bctx.fn.total_alloca_size
-      offset += bctx.allocated + 1 # Adding one means that some addresses will be equal to the stack size, allowing better
-                                   # optimization because the extra add/subtract can be ignored
+      offset += bctx.allocated + size - 1 # Add size so that there is enough space. For example if stack pointer is 100
+                                          # and we want to allocate 10 bytes, then change stack pointer to 90 to reserve
+                                          # bytes 91, 92, ..., 100. Subtract one to allow some allocations to be set to
+                                          # the stack pointer to skip an add as well as include the inital stack pointer
       bctx.allocated += size
 
-      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_pointer_var, offset)))
+      # Negate offset as the stack grows backward
+      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_pointer_var, -offset)))
 
     case ir.Load(): # Load a value from an address on the stack
       address = transValue(instr.address, ctx, bctx)
@@ -1103,8 +1108,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       else:
         for offset, val in enumerate(value.vals):
           offset_val = sb3.Known(offset)
-          set_ptr = sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val)
-          blocks.add(set_ptr)
+          blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val))
 
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
@@ -2125,7 +2129,7 @@ def transTerminatorInstr(instr: ir.Instr,
       # the stack size var
       if not bctx.fn.skip_stack_size_change:
         if bctx.fn.total_alloca_size is not None:
-          blocks.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-bctx.fn.total_alloca_size)))
+          blocks.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(bctx.fn.total_alloca_size)))
         else:
           blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, localizeVar(ctx.cfg.previous_stack_size_local,
                                                                             False, bctx).getValue()))
@@ -2741,7 +2745,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         to_allocate = info.block_alloca_size[block.label]
 
       if to_allocate != 0 and not info.skip_stack_size_change:
-        starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(to_allocate)))
+        starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
       available_params, av_param_sizes = (info.params, info.param_sizes) if is_first_block else ([], [])
@@ -2809,35 +2813,32 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   Initialize memory and get the addresses of global variables and function pointers
   """
 
-  # Global memory is at the start of memory (to keep pointers at low values for project.json size)
-  starting_global_addr = 1
-  # Function pointers exists at fake addresses after the end of memory
-  starting_fn_ptr_addr = ctx.cfg.memory_size + 1
+  # Get sizes of global variables
+  sizes = [getByteSize(glob.type) for glob in mod.global_vars.values()]
+  total_size = sum(sizes)
 
-  blocks = sb3.BlockList()
+  # Memory layout
+  null = 0
+  starting_global_addr = 1                               # Global memory is at the start of memory*
+  starting_heap_ptr = starting_global_addr + total_size  # Heap starts after global memory
+  starting_stack_ptr = ctx.cfg.memory_size               # Stack pointer will first point to the end of memory and grows backward
+  starting_fn_ptr_addr = ctx.cfg.memory_size + 1         # Function pointers exists at fake addresses after the end of memory
+  # *Global memory is at the start to keep pointers at low values for project.json size
 
-  # Get function pointer info
+  # Get global variable addresses
+  ptr = starting_global_addr
+  for i, glob in enumerate(mod.global_vars.values()):
+    ctx.globvar_to_ptr[glob.name] = ptr
+    ptr += sizes[i]
+
+  # Get function pointer addresses
   ctx.min_func_ptr_addr = starting_fn_ptr_addr
   ctx.fn_ptr_sigs = getFuncPtrRefs(mod)
 
-  # Initalize memory
+  # Initialize memory
+  blocks = sb3.BlockList()
   if ctx.cfg.memory_size > SCRATCH_LIST_LIMIT:
     raise CompException("Stack is too large to fit in one list, multiple lists/hacked length not implemented yet")
-
-  # Get the size and addresses of global variables
-  ptr = starting_global_addr
-  sizes: list[int] = []
-  for glob in mod.global_vars.values():
-    size = getByteSize(glob.type)
-    sizes.append(size)
-    ctx.globvar_to_ptr[glob.name] = ptr
-    ptr += size
-
-  total_size = ptr - 1
-
-  # Stack pointer will first point to the end of memory and grow backward
-  starting_stack_pointer = ptr #ctx.cfg.memory_size
-  # starting_heap_pointer = ptr
 
   init_mem: list[sb3.Known] = []
   ptr = starting_global_addr
@@ -2883,8 +2884,7 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   blocks.add(sb3.BlockList([
     # Reset stack pointer
-    # TODO start stack at starting_stack_pointer and grow backward
-    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(starting_stack_pointer)),
+    sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(starting_stack_ptr)),
 
     # Saturate memory - it needs to be filled for replace var to work
     sb3.ControlFlow("if", sb3.BoolOp("not", list_is_saturated), sb3.BlockList([
@@ -3135,7 +3135,10 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Parse llvm
   mod: ir.Module = parser.parseAssembly(llvm) if isinstance(llvm, str) else llvm
 
-  # Starting code
+  # Add foreign functions (run this before initMemory because it is needed for func ptr addrs)
+  ctx = addForeignFunctions(ctx)
+
+  # Run on green flag
   ctx.proj.code.append(sb3.BlockList([
     sb3.OnStartFlag(),
     # Put startup code in initialization function for run without screen refresh
@@ -3146,16 +3149,10 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Reset call stack counter
   initblocks.add(sb3.EditCounter("clear"))
 
-  # Add foreign functions
-  ctx = addForeignFunctions(ctx)
-
   # Setup memory and get global/function ptr addresses
   init_blocks, ctx = initMemory(mod, ctx)
   initblocks.add(init_blocks)
   initblocks.add(initLocalStack(ctx))
-
-  # Translate functions
-  ctx = transFuncs(mod, ctx)
 
   # Reset debug info on initialisation
   if cfg.do_debug_branch_log:
@@ -3169,14 +3166,8 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
       sb3.EditList("addto", cfg.debug_branch_log_var, None, sb3.Known(0))
     ])))
 
-  # Export debug info
-  if cfg.do_debug_branch_log:
-    branch_debug_info: list[tuple[int, str]] = []
-    for info in ctx.fn_info.values():
-      branch_debug_info.append((info.fn_id, info.name))
-    branch_debug_info.sort(key=lambda info: info[0])
-
-    ctx.debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
+  # Translate functions
+  ctx = transFuncs(mod, ctx)
 
   # Call main func in init code
   if not "main" in ctx.fn_info:
@@ -3193,5 +3184,14 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
                             all_opti = cfg.opti_passes,
                             dont_remove = getDontRemove(ctx),
                             ignore_external_change = {ctx.cfg.stack_pointer_var})
+
+  # Export debug info
+  if cfg.do_debug_branch_log:
+    branch_debug_info: list[tuple[int, str]] = []
+    for info in ctx.fn_info.values():
+      branch_debug_info.append((info.fn_id, info.name))
+    branch_debug_info.sort(key=lambda info: info[0])
+
+    ctx.debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
 
   return ctx.proj, ctx.debug_info
