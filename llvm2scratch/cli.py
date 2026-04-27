@@ -69,12 +69,16 @@ def main():
     default=None,
     help="Minify settings to apply; defaults to general; see below"
   )
-  parser.add_argument("--memory-size", type=int, default=1024,
-    help="Number of 'bytes' on 'memory' list; max value is 200,000; default is 1024")
+  parser.add_argument("--memory-size", type=int, default=4096,
+    help="Number of 'bytes' on 'memory' list; max value is 200,000; default is 4096")
   parser.add_argument("--local-stack-size", type=int, default=512,
     help="Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is 512")
   parser.add_argument("--max-branch-recursion", type=int, default=1_000_000,
     help="Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000")
+  parser.add_argument("--no-accurate-byte-spacing", action="store_true", default=False,
+    help="Disable extra padding bytes added to each value in memory so that it takes up the space it would normally in bytes. "
+         "This allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "
+         "Disabling this may break programs that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR.")
   parser.add_argument(
     "--debug-scratch-code",
     type=Path,
@@ -87,7 +91,7 @@ def main():
     default=False,
     help="Remove 'hacked' blocks not normally accessible from the editor such as 'counter' and 'while' "
          "by replacing them with workarounds. See https://en.scratch-wiki.info/wiki/Hidden_Blocks. This "
-         "may lead to a reduction in performance"
+         "may lead to a reduction in performance."
   )
   parser.add_argument(
     "--hide-blocks",
@@ -134,6 +138,7 @@ def main():
     memory_size=args.memory_size,
     local_stack_size=args.local_stack_size,
     max_branch_recursion=args.max_branch_recursion,
+    accurate_byte_spacing=not args.no_accurate_byte_spacing,
     scratch_config=scfg,
   )
 

@@ -15,10 +15,12 @@ from . import optimizer as opt
 from . import parser
 from . import ir
 
-INTERMEDIATE_MAX_BITS = 53 # Max bits scratch's doubles can store
-VARIABLE_MAX_BITS = 48 # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
-                       # up to 53 bits, some operations require extra precision
-SCRATCH_LIST_LIMIT = 200_000
+INTERMEDIATE_MAX_BITS = 53   # Max bits scratch's doubles can store
+VARIABLE_MAX_BITS = 48       # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
+                             # up to 53 bits, some operations require extra precision. This should be more than the regular byte size (8)
+                             # and more than PTR_SIZE_BITS (currently 32, see below)
+SCRATCH_LIST_LIMIT = 200_000 # Max elements in a scratch list (without importing a larger list or project.json hacks)
+PTR_SIZE_BITS = 32           # Bits per pointer - this is 32 as we are compiling for a 32 bit system
 
 @dataclass
 class DebugInfo:
@@ -32,16 +34,18 @@ class Config:
   opti: bool = True # If optimisations for scratch should be applied
   opti_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
 
-  memory_size: int = 1024 # Number of 'bytes' on 'memory' list; max value is 200,000
+  memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 1_000_000 # Maximum depth of scratch's call stack before resetting it
+  accurate_byte_spacing: bool = True # If extra padding bytes should be added to each value in memory so that it takes up the
+                                     # space it would normally in bytes. This allows byte indexing to be more accurate at the
+                                     # cost of requiring ~3x more space in the memory list. Disabling this may break programs
+                                     # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
 
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch
                                                                                # serializer
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
-
-  ptr_size_bits: int = 32 # Doesn't really matter except should be valid for pointer arithmetic
 
   return_var = "!return value" # Name of the scratch variable for returing values
   mem_var = "!mem" # Name of the scratch list for the memory list
@@ -226,23 +230,44 @@ def flatAsTuple(obj):
     raise TypeError("Expected dataclass instance")
   return tuple(getattr(obj, f.name) for f in fields(obj))
 
-def getByteSize(ty: ir.Type) -> int:
+def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
+  """
+  Gets the size in bytes of a type. If include_padding is False, then this will return the amount of
+  variables needed to store the type. If it is True, then it will return the size in memory it will take
+  up (so that byte offsets created by LLVM are respected).
+  """
+
   match ty:
     case ir.IntegerTy():
       # Scratch's fp variables can store < 52 bits per variable accurately
-      return math.ceil(ty.width / VARIABLE_MAX_BITS)
-    case ir.FloatingPointTy():
-      return 1; # All floats are stored with scratch's double precision variables
-    case ir.ArrayTy():
-      return ty.size * getByteSize(ty.inner)
-    case ir.StructTy():
-      return sum(getByteSize(mem) for mem in ty.members)
-    case ir.PointerTy():
-      return 1
-    case _:
-      raise CompException(f"Unknown Type: {ty} (py type {type(ty)})")
+      # If include_spacing is enabled, then calculate what the size would be in bytes
+      return math.ceil(ty.width / (8 if include_padding else VARIABLE_MAX_BITS))
 
-def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
+    case ir.FloatingPointTy():
+      if not include_padding:
+        # All floats are stored with scratch's double precision variables
+        return 1
+
+      match ty:
+        case ir.HalfTy():   return 2  # 16 bit float; 2 bytes
+        case ir.FloatTy():  return 4  # 32 bit float; 4 bytes
+        case ir.DoubleTy(): return 8  # 64 bit float; 8 bytes
+        case ir.Fp128Ty():  return 16 # 128 bit float; 16 bytes
+
+      raise CompException(f"Unknown floating point type: {ty}")
+
+    case ir.ArrayTy():
+      return ty.size * getByteSize(ty.inner, include_padding)
+
+    case ir.StructTy():
+      return sum(getByteSize(mem, include_padding) for mem in ty.members)
+
+    case ir.PointerTy():
+      return 1 if not include_padding else PTR_SIZE_BITS
+
+  raise CompException(f"Unknown type: {ty}")
+
+def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value], ctx: Context) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
   # TODO: support negative offsets, except with nuw
   known_offset: int = 0
   unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
@@ -256,7 +281,8 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int,
         assert isinstance(inner_type, ir.ArrayTy)
         inner_type = inner_type.inner
 
-      offset_size = getByteSize(inner_type)
+      # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
+      offset_size = getByteSize(inner_type, include_padding=ctx.cfg.accurate_byte_spacing)
       if isinstance(index_val, sb3.Known):
         assert isinstance(index_val.known, int) or \
               (isinstance(index_val.known, float) and index_val.known.is_integer())
@@ -273,7 +299,8 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int,
       members = inner_type.members
       member_offset = int(index_val.known)
       for member in members[:member_offset]:
-        known_offset += getByteSize(member)
+        # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
+        known_offset += getByteSize(member, include_padding=ctx.cfg.accurate_byte_spacing)
 
       inner_type = inner_type.members[member_offset]
 
@@ -281,23 +308,55 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value]) -> tuple[int,
 
   return known_offset, unknown_offsets
 
+def padValue(val: ValueAndBlocks | IdxbleValueAndBlocks, size: int) -> ValueAndBlocks | IdxbleValueAndBlocks:
+  """
+  Apply padding to a Value/IdxbleValue + Blocks so that it matches "size"
+  """
+  originally_idxable = isinstance(val, IdxbleValueAndBlocks)
+  blocks = val.blocks
+  values = val.value.vals if isinstance(val, IdxbleValueAndBlocks) else [val.value]
+  padding_len = size - len(values)
+  assert padding_len >= 0
+  values.extend(sb3.Known(0) for _ in range(padding_len))
+  assert len(values) == size
+
+  if originally_idxable or size > 1:
+    return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
+  else:
+    return ValueAndBlocks(values[0], blocks)
+
 def transValue(val: ir.Value,
                ctx: Context, bctx: BlockInfo | None,
-               is_global_init: bool=False) -> ValueAndBlocks | IdxbleValueAndBlocks:
+               is_global_init: bool=False,
+               include_padding: bool=False) -> ValueAndBlocks | IdxbleValueAndBlocks:
+
+  """
+  Convert an IR value into a scratch value + blocks used to generate it. If is_global_init is
+  True, then create a value made up of sb3.Knowns
+  """
+
+  if include_padding:
+    # We should only be adding padding if we are in a global initializer
+    assert is_global_init
+
   match val:
     case ir.LocalVarVal() | ir.ArgumentVal() | ir.GlobalPtrVal():
       var = transVar(val, bctx)
       res = var.getValue()
+
+      if is_global_init:
+        assert isinstance(val, ir.GlobalPtrVal)
+
       if isinstance(val, ir.GlobalPtrVal) and (ctx.cfg.opti or is_global_init):
         # Global variables store their address in their variable
         # when optimizations are enabled we use this address directly
         res = sb3.Known(ctx.globvar_to_ptr[val.name])
 
-      size = getByteSize(val.type)
+      size = getByteSize(val.type, include_padding)
       if isinstance(val, (ir.LocalVarVal, ir.ArgumentVal)) and size > 1:
         return IdxbleValueAndBlocks(var.getAllValues(size))
 
-      return ValueAndBlocks(res)
+      return padValue(ValueAndBlocks(res), size)
 
     case ir.KnownIntVal():
       # Calculate the two's complement version of the number
@@ -307,40 +366,48 @@ def transValue(val: ir.Value,
                       # but now the parser should handle it
 
       if val.width <= VARIABLE_MAX_BITS:
-        return ValueAndBlocks(sb3.Known(num))
+        res = ValueAndBlocks(sb3.Known(num))
+      else:
+        # Little endian ordering of values
+        values: list[sb3.Value] = []
+        while width > 0:
+          values.append(sb3.Known(num % (2 ** VARIABLE_MAX_BITS)))
+          num = num // (2 ** VARIABLE_MAX_BITS)
+          width -= VARIABLE_MAX_BITS
+        res = IdxbleValueAndBlocks(IdxbleValue(values))
 
-      # Little endian ordering of values
-      values: list[sb3.Value] = []
-      while width > 0:
-        values.append(sb3.Known(num % (2 ** VARIABLE_MAX_BITS)))
-        num = num // (2 ** VARIABLE_MAX_BITS)
-        width -= VARIABLE_MAX_BITS
-
-      return IdxbleValueAndBlocks(IdxbleValue(values))
+      return padValue(res, getByteSize(val.type, include_padding))
 
     case ir.KnownFloatVal():
-      return ValueAndBlocks(sb3.Known(val.value))
+      return padValue(
+        ValueAndBlocks(sb3.Known(val.value)),
+        getByteSize(val.type, include_padding))
 
     case ir.KnownArrVal() | ir.KnownStructVal():
       values: list[sb3.Value] = []
       blocks = sb3.BlockList()
       for element in val.values:
-        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init))
+        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init, include_padding))
         if isinstance(el_val, sb3.Value):
           values.append(el_val)
         else:
           values.extend(el_val.vals)
         blocks.add(el_blocks)
 
+      # Arrays/Structs don't need padding
       return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
 
     case ir.NullPtrVal():
       # Since pointers start from one anyway (because lists start from one in scratch), zero can be used for null
-      return ValueAndBlocks(sb3.Known(0))
+      return padValue(
+        ValueAndBlocks(sb3.Known(0)),
+        getByteSize(val.type, include_padding))
 
     case ir.FunctionVal():
       # Return a pointer corresponding to an id given to each func ptr reference
-      return ValueAndBlocks(sb3.Known(getFuncPtrAddr(val.name, ctx)))
+      return padValue(
+        ValueAndBlocks(sb3.Known(getFuncPtrAddr(val.name, ctx))),
+        getByteSize(val.type, include_padding))
 
     case ir.ConstExprVal():
       expr = val.expr
@@ -353,18 +420,27 @@ def transValue(val: ir.Value,
             assert isinstance(index_val, ir.KnownIntVal)
             indices.append(sb3.Known(index_val.value))
 
-          known_offset, unknown_offsets = getGepOffset(expr.base_ptr_type, indices)
+          known_offset, unknown_offsets = getGepOffset(expr.base_ptr_type, indices, ctx)
           assert len(unknown_offsets) == 0
 
           base_ptr = ctx.globvar_to_ptr[expr.base_ptr.name]
 
-          return ValueAndBlocks(sb3.Known(base_ptr + known_offset))
+          # Pointer needs padding applied
+          return padValue(
+            ValueAndBlocks(sb3.Known(base_ptr + known_offset)),
+            getByteSize(val.type, include_padding))
 
         case ir.Conversion():
           match expr.opcode:
-            case ir.ConvOpcode.PtrToInt | ir.ConvOpcode.IntToPtr:
+            case ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr | ir.ConvOpcode.IntToPtr:
+              # TODO: truncation and zero extension if int type is different width to pointer, also
+              # make sure to padValue if zero extending
+              int_ty = expr.value.type if expr.opcode == ir.ConvOpcode.IntToPtr else expr.res_type
+              assert isinstance(int_ty, ir.IntegerTy)
+              assert int_ty.width == PTR_SIZE_BITS
+
               # No-op
-              return transValue(expr.value, ctx, bctx, is_global_init)
+              return transValue(expr.value, ctx, bctx, is_global_init, include_padding)
 
             case ir.ConvOpcode.BitCast | ir.ConvOpcode.AddrSpaceCast:
               raise CompException(f"Unsupported constexpr conv opcode {expr.opcode}")
@@ -430,7 +506,7 @@ def localizeSizedParameters(params: list[Variable], sizes: list[int]) -> list[st
       res.append(param.getRawVarName(None if size == 1 else i))
   return res
 
-def combineIdxableValues(vals: list[sb3.Value | IdxbleValue]) -> IdxbleValue:
+def combineIdxbleValues(vals: list[sb3.Value | IdxbleValue]) -> IdxbleValue:
   res = []
   for val in vals:
     if isinstance(val, sb3.Value): res.append(val)
@@ -1054,7 +1130,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert var is None or var.var_type != "param"
 
       blocks = sb3.BlockList()
-      size = getByteSize(instr.allocated_type)
+      # Include padding in allocation space to prevent bytes being overriden (i.e. with memcpy)
+      size = getByteSize(instr.allocated_type, include_padding=ctx.cfg.accurate_byte_spacing)
 
       assert bctx.label is not None
       if bctx.fn.skip_stack_size_change:
@@ -1081,7 +1158,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if isinstance(address.value, IdxbleValue):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
-      byte_size = getByteSize(instr.loaded_type)
+      # TODO FIX: properly skip over padding bytes
+      if ctx.cfg.accurate_byte_spacing and isinstance(instr.loaded_type, (ir.ArrayTy, ir.StructTy)):
+        raise CompException(f"Loading aggregates with accurate padding not supported yet: {instr}")
+
+      # Don't include padding - we don't care about loading padded bytes, they only exist to offset pointers
+      byte_size = getByteSize(instr.loaded_type, include_padding=False)
 
       var = transVar(instr.result, bctx)
       if byte_size == 1:
@@ -1102,6 +1184,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       if isinstance(address, IdxbleValue):
         raise CompException(f"Address to store cannot be an indexable value in {instr}")
+
+      # TODO FIX: properly skip over padding bytes when storing
+      if ctx.cfg.accurate_byte_spacing and isinstance(instr.value.type, (ir.ArrayTy, ir.StructTy)):
+        raise CompException(f"Storing aggregates with accurate padding not supported yet: {instr}")
 
       if isinstance(value, sb3.Value):
         blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.mem_var, address, value)]))
@@ -1635,9 +1721,17 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           assert isinstance(from_ty, ir.IntegerTy)
           res_val = undoTwosComplement(from_ty.width, value)
 
+        case ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr | ir.ConvOpcode.IntToPtr:
+          # TODO: truncation and zero extension if int type is different width to pointer
+          int_ty = instr.value.type if instr.opcode == ir.ConvOpcode.IntToPtr else instr.res_type
+          assert isinstance(int_ty, ir.IntegerTy)
+          assert int_ty.width == PTR_SIZE_BITS
+
+          # No-op
+          res_val = value
+
         case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | \
-             ir.ConvOpcode.UIToFP | ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr | \
-             ir.ConvOpcode.IntToPtr | ir.ConvOpcode.BitCast:
+             ir.ConvOpcode.UIToFP | ir.ConvOpcode.BitCast:
           # No-op
           res_val = value
 
@@ -1663,7 +1757,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"integers or pointers, got type {type(instr.left.type)}")
 
-      width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else ctx.cfg.ptr_size_bits
+      width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else PTR_SIZE_BITS
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
         raise CompException(f"Instruction icmp currently supports "
@@ -1795,7 +1889,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         blocks.add(index.blocks)
         indices.append(index.value)
 
-      known_offset, unknown_offsets = getGepOffset(instr.base_ptr_type, indices)
+      known_offset, unknown_offsets = getGepOffset(instr.base_ptr_type, indices, ctx)
 
       offsets: list[sb3.Value] = []
       if known_offset != 0:
@@ -1838,7 +1932,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       match instr.value.type:
         case ir.IntegerTy() | ir.PointerTy():
           width = instr.value.type.width if isinstance(instr.value.type, ir.IntegerTy) \
-            else ctx.cfg.ptr_size_bits
+            else PTR_SIZE_BITS
 
           # Works with NaN, Infinity, invalid values (mod turns infinity to NaN but
           # floor doesn't, so doesn't work other way around)
@@ -2444,7 +2538,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
             call_id += 1 # Note: external funcs still contribute to call ids even if unused
 
           case ir.Alloca():
-            branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type)
+            branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type,
+                                                          include_padding=ctx.cfg.accurate_byte_spacing)
 
           case ir.Phi():
             res_var_name = instr.result.name
@@ -2814,7 +2909,8 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   """
 
   # Get sizes of global variables
-  sizes = [getByteSize(glob.type) for glob in mod.global_vars.values()]
+  # Include padding as this is accessed as part of memory
+  sizes = [getByteSize(glob.type, include_padding=ctx.cfg.accurate_byte_spacing) for glob in mod.global_vars.values()]
   total_size = sum(sizes)
 
   # Memory layout
@@ -2848,7 +2944,7 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
       blocks.add(globvar.setValue(sb3.Known(ptr)))
 
     if glob.init is not None:
-      blocks_and_value = transValue(glob.init, ctx, None, is_global_init=True)
+      blocks_and_value = transValue(glob.init, ctx, None, is_global_init=True, include_padding=ctx.cfg.accurate_byte_spacing)
       unknown = len(blocks_and_value.blocks) > 0
       value = blocks_and_value.value
 
@@ -2868,7 +2964,8 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
         case _:
           raise AssertionError("Did not expect this path")
 
-      # TODO this will need correct spacing when memory spacing is changed
+      if len(values) != sizes[i]:
+        print(values, len(values), sizes[i])
       assert len(values) == sizes[i]
       init_mem.extend(values)
 

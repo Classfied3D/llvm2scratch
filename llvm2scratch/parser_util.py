@@ -552,7 +552,7 @@ def parseTypeConstantTokens(tokens: list[str], structs: dict[str, StructTy], fun
     raise ValueError(f"Unsupported value type {tokens[0]}")
 
   # Constant expressions
-  elif tokens[0] in ["trunc", "ptrtoint", "inttoptr", "bitcast", "addrspacecast"]:
+  elif tokens[0] in ["trunc", "ptrtoint", "ptrtoaddr", "inttoptr", "bitcast", "addrspacecast"]:
     assert tokens[1].startswith("(") and tokens[1].endswith(")")
     contents = tokens[1][1:-1]
 
