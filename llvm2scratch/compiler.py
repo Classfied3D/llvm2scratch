@@ -263,7 +263,7 @@ def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
       return sum(getByteSize(mem, include_padding) for mem in ty.members)
 
     case ir.PointerTy():
-      return 1 if not include_padding else PTR_SIZE_BITS
+      return 1 if not include_padding else math.ceil(PTR_SIZE_BITS / 8)
 
   raise CompException(f"Unknown type: {ty}")
 
