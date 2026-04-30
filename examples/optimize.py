@@ -54,7 +54,7 @@ def main():
   ]))
 
   proj = optimize(proj)
-  proj.export("output/out.sprite3")
+  proj.export("output/out.sprite3", Format.Sprite3)
 
 if __name__ == "__main__":
   main()

@@ -12,6 +12,7 @@ import json
 import math
 
 MAIN_SPRITE_NAME = "DONT OPEN" # Incorrect grammar so it can fit in sprite name box lol
+                               # Alternatively lowercase uses less horizontal space: Do Not Open could fit
 EMPTY_SPRITE_NAME = "Empty"
 MESSAGE = """\
 WARNING: The 'DONT OPEN' sprite may contain a lot of blocks and cause the scratch editor to crash! \

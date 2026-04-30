@@ -871,10 +871,88 @@ def assignParameters(params: list[Variable], param_sizes: list[int], next_var_us
   return blocks
 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
-  blocks = sb3.BlockList()
+  end_assignments: list[tuple[Variable, ValueAndBlocks | IdxbleValueAndBlocks]] = []
+  to_resolve: dict[str, str] = {}
+  set_by: dict[str, str] = {}
+  resolved: list[tuple[str, str]] = []
+  var_lookup: dict[str, Variable] = {}
+  val_lookup: dict[str, ValueAndBlocks | IdxbleValueAndBlocks] = {}
+
   for res_var, ir_val in phi_info:
-    if isinstance(ir_val, ir.UndefVal): continue # Undef values do not need to be assigned
+    # Undef values do not need to be assigned
+    if isinstance(ir_val, ir.UndefVal):
+      continue
+
     val = transValue(ir_val, ctx, bctx)
+
+    if isinstance(ir_val, ir.LocalVarVal):
+      # Other variables in this phi assignment might depend on this one, ensure it gets resolved correctly
+      to_resolve[res_var.var_name] = ir_val.name
+      var_lookup[res_var.var_name] = res_var
+      val_lookup[ir_val.name] = val
+    else:
+      # It is safe to put this at the end because it does not rely on anything that might be changed
+      end_assignments.append((res_var, val))
+
+  while to_resolve:
+    # Anything that has a dependency on it cannot be set
+    cant_set = set(to_resolve.values())
+    to_set = set(to_resolve.keys()) - cant_set
+
+    for var in to_set:
+      set_by[to_resolve[var]] = var
+      resolved.append((var, to_resolve[var]))
+      del to_resolve[var]
+
+    # If there is a dependency cycle and we need to create a temporary (or use an existing variable)
+    if len(to_set) == 0:
+      # We can use order of operations to our advantage. For example:
+      # 2 = 3;
+      # temp1 = 3;
+      # 3 = 4;
+      # 4 = 5;
+      # 5 = temp1;
+      # Can be optimized to:
+      # 2 = 3;
+      # 3 = 4;
+      # 4 = 5;
+      # 5 = 2;
+      already_set = set(to_resolve.keys()) & set(set_by.keys())
+      if already_set:
+        # Use an existing variable set to the same value
+        to_make_temp = next(iter(already_set))
+        temp_name = set_by[to_make_temp]
+      else:
+        to_make_temp = next(iter(to_resolve.keys()))
+        to_make_temp_val = val_lookup[to_make_temp]
+
+        # Create a temporary
+        temp_name = genTempVar(ctx)
+        temp_var = Variable(temp_name, "special_var", None)
+        var_lookup[temp_name] = temp_var
+        if isinstance(to_make_temp_val, ValueAndBlocks):
+          temp_val = ValueAndBlocks(temp_var.getValue())
+        else:
+          temp_val = IdxbleValueAndBlocks(temp_var.getAllValues(len(to_make_temp_val.value.vals)))
+        val_lookup[temp_name] = temp_val
+
+        resolved.append((temp_name, to_make_temp))
+
+      resolved.append((to_make_temp, to_resolve[to_make_temp]))
+      del to_resolve[to_make_temp]
+
+      # Update references to value with the new temporary or existing value
+      for var, deps in to_resolve.items():
+        if to_make_temp == deps:
+          to_resolve[var] = temp_name
+
+  assignments: list[tuple[Variable, ValueAndBlocks | IdxbleValueAndBlocks]] = []
+  for var_name, val_name in resolved:
+    assignments.append((var_lookup[var_name], val_lookup[val_name]))
+  assignments.extend(end_assignments)
+
+  blocks = sb3.BlockList()
+  for res_var, val in assignments:
     blocks.add(val.blocks)
     if isinstance(val, ValueAndBlocks):
       blocks.add(res_var.setValue(val.value))
@@ -919,7 +997,7 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
                              ctx: Context) -> tuple[sb3.BlockList, Context]:
   """
   Returns the blocks needed to return a branch instruction (procedure)
-  that will reset the scratch's stack if reaching a max amount of permutations,
+  that will reset the scratch's stack if reaching a max amount of recursions,
   preventing scratch from running out of memory
   """
   assert len(params) == len(param_sizes)
