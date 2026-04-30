@@ -43,8 +43,7 @@ class Config:
                                      # cost of requiring ~3x more space in the memory list. Disabling this may break programs
                                      # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
 
-  scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch
-                                                                               # serializer
+  scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch serializer
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
   return_var = "!return value" # Name of the scratch variable for returing values
@@ -91,7 +90,7 @@ class Context:
 class FuncPtrSigInfo:
   # ID for the signature of the function pointer when being called
   signature_id: int
-  # Descriptions for following in FuncInfo
+  # Descriptions for following are in FuncInfo
   can_call: set[str]
   return_addresses: list[str]
   returns_to_address: bool
@@ -2301,7 +2300,8 @@ def transTerminatorInstr(instr: ir.Instr,
       # the stack size var
       if not bctx.fn.skip_stack_size_change:
         if bctx.fn.total_alloca_size is not None:
-          blocks.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(bctx.fn.total_alloca_size)))
+          if bctx.fn.total_alloca_size != 0:
+            blocks.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(bctx.fn.total_alloca_size)))
         else:
           blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, localizeVar(ctx.cfg.previous_stack_size_local,
                                                                             False, bctx).getValue()))
