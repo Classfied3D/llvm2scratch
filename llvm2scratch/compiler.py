@@ -2374,14 +2374,18 @@ def transTerminatorInstr(instr: ir.Instr,
         label_name = label.label
         label_proc_name = localizeLabel(label_name, bctx.fn)
 
-        branch_blocks = sb3.BlockList()
-        branch_blocks.add(assignPhiNodes(phi_info[label_name], ctx, bctx))
-        branch_blocks.add(sb3.ProcedureCall(label_proc_name, []))
+        case_vs_label[case_val] = sb3.BlockList([
+          *assignPhiNodes(phi_info[label_name], ctx, bctx).blocks,
+          sb3.ProcedureCall(label_proc_name, []),
+        ])
 
-        case_vs_label[case_val] = branch_blocks
+      default_label_name = instr.branch_default.label
+      default_proc_name = localizeLabel(default_label_name, bctx.fn)
 
-      default_proc_name = localizeLabel(instr.branch_default.label, bctx.fn)
-      default_label_call = sb3.BlockList([sb3.ProcedureCall(default_proc_name, [])])
+      default_label_call = sb3.BlockList([
+        *assignPhiNodes(phi_info[default_label_name], ctx, bctx).blocks,
+        sb3.ProcedureCall(default_proc_name, []),
+      ])
 
       lowest_poss = 0
       highest_poss = (2 ** width) - 1 # FUTURE OPTI: if the value called from was zero-extended (e.g. from an i8)
