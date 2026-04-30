@@ -11,6 +11,7 @@ packages = [{ include = "llvm2scratch" }]
 python = ">=3.12"
 llvmlite = "^0.45.0"
 networkx = "^3.6.0"
+ordered-set = "^4.1.0"
 
 [tool.poetry.scripts]
 llvm2scratch = "llvm2scratch.cli:main"

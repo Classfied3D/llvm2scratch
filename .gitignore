@@ -3,6 +3,7 @@
 **/.zed
 **/.ropeproject
 **/__pycache__
+**/.venv
 
 examples/output
 examples/profile.out

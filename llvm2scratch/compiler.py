@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
-from collections import OrderedDict, defaultdict
 from typing import Literal, Callable, cast
+from collections import defaultdict
+from ordered_set import OrderedSet
 from copy import deepcopy
 
 import random
@@ -649,7 +650,7 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) ->
     raise CompException(f"Multipling {width} bits is not supported")
 
 def binarySearch(value: sb3.Value,
-                 branches: OrderedDict[int, sb3.BlockList],
+                 branches: dict[int, sb3.BlockList],
                  default_branch: sb3.BlockList | None = None,
                  min_poss_value: int | None = None, # Max value - we do not need to check for default values above it
                  max_poss_value: int | None = None, # Min value - likewise
@@ -658,7 +659,7 @@ def binarySearch(value: sb3.Value,
   if len(branches) == 0:
     return sb3.BlockList([]) if default_branch is None else default_branch
 
-  if not are_branches_sorted: branches = OrderedDict(sorted(branches.items()))
+  if not are_branches_sorted: branches = dict(sorted(branches.items()))
 
   if _hi is None: _hi = len(branches.keys()) - 1
   mid = (_lo + _hi) // 2
@@ -895,8 +896,8 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
 
   while to_resolve:
     # Anything that has a dependency on it cannot be set
-    cant_set = set(to_resolve.values())
-    to_set = set(to_resolve.keys()) - cant_set
+    cant_set = OrderedSet(to_resolve.values())
+    to_set = OrderedSet(to_resolve.keys()) - cant_set
 
     for var in to_set:
       set_by[to_resolve[var]] = var
@@ -916,7 +917,7 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
       # 3 = 4;
       # 4 = 5;
       # 5 = 2;
-      already_set = set(to_resolve.keys()) & set(set_by.keys())
+      already_set = OrderedSet(to_resolve.keys()) & OrderedSet(set_by.keys())
       if already_set:
         # Use an existing variable set to the same value
         to_make_temp = next(iter(already_set))
@@ -2245,7 +2246,7 @@ def transReturnAddr(return_address: sb3.Value, info: FuncInfo | FuncPtrSigInfo, 
 
   blocks = sb3.BlockList()
   if info.takes_return_address:
-    return_to_addr_code = OrderedDict()
+    return_to_addr_code = {}
     for i, addr in enumerate(info.return_addresses):
       return_to_addr_code[i] = sb3.BlockList([sb3.ProcedureCall(addr, [])])
 
@@ -2359,7 +2360,7 @@ def transTerminatorInstr(instr: ir.Instr,
         val, opti_val_blocks = flatAsTuple(optimizeValueUse(val, math.log2(len(instr.branch_table)), ctx))
         blocks.add(opti_val_blocks)
 
-      case_vs_label: OrderedDict[int, sb3.BlockList] = OrderedDict()
+      case_vs_label: dict[int, sb3.BlockList] = {}
       for case, label in instr.branch_table:
         case_val = transValue(case, ctx, bctx)
         # Switch cases should be constant and unique
@@ -2802,7 +2803,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
 
     callback = localizeFuncPtrSigCallback(signature_id)
 
-    branches = OrderedDict()
+    branches = dict()
     for name in could_call:
       branch = sb3.BlockList()
       branch.add(sb3.ProcedureCall(name, [sb3.GetParameter(arg) for arg in arguments]))
@@ -3292,7 +3293,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Returns the days since 2000 in UTC time
   ctx = addFunc("SB3_days_since_2000", [], sb3.BlockList([
-     sb3.EditVar("set", ctx.cfg.return_var, sb3.DaysSince2000()),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.DaysSince2000()),
   ]), ctx)
 
   #ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)

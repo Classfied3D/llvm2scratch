@@ -15,7 +15,7 @@ def main():
     EditVar("set", "hello3", GetCounter()),
     EditCounter("incr"),
     EditVar("set", "hello4", Op("add", GetVar("hello3"), Known(20))),
-    Say(GetVar("hello4")), # Test if will elide if used too many times for it be faster
+    Say(GetVar("hello4")), # Test if wont elide if used too many times for it be faster
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
@@ -29,6 +29,8 @@ def main():
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
     Say(GetVar("hello4")),
+    EditVar("set", "hello5", Op("add", GetVar("hello3"), Known(21))),
+    Say(GetVar("hello5")),
 
     # https://github.com/Classfied3D/llvm2scratch/pull/2#discussion_r3004955618
     # Also I should stop quoting that song TwT - Heathercat123
@@ -51,6 +53,27 @@ def main():
     ])),
     Say(GetVar("buffer")),
     EditVar("set", "return", Known(0)),
+  ]))
+
+  proj.code.append(BlockList([
+    ProcedureDef("test1", []),
+    EditVar("set", "b", GetVar("a")),
+    ControlFlow("if_else", BoolOp("=", GetVar("a"), GetVar("a")), BlockList([
+      EditVar("set", "c", GetVar("b")),
+    ]), BlockList([
+      EditVar("set", "a", Known(3)),
+      EditVar("set", "c", GetVar("b")),
+    ])),
+    Say(GetVar("a")),
+    Say(GetVar("c")),
+  ]))
+
+  proj.code.append(BlockList([
+    ProcedureDef("test2", []),
+    EditVar("set", "b", GetVar("a")),
+    EditVar("set", "b", GetVar("r")),
+    EditVar("set", "c", GetVar("b")),
+    Say(GetVar("c")),
   ]))
 
   proj = optimize(proj)

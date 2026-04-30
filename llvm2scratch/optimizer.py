@@ -770,14 +770,25 @@ def assignmentElision(proj: sb3.Project,
         for var_name in to_remove:
           del changed_but_unread[var_name]
 
-        to_remove = []
+        to_remove = set()
         for var_name, (var_dependents, var_value) in to_elide.items():
+          # If the var was overwritten, then it cannot be elided
           if var_name in use.might_modify:
-            to_remove.append(var_name)
+            to_remove.add(var_name)
+            cannot_elide.add(var_name)
+
+          # If any of the dependencies are modified, it can only be elided provided
+          # it is not read any further in the code
           elif bool(use.might_modify & var_dependents):
-            # If any of the variables are changed
-            to_remove.append(var_name)
-            changed_but_unread[var_name] = var_dependents, var_value
+            to_remove.add(var_name)
+            cannot_elide.add(var_name)
+
+            # If the block modifies the a dependency, and also depends on the
+            # variable, then the variable could have had its dependency change then
+            # read, so it cannot be elided
+            if var_name not in use.dependent:
+              changed_but_unread[var_name] = var_dependents, var_value
+
         for var_name in to_remove:
           del to_elide[var_name]
 
@@ -786,16 +797,15 @@ def assignmentElision(proj: sb3.Project,
         else:
           var_name = "var:" + block.var_name
           depends_on, _ = getValueVarUse(block.value)
+
           if block.op == "set" and var_name not in (depends_on | cannot_elide):
             to_elide[var_name] = depends_on, block.value
-          # Don't elide if overwritten
-          cannot_elide.add(var_name)
 
       to_elide.update(changed_but_unread)
 
-      # Don't elide vars in dont_elide
+      # Don't elide vars in dont_remove
       for var_name in dont_remove:
-        while var_name in to_elide.keys():
+        if var_name in to_elide:
           del to_elide[var_name]
 
       # Calculate if it is actually faster to elide
