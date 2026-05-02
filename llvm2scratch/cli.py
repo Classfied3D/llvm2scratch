@@ -36,6 +36,8 @@ class CustomFormatter(argparse.HelpFormatter):
     return super().format_help()
 
 def main():
+  defaults = compiler.Config()
+
   parser = argparse.ArgumentParser(
     description="Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)",
     formatter_class=CustomFormatter
@@ -69,12 +71,13 @@ def main():
     default=None,
     help="Minify settings to apply; defaults to general; see below"
   )
-  parser.add_argument("--memory-size", type=int, default=4096,
-    help="Number of 'bytes' on 'memory' list; max value is 200,000; default is 4096")
-  parser.add_argument("--local-stack-size", type=int, default=512,
-    help="Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is 512")
-  parser.add_argument("--max-branch-recursion", type=int, default=1_000_000,
-    help="Maximum depth of scratch's call stack before resetting it; defaults to 1,000,000")
+  parser.add_argument("--memory-size", type=int, default=defaults.memory_size,
+    help=f"Number of 'bytes' on 'memory' list; max value is 200,000; default is {defaults.memory_size}")
+  parser.add_argument("--local-stack-size", type=int, default=defaults.local_stack_size,
+    help=f"Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is "
+         f"{defaults.local_stack_size}")
+  parser.add_argument("--max-branch-recursion", type=int, default=defaults.max_branch_recursion,
+    help=f"Maximum depth of scratch's call stack before resetting it; defaults to {defaults.max_branch_recursion}")
   parser.add_argument("--no-accurate-byte-spacing", action="store_true", default=False,
     help="Disable extra padding bytes added to each value in memory so that it takes up the space it would normally in bytes. "
          "This allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "

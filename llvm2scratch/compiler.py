@@ -22,6 +22,9 @@ VARIABLE_MAX_BITS = 48       # Maximum amount of bits to store in a fp variable.
                              # and more than PTR_SIZE_BITS (currently 32, see below)
 SCRATCH_LIST_LIMIT = 200_000 # Max elements in a scratch list (without importing a larger list or project.json hacks)
 PTR_SIZE_BITS = 32           # Bits per pointer - this is 32 as we are compiling for a 32 bit system
+EXIT_CALL_ID = 0             # Jump table call ID of corresponding to exit
+ENTRY_CALL_ID = 1            # Jump table call ID of corresponding to entry
+START_STACK_RESET_ID = 2     # Starting jump table call ID of stack reset
 
 @dataclass
 class DebugInfo:
@@ -38,22 +41,23 @@ class Config:
   memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
-  max_branch_recursion: int = 1_000_000 # Maximum depth of scratch's call stack before resetting it
+  max_branch_recursion: int = 3000 # Maximum depth of scratch's call stack before resetting it
   accurate_byte_spacing: bool = True # If extra padding bytes should be added to each value in memory so that it takes up the
                                      # space it would normally in bytes. This allows byte indexing to be more accurate at the
                                      # cost of requiring ~3x more space in the memory list. Disabling this may break programs
                                      # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
-
+  entrypoint: str = "main" # Name of function to call to start the program
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch serializer
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
 
-  return_var = "!return value" # Name of the scratch variable for returing values
-  mem_var = "!mem" # Name of the scratch list for the memory list
-  init_mem_var = "!mem init" # Name of the scratch list for the initialize memory list
-  stack_pointer_var = "!stack pointer" # Name of the scratch variable for the stack pointer
-  local_stack_var = "!local stack" # Name of the scratch list to store variables that will be used recursively
-  local_stack_size_var = "!local stack size" # Name of the scratch variable to store the label stack's size
-  debug_branch_log_var = "!!debug_branch_log" # Name of the scratch list to store debug info (using underscores
+  return_var = "!return value" # Name of the variable for returing values
+  mem_var = "!mem" # Name of the list for the memory list
+  init_mem_var = "!mem init" # Name of the list for the initialize memory list
+  stack_pointer_var = "!stack pointer" # Name of the variable for the stack pointer
+  local_stack_var = "!local stack" # Name of the list to store variables that will be used recursively
+  local_stack_size_var = "!local stack size" # Name of the variable to store the label stack's size
+  jump_table_id_var = "!call stack reset id" # Name of the variable to store the ID of the current branch on a stack reset
+  debug_branch_log_var = "!!debug_branch_log" # Name of the list to store debug info (using underscores
                                               # to avoid spaces in exported filename for convenience)
 
   ascii_lookup_var = "!ascii lookup"
@@ -84,8 +88,10 @@ class Context:
   # Starting ptr addr for functions. Could be independent from stack
   # using LLVM datalayout
   min_func_ptr_addr: int = 0
-  debug_info: DebugInfo = field(default_factory=DebugInfo) # Info about a scratch project which can be used in
-                                                           # future compilations for optimization
+  # [(func_name, branch_name)]. List of all locations which contain a stack check
+  all_check_locations: list[tuple[str, str]] = field(default_factory=list)
+  # Info about a scratch project which can be used in future compilations for optimization
+  debug_info: DebugInfo = field(default_factory=DebugInfo)
 
 @dataclass
 class FuncPtrSigInfo:
@@ -484,8 +490,8 @@ def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
 def localizeParameter(name: str) -> str:
   return "%" + name
 
-def localizeLabel(label: str, fn: FuncInfo) -> str:
-  return f"{fn.name}:{label}"
+def localizeLabel(label: str, fn_name: str) -> str:
+  return f"{fn_name}:{label}"
 
 def localizeCallId(call_id: int, label: str, fn_name: str, recursive: bool = False) -> str:
   if not recursive:
@@ -993,7 +999,7 @@ def getUncheckedProcedureStart(proc_name: str, params: list[Variable], param_siz
   return blocks, ctx
 
 def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes: list[int],
-                             next_var_use_depends: set[str], fn: FuncInfo,
+                             next_var_use_depends: set[str], block_label: str, fn: FuncInfo,
                              ctx: Context) -> tuple[sb3.BlockList, Context]:
   """
   Returns the blocks needed to return a branch instruction (procedure)
@@ -1002,27 +1008,21 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
   """
   assert len(params) == len(param_sizes)
 
-  reset_broadcast = f"{proc_name}:reset stack"
-  arguments: list[sb3.Value] = [sb3.GetVar(arg) for arg in localizeSizedParameters(params, param_sizes)]
-  ctx.proj.code.append(sb3.BlockList([
-    sb3.OnBroadcast(reset_broadcast),
-    sb3.ProcedureCall(proc_name, arguments),
-  ]))
-
   blocks, ctx = getUncheckedProcedureStart(proc_name, params, param_sizes, fn, ctx, is_counted=True)
 
-  on_reset = sb3.BlockList()
-
-  on_reset = assignParameters(params, param_sizes, next_var_use_depends)
-  # NB for future modifications, the call/broadcast should be next to the stop script so it is treated by the optimizer as an
-  # "ending call"
-  on_reset.add(sb3.BlockList([
-    sb3.EditCounter("clear"),
-    sb3.Broadcast(sb3.Known(reset_broadcast), False), # While broadcasts are slow, this is the fastest option in this rare case
-    sb3.StopScript("stopthis")]))
+  # Get the ID of this branch in the stack reset jump table so it can jump back to this branch once
+  # the stack is reset
+  reset_id = START_STACK_RESET_ID + ctx.all_check_locations.index((fn.name, block_label))
 
   blocks.add(sb3.ControlFlow("if",
-    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), on_reset))
+    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), sb3.BlockList([
+      # This should never be called as it is not possible to branch to the first branch, but will be kept
+      # in case parameters are used between blocks in future
+      *assignParameters(params, param_sizes, next_var_use_depends).blocks,
+
+      sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(reset_id)),
+      sb3.StopScript("stopthis")
+    ])))
 
   return blocks, ctx
 
@@ -2256,9 +2256,6 @@ def transReturnAddr(return_address: sb3.Value, info: FuncInfo | FuncPtrSigInfo, 
     # If the function doesn't take a return address then it must always return to the same place
     assert len(info.return_addresses) == 1
     blocks.add(sb3.BlockList([sb3.ProcedureCall(info.return_addresses[0], [])]))
-  else:
-    pass # TODO FIX: if a function ever returns here the stack will unwind which may be unexpected
-         # so the stop all block could be used. This happens with the main function for example
 
   blocks.end = True
 
@@ -2307,6 +2304,15 @@ def transTerminatorInstr(instr: ir.Instr,
           blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, localizeVar(ctx.cfg.previous_stack_size_local,
                                                                             False, bctx).getValue()))
 
+      if bctx.fn.name == ctx.cfg.entrypoint:
+        # Exit the program
+        blocks.add(sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(EXIT_CALL_ID)))
+
+        # TODO allow calling the entrypoint function with a return address corresponding to
+        # exiting the function
+        assert not bctx.fn.takes_return_address
+        assert (not bctx.fn.returns_to_address) or len(bctx.fn.return_addresses) == 0
+
       if bctx.fn.returns_to_address:
         return_addr = localizeVar(ctx.cfg.return_address_local, False, bctx)
         blocks.add(transReturnAddr(return_addr.getValue(), bctx.fn, ctx))
@@ -2321,7 +2327,7 @@ def transTerminatorInstr(instr: ir.Instr,
       blocks.add(assignPhiNodes(phi_info[instr.branch.label], ctx, bctx))
 
       # Jump to label
-      proc_name = localizeLabel(instr.branch.label, bctx.fn)
+      proc_name = localizeLabel(instr.branch.label, bctx.fn.name)
       blocks.add(sb3.ProcedureCall(proc_name, []))
 
     case ir.CondBr(): # Jump to a label, either known or dependent on a condition
@@ -2336,7 +2342,7 @@ def transTerminatorInstr(instr: ir.Instr,
       label_true, label_false = instr.branch_true.label, instr.branch_false.label
       phi_blocks_true = assignPhiNodes(phi_info[label_true], ctx, bctx)
       phi_blocks_false = assignPhiNodes(phi_info[label_false], ctx, bctx)
-      true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn), localizeLabel(label_false, bctx.fn)
+      true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn.name), localizeLabel(label_false, bctx.fn.name)
 
       blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList(
         phi_blocks_true.blocks + [sb3.ProcedureCall(true_proc_name, [])]
@@ -2373,7 +2379,7 @@ def transTerminatorInstr(instr: ir.Instr,
         case_val = int(case_val.value.known)
 
         label_name = label.label
-        label_proc_name = localizeLabel(label_name, bctx.fn)
+        label_proc_name = localizeLabel(label_name, bctx.fn.name)
 
         case_vs_label[case_val] = sb3.BlockList([
           *assignPhiNodes(phi_info[label_name], ctx, bctx).blocks,
@@ -2381,7 +2387,7 @@ def transTerminatorInstr(instr: ir.Instr,
         ])
 
       default_label_name = instr.branch_default.label
-      default_proc_name = localizeLabel(default_label_name, bctx.fn)
+      default_proc_name = localizeLabel(default_label_name, bctx.fn.name)
 
       default_label_call = sb3.BlockList([
         *assignPhiNodes(phi_info[default_label_name], ctx, bctx).blocks,
@@ -2564,7 +2570,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   call_graph: dict[str, tuple[set[str], bool]] = {}
   return_addresses: dict[str, list[str]] = {}
   returns_to_address: dict[str, bool] = {}
-  all_check_locations: dict[str, list[str]] = {}
+  check_locations: dict[str, list[str]] = {}
   branch_alloca_size: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
   total_alloca_size: dict[str, int | None] = {}
   block_var_use: dict[str, dict[str, BlockVarUse]] = {}
@@ -2675,7 +2681,9 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     # address. Furthermore, a binary search and a call is usually faster than potentially
     # hundreds of recursions backward.
     returns_to_address[fn.name] = could_recurse
-    all_check_locations[fn.name] = fn_check_locations
+    check_locations[fn.name] = fn_check_locations
+    for branch in fn_check_locations:
+      ctx.all_check_locations.append((fn.name, branch))
 
     # Any branch that may be called more than once
     repeating_branches: set[str] = set().union(*[set(branch) for branch in cycles])
@@ -2754,7 +2762,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
 
     ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, call_graph[fn.name][0],
                                     fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
-                                    all_check_locations.get(fn.name, list()),
+                                    check_locations.get(fn.name, list()),
                                     branch_alloca_size[fn.name], total_alloca_size.get(fn.name, None),
                                     skip_stack_size_change, block_var_use[fn.name],
                                     branches_to_first.get(fn.name, False), phi_assignments[fn.name])
@@ -2858,7 +2866,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         localized_params = info.params
         localized_param_sizes = info.param_sizes
       else:
-        proc_name = localizeLabel(block.label, info)
+        proc_name = localizeLabel(block.label, info.name)
         localized_params = []
         localized_param_sizes = []
 
@@ -2871,7 +2879,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         next_var_use_depends = info.block_var_use[block.label].depends
         next_var_use_depends |= ctx.cfg.special_locals
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params, localized_param_sizes,
-                                                         next_var_use_depends, info, ctx)
+                                                         next_var_use_depends, block.label, info, ctx)
 
       if is_first_block and ctx.cfg.do_debug_branch_log:
         # Increment the function counter in the log
@@ -2893,7 +2901,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         poss_depends |= ctx.cfg.special_locals
         starting_fn_code.add(assignParameters(info.params, info.param_sizes, poss_depends))
 
-        first_block_proc_name = localizeLabel(block.label, info)
+        first_block_proc_name = localizeLabel(block.label, info.name)
 
         starting_fn_code.add(sb3.ProcedureCall(first_block_proc_name, []))
 
@@ -2905,7 +2913,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
                                                             is_counted=info.returns_to_address)
         else:
           starting_fn_code, ctx = getCheckedProcedureStart(first_block_proc_name, [], [],
-                                                           poss_depends, info, ctx)
+                                                           poss_depends, block.label, info, ctx)
 
         is_first_block = False
 
@@ -2986,6 +2994,48 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
   return ctx
 
+def transEntrypointCall(ctx: Context) -> tuple[sb3.BlockList, Context]:
+  entrypoint = ctx.cfg.entrypoint
+  if entrypoint not in ctx.fn_info:
+    raise CompException(f"Could not find entrypoint function {entrypoint}!")
+
+  entrypoint_info = ctx.fn_info[entrypoint]
+  main_params_len = sum(entrypoint_info.param_sizes) + int(entrypoint_info.takes_return_address)
+  entrypoint_call = sb3.ProcedureCall(entrypoint, [sb3.Known(0)] * main_params_len)
+
+  if not entrypoint_info.returns_to_address:
+    return sb3.BlockList([entrypoint_call]), ctx
+
+  # We need to make a jump table for everywhere the stack might need to reset
+  else:
+    jump_table: dict[int, sb3.BlockList] = {
+      EXIT_CALL_ID: sb3.BlockList([sb3.StopScript("stopthis")]),
+      ENTRY_CALL_ID: sb3.BlockList([entrypoint_call]),
+    }
+
+    for id_offset, (fn_name, branch_label) in enumerate(ctx.all_check_locations):
+      branch_proc_name = localizeLabel(branch_label, fn_name)
+      # Branches don't have parameters
+      jump_table[START_STACK_RESET_ID + id_offset] = sb3.BlockList([sb3.ProcedureCall(branch_proc_name, [])])
+
+    jump_table_blocks = binarySearch(sb3.GetVar(ctx.cfg.jump_table_id_var), jump_table)
+
+    jump_table_fn_name = "!jump table"
+    jump_table_fn_blocks = sb3.BlockList([
+      sb3.ProcedureDef(jump_table_fn_name, []),
+      sb3.ControlFlow("forever", None, sb3.BlockList([
+        sb3.EditCounter("clear"),
+        *jump_table_blocks.blocks,
+      ])),
+    ])
+
+    ctx.proj.code.append(jump_table_fn_blocks)
+
+    return sb3.BlockList([
+      sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(ENTRY_CALL_ID)),
+      sb3.ProcedureCall(jump_table_fn_name, []),
+    ]), ctx
+
 def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   """
   Initialize memory and get the addresses of global variables and function pointers
@@ -3047,8 +3097,6 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
         case _:
           raise AssertionError("Did not expect this path")
 
-      if len(values) != sizes[i]:
-        print(values, len(values), sizes[i])
       assert len(values) == sizes[i]
       init_mem.extend(values)
 
@@ -3326,9 +3374,6 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ]))
   initblocks = sb3.BlockList([sb3.ProcedureDef("!init", [])])
 
-  # Reset call stack counter
-  initblocks.add(sb3.EditCounter("clear"))
-
   # Setup memory and get global/function ptr addresses
   init_blocks, ctx = initMemory(mod, ctx)
   initblocks.add(init_blocks)
@@ -3349,11 +3394,9 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Translate functions
   ctx = transFuncs(mod, ctx)
 
-  # Call main func in init code
-  if not "main" in ctx.fn_info:
-    raise CompException("No main function") # TODO Libraries?
-  main_params_len = sum(ctx.fn_info["main"].param_sizes) + int(ctx.fn_info["main"].takes_return_address)
-  initblocks.add(sb3.ProcedureCall("main", [sb3.Known(0)] * main_params_len))
+  # Start program after initialization
+  start_program_blocks, ctx = transEntrypointCall(ctx)
+  initblocks.add(start_program_blocks)
 
   # Add init code
   ctx.proj.code.append(initblocks)

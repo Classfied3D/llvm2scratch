@@ -76,8 +76,10 @@ class BlockListInfo:
 def getInputs(block: sb3.Block) -> list[sb3.Value]:
   """Gets all inputs a block takes. Does not check contents of if blocks etc, this must be done manually"""
   match block:
-    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast() | sb3.SwitchCostume():
+    case sb3.Say() | sb3.EditVar() | sb3.Broadcast() | sb3.SwitchCostume():
       return [block.value]
+    case sb3.ControlFlow():
+      return [block.value] if block.value is not None else []
     case sb3.EditList():
       inputs = []
       if block.item is not None: inputs.append(block.item)
@@ -91,12 +93,19 @@ def getInputs(block: sb3.Block) -> list[sb3.Value]:
 def setInputs(block: sb3.Block, inputs: list[sb3.Value]) -> sb3.Block:
   """Sets the inputs a block takes. Uses the same order as getInputs"""
   match block:
-    case sb3.Say() | sb3.EditVar() | sb3.ControlFlow() | sb3.Broadcast() | sb3.SwitchCostume():
+    case sb3.Say() | sb3.EditVar() | sb3.Broadcast() | sb3.SwitchCostume():
       assert len(inputs) == 1
       block.value = inputs[0]
+    case sb3.ControlFlow():
+      if block.op != "forever":
+        assert len(inputs) == 1
+        block.value = inputs[0]
+      else:
+        assert len(inputs) == 0
     case sb3.EditList():
       if block.item is not None: block.item = inputs.pop(0)
       if block.index is not None: block.index = inputs.pop(0)
+      assert len(inputs) == 0
     case sb3.ProcedureCall():
       assert len(inputs) == len(block.arguments)
       block.arguments = inputs
@@ -359,12 +368,19 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
                 new_blocklist.add(block.blocks)
               elif block.else_blocks is not None:
                 new_blocklist.add(block.else_blocks)
-            case "until":
+            case "until" | "while":
               did_opti = True
-              add_block = not block.value.known # TODO OPTI: otherwise use forever
-            case "while":
-              did_opti = True
-              add_block = block.value.known
+              inverted = block == "while"
+              is_forever = inverted ^ (not block.value.known)
+              if is_forever:
+                block.op = "forever"
+                block.value = None
+
+                # No blocks come after a forever block
+                new_blocklist.add(block)
+                break
+              else:
+                add_block = False
         elif isinstance(block.value, sb3.BoolOp) and block.value.op == "not":
           match block.op:
             case "if_else":
@@ -458,7 +474,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
     for value in getInputs(block):
       value_dependent, counts = getValueVarUse(value)
       all_value_dependent |= value_dependent
-      if isinstance(block, sb3.ControlFlow) and block.op in ["until", "while"]:
+      if isinstance(block, sb3.ControlFlow) and block.op in ["until", "while", "forever"]:
         # Might be depended on an unlimited amount of times
         info.use_counts += Counter({key: float("inf") for key in counts})
       else:
@@ -520,7 +536,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
           info.use_counts += callee_info.use_counts
       case sb3.ControlFlow():
         match block.op:
-          case "if" | "reptimes" | "until" | "while":
+          case "if" | "reptimes" | "until" | "while" | "forever":
             b_info = getBlockListVarUse(
               block.blocks, func_info, ignore_external_change, is_ending and block.op == "if")
 
@@ -529,8 +545,11 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
             info.might_call   |= b_info.might_call | b_info.always_call
 
             if block.op == "if":
-              # Assume called half the times
+              # Assume called half the time
               info.use_counts += Counter({k: v / 2 for k, v in b_info.use_counts.items()})
+            elif block.op == "reptimes" and isinstance(block.value, sb3.Known):
+              times = sb3.scratchCastToNum(block.value)
+              info.use_counts += Counter({k: v * times for k, v in b_info.use_counts.items()})
             else:
               # Might repeat an unlimited amount of times
               info.use_counts += Counter({key: float("inf") for key in b_info.use_counts})

@@ -40,6 +40,7 @@ SHORT_OP_TO_OPCODE = {
   "reptimes": "control_repeat",
   "until": "control_repeat_until",
   "while": "control_while",
+  "forever": "control_forever",
 
   # Variables
   "set": "data_setvariableto",
@@ -590,15 +591,20 @@ class OnStartFlag(StartBlock):
   def stringify(self) -> str:
     return f"when green flag clicked"
 
-FlowOp = Literal["if", "if_else", "reptimes", "until", "while"]
+FlowOp = Literal["if", "if_else", "reptimes", "until", "while", "forever"]
 @dataclass
 class ControlFlow(Block):
   op: FlowOp
-  value: Value
+  value: Value | None
   blocks: BlockList
   else_blocks: BlockList | None = None
 
   def __post_init__(self):
+    if self.op == "forever" and self.value is not None:
+      raise ScratchCompException("Forever cannot accept a value")
+    elif self.op != "forever" and self.value is None:
+      raise ScratchCompException(f"{self.op} requires a value!")
+
     if self.op in ["if", "if_else", "until", "while"] and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
 
@@ -607,6 +613,18 @@ class ControlFlow(Block):
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     op, val = self.op, self.value
+    opcode = SHORT_OP_TO_OPCODE[op]
+    blocks_id = ctx.addBlockList(self.blocks, my_id)
+    inputs = {"SUBSTACK": [2, blocks_id]}
+
+    if self.op == "forever":
+      return {
+        "opcode": opcode,
+        "inputs": inputs
+      }, ctx
+
+    assert val is not None
+
     if self.op == "while" and not ctx.cfg.allow_hacked_blocks:
       op = "until"
       val = BoolOp("not", val)
@@ -618,10 +636,9 @@ class ControlFlow(Block):
       raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_INT)
 
     blocks_id = ctx.addBlockList(self.blocks, my_id)
+    inputs = {"SUBSTACK": [2, blocks_id]}
 
     input_name = "TIMES" if op == "reptimes" else "CONDITION"
-
-    inputs = {"SUBSTACK": [2, blocks_id]}
     if raw_val is not None: inputs.update({input_name: raw_val})
 
     if op == "if_else":
@@ -630,7 +647,7 @@ class ControlFlow(Block):
       inputs.update({"SUBSTACK2": [2, else_blocks_id]})
 
     return {
-      "opcode": SHORT_OP_TO_OPCODE[op],
+      "opcode": opcode,
       "inputs": inputs
     }, ctx
 
@@ -644,10 +661,15 @@ class ControlFlow(Block):
       "until": "repeat until",
       "while": "while",
       "reptimes": "repeat",
-    }[self.op] + " " + self.value.stringify() + "\n" + self.indent(self.blocks)
+      "forever": "forever"
+    }[self.op] + (" " + self.value.stringify() if self.value is not None else "") \
+               + "\n" + self.indent(self.blocks)
     if self.else_blocks is not None:
       res += "\nelse\n" + self.indent(self.else_blocks)
     return res
+
+  def isEnd(self) -> bool:
+    return self.op == "forever"
 
 @dataclass
 class StopScript(EndBlock):
