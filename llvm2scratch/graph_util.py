@@ -52,26 +52,23 @@ class CallGraphAnalysis:
     while self.analyzeNode(self.entrypoint):
       self.analyzed = set()
 
-def minHittingSetExact(cycles: list[list[int]]) -> list[int]:
-  if not cycles: return []
-  cycle_sets = [set(c) for c in cycles]
-  all_nodes = sorted(set().union(*cycle_sets))
-  for r in range(1, len(all_nodes) + 1):
-    for comb in itertools.combinations(all_nodes, r):
-      s = set(comb)
-      if all(s & c for c in cycle_sets):
-        return list(comb)
-  return all_nodes
+def findNodesWithCycle(graph: dict[str, list[str]]) -> set[str]:
+  g = nx.DiGraph(graph)
+  return {
+    node
+    for scc in nx.strongly_connected_components(g)
+    if len(scc) > 1
+    for node in scc
+  } | set(nx.nodes_with_selfloops(g))
 
-def findAllCycles(graph: dict[str, list[str]]) -> tuple[list[list[int]], list[str]]:
+def selectCycleChecks(graph: dict[str, list[str]]) -> list[str]:
+  # TODO: if graph has a very large amount of cycles, then use findNodesWithCycle instead
+  # Find all cycles
   g = nx.DiGraph(graph)
   nodes = sorted(g.nodes())
   node_idx = {n: i for i, n in enumerate(nodes)}
   g_int = nx.relabel_nodes(g, node_idx)
-  return list(nx.simple_cycles(g_int)), nodes
-
-def selectCycleChecks(cycles: list[list[int]], nodes: list[str]) -> list[str]:
-  # TODO: if graph has a large amount of cycles, then use minimum hitting set on SCCs instead
+  cycles = list(nx.simple_cycles(g_int))
 
   if not cycles: return []
   # Any node that can call itself must have a stack check; therefore we can ignore cycles
@@ -94,6 +91,17 @@ def selectCycleChecks(cycles: list[list[int]], nodes: list[str]) -> list[str]:
     greedy_nodes = set(greedyHittingSet(remaining, nodes))
 
   return [nodes[i] for i in self_loop_nodes | greedy_nodes]
+
+def minHittingSetExact(cycles: list[list[int]]) -> list[int]:
+  if not cycles: return []
+  cycle_sets = [set(c) for c in cycles]
+  all_nodes = sorted(set().union(*cycle_sets))
+  for r in range(1, len(all_nodes) + 1):
+    for comb in itertools.combinations(all_nodes, r):
+      s = set(comb)
+      if all(s & c for c in cycle_sets):
+        return list(comb)
+  return all_nodes
 
 def greedyHittingSet(cycles: list[list[int]], nodes: list[str]) -> list[int]:
   if not cycles: return []
