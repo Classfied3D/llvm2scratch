@@ -835,16 +835,18 @@ def assignmentElision(proj: sb3.Project,
       for var_name in slower_to_elide:
         del to_elide[var_name]
 
-      # Perform one elision at a time - otherwise issues can be created where
-      # the dependencies of sub-elisions are not respected
-      if len(to_elide) > 0:
-        single_elision_key = list(to_elide.keys())[0]
-        single_elision = {single_elision_key: to_elide[single_elision_key][1]}
-      else:
-        single_elision = {}
+      # When eliding multiple variables in one go we cannot elide anything with a
+      # dependency of being elided or vice versa
+      final_elisions: dict[str, sb3.Value] = {}
+      current_elision_deps = set()
+      for elided_var, (elided_deps, elided_val) in to_elide.items():
+        if elided_var not in current_elision_deps and not (elided_deps & current_elision_deps):
+          final_elisions[elided_var] = elided_val
+          current_elision_deps |= elided_deps
+          current_elision_deps.add(elided_var)
 
       # Perform the elision
-      blocklist, did_elide = assignmentElisionBlock(blocklist, single_elision)
+      blocklist, did_elide = assignmentElisionBlock(blocklist, final_elisions)
       did_total_opti |= did_elide
     fn_blocks[name] = blocklist
 
