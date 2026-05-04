@@ -273,14 +273,14 @@ def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
 
   raise CompException(f"Unknown type: {ty}")
 
-def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value], ctx: Context) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
+def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], ctx: Context) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
   # TODO: support negative offsets, except with nuw
   known_offset: int = 0
   unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
 
   is_arr_offset = True
   inner_type = base_ptr_type
-  for i, index_val in enumerate(indices):
+  for i, (index_val, index_width) in enumerate(indices):
     if is_arr_offset:
       # An array offset
       if i != 0:
@@ -290,9 +290,10 @@ def getGepOffset(base_ptr_type: ir.Type, indices: list[sb3.Value], ctx: Context)
       # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
       offset_size = getByteSize(inner_type, include_padding=ctx.cfg.accurate_byte_spacing)
       if isinstance(index_val, sb3.Known):
-        assert isinstance(index_val.known, int) or \
-              (isinstance(index_val.known, float) and index_val.known.is_integer())
-        known_offset += int(index_val.known) * offset_size
+        assert isinstance(index_val.known, (int, float)) and index_val.known.is_integer()
+        # Account for negative indices
+        no_twos_comp_known = comptimeUndoTwosComplement(index_width, index_val.known)
+        known_offset += int(no_twos_comp_known) * offset_size
       else:
         unknown_offsets[offset_size].append(index_val)
     else:
@@ -424,9 +425,9 @@ def transValue(val: ir.Value,
           indices = []
           for index_val in expr.indices:
             assert isinstance(index_val, ir.KnownIntVal)
-            indices.append(sb3.Known(index_val.value))
+            indices.append((sb3.Known(index_val.value), index_val.width))
 
-          known_offset, unknown_offsets = getGepOffset(expr.base_ptr_type, indices, ctx)
+          known_offset, unknown_offsets = getGepOffsets(expr.base_ptr_type, indices, ctx)
           assert len(unknown_offsets) == 0
 
           base_ptr = ctx.globvar_to_ptr[expr.base_ptr.name]
@@ -550,15 +551,31 @@ def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
 def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
-def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
-  """Reverses two's complement on a value."""
+def undoTwosComplementWithOffset(width: int, val: sb3.Value) -> tuple[sb3.Value, int]:
+  """
+  Returns (value, offset), where value + offset is the reverse two's complement of the input value with
+  a two's complement of width. Offset is always equal to 2^(width - 1) - 1.
+  """
 
-  # Weird formula but works
-  return sb3.Op("add",
-    sb3.Op("mod",
-      sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)),
-      sb3.Known(-(2 ** width))),
-    sb3.Known(2 ** (width - 1) - 1))
+  # e.g. with 8 bits: output = ( ( input + 129 ) mod -256 ) + 127
+  # this reverses two's complement in 3 values and only uses the input value once, as well as providing
+  # an offset which can be optimized somewhere else with the power of maths
+  return (
+    sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))),
+    (2 ** (width - 1) - 1)
+  )
+
+def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
+  """Reverses a two's complement of width on value"""
+
+  value, offset = undoTwosComplementWithOffset(width, val)
+
+  return sb3.Op("add", value, sb3.Known(offset))
+
+def comptimeUndoTwosComplement(width: int, val: int | float) -> int | float:
+  if val >= 2**(width-1):
+    val -= 2**width
+  return val
 
 def intPow2(val: sb3.Value, ctx: Context, manual_offset: int=0) -> tuple[sb3.Value, Context]:
   """
@@ -582,7 +599,7 @@ def bitShift(direction: Literal["left", "right"],
   right_mul, ctx = intPow2(right, ctx)
 
   if direction == "left":
-    # Multipling by a power of two is safe because the internal double value scratch uses doesnt loose accuracy
+    # Multipling by a power of two is safe because the internal double value scratch uses doesn't lose accuracy
     # when only the exponent part changes
     unwrapped = sb3.Op("mul", left, right_mul)
     if not can_shift_out: return unwrapped, ctx
@@ -1960,14 +1977,15 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(base_ptr, ValueAndBlocks)
       blocks.add(base_ptr.blocks)
 
-      indices: list[sb3.Value] = []
+      indices: list[tuple[sb3.Value, int]] = []
       for index_val in instr.indices:
+        assert isinstance(index_val.type, ir.IntegerTy)
         index = transValue(index_val, ctx, bctx)
         assert isinstance(index, ValueAndBlocks)
         blocks.add(index.blocks)
-        indices.append(index.value)
+        indices.append((index.value, index_val.type.width))
 
-      known_offset, unknown_offsets = getGepOffset(instr.base_ptr_type, indices, ctx)
+      known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
 
       offsets: list[sb3.Value] = []
       if known_offset != 0:
