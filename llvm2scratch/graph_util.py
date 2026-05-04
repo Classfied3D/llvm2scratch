@@ -100,7 +100,16 @@ def selectCycleChecks(cycles: list[list[str]], exact_threshold_nodes: int = 15) 
 
 def unavoidableNodes(graph: dict[str, list[str]], source: str, target: str) -> set[str]:
   g = nx.DiGraph(graph)
-  paths = list(nx.all_simple_paths(g, source, target))
-  if not paths:
-    return set()
-  return set.intersection(*[set(p) for p in paths])
+  dominators = nx.immediate_dominators(g, source)
+
+  if target not in dominators:
+    return {source}
+
+  unavoidable = set()
+  node = target
+  while node != source:
+    unavoidable.add(node)
+    node = dominators[node]
+  unavoidable.add(source)
+
+  return unavoidable
