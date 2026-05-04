@@ -2674,8 +2674,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       # Find what each block in the function could branch to
       branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
-    cycles = util.findAllCycles(branches)
-    fn_check_locations = util.selectCycleChecks(cycles)
+    cycles, cycle_nodes = util.findAllCycles(branches)
+    fn_check_locations = sorted(util.selectCycleChecks(cycles, cycle_nodes))
     could_recurse = len(fn_check_locations) > 0
     # If the branches could create a loop, we must place stack checks, so we should return to an
     # address. Furthermore, a binary search and a call is usually faster than potentially
@@ -2686,7 +2686,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       ctx.all_check_locations.append((fn.name, branch))
 
     # Any branch that may be called more than once
-    repeating_branches: set[str] = set().union(*[set(branch) for branch in cycles])
+    repeating_branches: set[str] = set().union(*[{cycle_nodes[i] for i in c} for c in cycles])
     # Branches that are unavoidable
     unavoidable_branches: set[str] = util.unavoidableNodes(branches, first_label, "ret")
     # Branches that are always ran once per func call

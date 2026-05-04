@@ -12,6 +12,8 @@ python = ">=3.12"
 llvmlite = "^0.45.0"
 networkx = "^3.6.0"
 ordered-set = "^4.1.0"
+numpy = "^2.4.4"
+scipy = "^1.17.1"
 
 [tool.poetry.scripts]
 llvm2scratch = "llvm2scratch.cli:main"

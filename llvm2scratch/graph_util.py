@@ -2,7 +2,9 @@ from collections import defaultdict, deque, Counter
 from dataclasses import dataclass, field
 from copy import deepcopy
 
+from scipy.sparse import csc_array
 import networkx as nx
+import numpy as np
 import itertools
 
 @dataclass
@@ -50,53 +52,73 @@ class CallGraphAnalysis:
     while self.analyzeNode(self.entrypoint):
       self.analyzed = set()
 
-def minHittingSetExact(cycles: list[list[str]]) -> list[str]:
-  """Exact minimum hitting set by brute-force (use only for small instances)."""
-  if not cycles:
-    return []
+def minHittingSetExact(cycles: list[list[int]]) -> list[int]:
+  if not cycles: return []
   cycle_sets = [set(c) for c in cycles]
-  nodes = sorted(set().union(*cycle_sets))
-  for r in range(1, len(nodes) + 1):
-    for comb in itertools.combinations(nodes, r):
+  all_nodes = sorted(set().union(*cycle_sets))
+  for r in range(1, len(all_nodes) + 1):
+    for comb in itertools.combinations(all_nodes, r):
       s = set(comb)
       if all(s & c for c in cycle_sets):
-        return list(s)
-  return nodes # fallback: return all nodes if nothing found (shouldn't happen)
+        return list(comb)
+  return all_nodes
 
-def greedyHittingSet(cycles: list[list[str]]) -> list[str]:
-  """Greedy heuristic hitting set: iteratively choose node that covers most remaining cycles."""
-  if not cycles:
-    return []
-  cycle_sets = [set(c) for c in cycles]
-  uncovered = cycle_sets.copy()
-  selected: set[str] = set()
-
-  while uncovered:
-    # count frequency
-    freq: dict[str, int] = {}
-    for c in uncovered:
-      for n in c:
-        freq[n] = freq.get(n, 0) + 1
-    # pick node with max frequency (tie-breaker: stable via sorted)
-    node = max(sorted(freq.keys()), key=lambda x: freq[x])
-    selected.add(node)
-    # remove covered cycles
-    uncovered = [c for c in uncovered if node not in c]
-
-  return list(selected)
-
-def findAllCycles(graph: dict[str, list[str]]) -> list[list[str]]:
+def findAllCycles(graph: dict[str, list[str]]) -> tuple[list[list[int]], list[str]]:
   g = nx.DiGraph(graph)
-  return list(nx.simple_cycles(g))
+  nodes = sorted(g.nodes())
+  node_idx = {n: i for i, n in enumerate(nodes)}
+  g_int = nx.relabel_nodes(g, node_idx)
+  return list(nx.simple_cycles(g_int)), nodes
 
-def selectCycleChecks(cycles: list[list[str]], exact_threshold_nodes: int = 15) -> list[str]:
-  if not cycles:
-    return []
-  cycle_nodes = set().union(*[set(c) for c in cycles])
-  if len(cycle_nodes) <= exact_threshold_nodes:
-    return minHittingSetExact(cycles)
+def selectCycleChecks(cycles: list[list[int]], nodes: list[str]) -> list[str]:
+  # TODO: if graph has a large amount of cycles, then use minimum hitting set on SCCs instead
+
+  if not cycles: return []
+  # Any node that can call itself must have a stack check; therefore we can ignore cycles
+  # containing that node
+  self_loop_nodes = {c[0] for c in cycles if len(c) == 1}
+  remaining = [c for c in cycles if not self_loop_nodes.intersection(c)]
+
+  if not remaining:
+    return [nodes[i] for i in self_loop_nodes]
+
+  # Avoid counting number of nodes if it is expensive to do so
+  if len(remaining) < 1000:
+    calc_exact = len(set().union(*[set(c) for c in remaining])) <= 15
   else:
-    return greedyHittingSet(cycles)
+    calc_exact = False
+
+  if calc_exact:
+    greedy_nodes = set(minHittingSetExact(remaining))
+  else:
+    greedy_nodes = set(greedyHittingSet(remaining, nodes))
+
+  return [nodes[i] for i in self_loop_nodes | greedy_nodes]
+
+def greedyHittingSet(cycles: list[list[int]], nodes: list[str]) -> list[int]:
+  if not cycles: return []
+  n_nodes = len(nodes)
+  lengths = np.array([len(c) for c in cycles], dtype=np.int32)
+  rows = np.repeat(np.arange(len(cycles), dtype=np.int32), lengths)
+  flat = list(itertools.chain.from_iterable(cycles))
+  cols = np.array(flat, dtype=np.int32)
+  subsets = csc_array(
+    (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+    shape=(len(cycles), n_nodes)
+  )
+
+  slice_col = lambda j: subsets.indices[slice(*subsets.indptr[[j, j+1]])]
+  n, j = len(cycles), n_nodes
+  set_counts = np.asarray(subsets.sum(axis=0)).ravel()
+  point_cover, soln = np.zeros(n, dtype=bool), np.zeros(j, dtype=bool)
+
+  while not np.all(point_cover):
+    opt_s = np.argmax(set_counts)
+    point_cover[slice_col(opt_s)] = True
+    set_counts = np.maximum((~point_cover).view(np.uint8) @ subsets, 0)
+    soln[opt_s] = True
+
+  return np.flatnonzero(soln).tolist()
 
 def unavoidableNodes(graph: dict[str, list[str]], source: str, target: str) -> set[str]:
   g = nx.DiGraph(graph)
