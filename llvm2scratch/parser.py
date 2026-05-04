@@ -6,8 +6,9 @@ from .parser_util import *
 from .ir import *
 
 def getResultLocalVar(instr: llvm.ValueRef) -> ResultLocalVar | None:
-  if str(instr).strip().startswith("%"):
-    return ResultLocalVar(str(instr).split("=")[0].strip()[1:])
+  stringified = str(instr).strip()
+  if stringified.startswith("%"):
+    return ResultLocalVar(stringified.split("=")[0][1:])
   return None
 
 def decodeType(type: llvm.TypeRef, structs: dict[str, StructTy], func_names: list[str]) -> Type:
