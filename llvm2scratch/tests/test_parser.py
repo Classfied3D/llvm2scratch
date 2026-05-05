@@ -204,7 +204,8 @@ class ConstantParse(unittest.TestCase):
           result=ResultLocalVar(name=""),
           base_ptr_type=IntegerTy(width=8),
           base_ptr=GlobalPtrVal(type=PointerTy(addrspace=0), name="hi"),
-          indices=[KnownIntVal(type=IntegerTy(width=64), value=8, width=64)])), []))
+          indices=[KnownIntVal(type=IntegerTy(width=64), value=8, width=64)],
+          is_inbounds=False, is_nusw=False, is_nuw=False)), []))
 
   def testParseConv(self):
     self.assertEqual(
