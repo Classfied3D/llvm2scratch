@@ -21,7 +21,7 @@ VARIABLE_MAX_BITS = 48       # Maximum amount of bits to store in a fp variable.
                              # up to 53 bits, some operations require extra precision. This should be more than the regular byte size (8)
                              # and more than PTR_SIZE_BITS (currently 32, see below)
 SCRATCH_LIST_LIMIT = 200_000 # Max elements in a scratch list (without importing a larger list or project.json hacks)
-PTR_SIZE_BITS = 32           # Bits per pointer - this is 32 as we are compiling for a 32 bit system
+PTR_WIDTH_BITS = 32          # Bits per pointer - this is 32 as we are compiling for a 32 bit system
 EXIT_CALL_ID = 0             # Jump table call ID of corresponding to exit
 ENTRY_CALL_ID = 1            # Jump table call ID of corresponding to entry
 START_STACK_RESET_ID = 2     # Starting jump table call ID of stack reset
@@ -269,14 +269,13 @@ def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
       return sum(getByteSize(mem, include_padding) for mem in ty.members)
 
     case ir.PointerTy():
-      return 1 if not include_padding else math.ceil(PTR_SIZE_BITS / 8)
+      return 1 if not include_padding else math.ceil(PTR_WIDTH_BITS / 8)
 
   raise CompException(f"Unknown type: {ty}")
 
-def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], ctx: Context) -> tuple[int, defaultdict[int, list[sb3.Value]]]:
-  # TODO: support negative offsets, except with nuw
+def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], ctx: Context) -> tuple[int, list[tuple[sb3.Value, int, int]]]:
   known_offset: int = 0
-  unknown_offsets: defaultdict[int, list[sb3.Value]] = defaultdict(list)
+  unknown_offsets: list[tuple[sb3.Value, int, int]] = []
 
   is_arr_offset = True
   inner_type = base_ptr_type
@@ -292,10 +291,10 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
       if isinstance(index_val, sb3.Known):
         assert isinstance(index_val.known, (int, float)) and index_val.known.is_integer()
         # Account for negative indices
-        no_twos_comp_known = comptimeUndoTwosComplement(index_width, index_val.known)
+        no_twos_comp_known = comptimeUndoTwosComplement(index_val.known, index_width)
         known_offset += int(no_twos_comp_known) * offset_size
       else:
-        unknown_offsets[offset_size].append(index_val)
+        unknown_offsets.append((index_val, index_width, offset_size))
     else:
       # A struct offset
       assert isinstance(inner_type, ir.StructTy)
@@ -314,6 +313,91 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
     is_arr_offset = isinstance(inner_type, ir.ArrayTy)
 
   return known_offset, unknown_offsets
+
+def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tuple[sb3.Value, int, int]], ctx: Context) -> sb3.Value:
+  """
+  Applies GEP offsets to a base pointer. Accepts unknown_offsets of a list of (index_val, index_width, multiplier) where multiplier
+  is the size of the value multiplied by in the GEP.
+  """
+
+  max_intermediate = 2**INTERMEDIATE_MAX_BITS
+
+  twos_comp_sum: list[tuple[sb3.Value, int, int]] = []
+  rev_twos_comp: list[tuple[sb3.Value, int, int]] = []
+
+  for item in unknown_offsets:
+    _, index_width, multiplier = item
+    if index_width != PTR_WIDTH_BITS or 2**PTR_WIDTH_BITS + multiplier * 2**index_width >= max_intermediate:
+      # If the index is too large to multiply by multiplier without unsigned
+      # overflow for -ve values OR the index is not 32 bits wide we should
+      # reverse two's complement
+      rev_twos_comp.append(item)
+    else:
+      # We can use the fact that multiplication and additions with a 32 bit
+      # two's complement number is the same as it's reversed value under mod 2^32
+      twos_comp_sum.append(item)
+
+  # Sort from smallest 2^width * multiplier upward, meaning that fewer offset
+  # magnitude reductions are required
+  sort_func = lambda k: 2**k[1] * k[2]
+  twos_comp_sum.sort(key=sort_func)
+  rev_twos_comp.sort(key=sort_func)
+
+  # Don't multiply by one
+  multiply_offset = lambda offset, multiplier: sb3.Op("mul", sb3.Known(multiplier), offset) \
+                                               if multiplier != 1 else offset
+
+  final_val = base
+  cuml_offset = known_offset
+
+  for index_val, index_width, multiplier in rev_twos_comp:
+    rev, rev_offset = undoTwosComplementWithOffset(index_val, index_width)
+    this_offset = rev_offset * multiplier
+
+    # If the multiplier * min value due to reverse two's comp is too large,
+    # we need to add before multipling
+    if multiplier * 2**index_width >= max_intermediate:
+      rev = sb3.Op("add", rev, sb3.Known(rev_offset))
+      this_offset = 0
+
+    # If the offset is too large that it would make the final offset larger
+    # than the intermediate value, then add that offset early and bring
+    # it back to a reasonable value
+    if cuml_offset + this_offset >= max_intermediate:
+      final_val = sb3.Op("add", final_val, sb3.Known(cuml_offset))
+      cuml_offset = 0
+
+    cuml_offset += this_offset
+    final_val = sb3.Op("add", final_val, multiply_offset(rev, multiplier))
+
+  # Add any leftover offset
+  if cuml_offset != 0:
+    final_val = sb3.Op("add", final_val, sb3.Known(cuml_offset))
+
+  # Sum of index * width should index appropriately into memory, so it is safe
+  # to assume it takes a reasonable value with reversed two's complement values
+  cuml_max_val = (10 * ctx.cfg.memory_size) if len(rev_twos_comp) > 0 else 0
+  # If we are adding two's comp numbers, we need to ensure that we use mod at the
+  # end in order to wrap it back around
+  final_mod_step = len(twos_comp_sum) > 0
+
+  for index_val, index_width, multiplier in twos_comp_sum:
+    this_max_val = multiplier * 2**index_width
+
+    # If the value would be too large, then add a mod step earlier to keep it within
+    # the intermediate range
+    if cuml_max_val + this_max_val >= max_intermediate:
+      final_val = sb3.Op("mod", final_val, sb3.Known(2**PTR_WIDTH_BITS))
+      max_val = 2**PTR_WIDTH_BITS
+
+    cuml_max_val += this_max_val
+    final_val = sb3.Op("add", final_val, multiply_offset(index_val, multiplier))
+
+  if final_mod_step:
+    # Make the final number in bounds of two's complement
+    final_val = sb3.Op("mod", final_val, sb3.Known(2**PTR_WIDTH_BITS))
+
+  return final_val
 
 def padValue(val: ValueAndBlocks | IdxbleValueAndBlocks, size: int) -> ValueAndBlocks | IdxbleValueAndBlocks:
   """
@@ -444,7 +528,7 @@ def transValue(val: ir.Value,
               # make sure to padValue if zero extending
               int_ty = expr.value.type if expr.opcode == ir.ConvOpcode.IntToPtr else expr.res_type
               assert isinstance(int_ty, ir.IntegerTy)
-              assert int_ty.width == PTR_SIZE_BITS
+              assert int_ty.width == PTR_WIDTH_BITS
 
               # No-op
               return transValue(expr.value, ctx, bctx, is_global_init, include_padding)
@@ -548,10 +632,10 @@ def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
 
   return name, offset, ctx
 
-def twosComplement(width: int, val: sb3.Value) -> sb3.Value:
+def twosComplement(val: sb3.Value, width: int) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
 
-def undoTwosComplementWithOffset(width: int, val: sb3.Value) -> tuple[sb3.Value, int]:
+def undoTwosComplementWithOffset(val: sb3.Value, width: int) -> tuple[sb3.Value, int]:
   """
   Returns (value, offset), where value + offset is the reverse two's complement of the input value with
   a two's complement of width. Offset is always equal to 2^(width - 1) - 1.
@@ -565,14 +649,14 @@ def undoTwosComplementWithOffset(width: int, val: sb3.Value) -> tuple[sb3.Value,
     (2 ** (width - 1) - 1)
   )
 
-def undoTwosComplement(width: int, val: sb3.Value) -> sb3.Value:
+def undoTwosComplement(val: sb3.Value, width: int) -> sb3.Value:
   """Reverses a two's complement of width on value"""
 
-  value, offset = undoTwosComplementWithOffset(width, val)
+  value, offset = undoTwosComplementWithOffset(val, width)
 
   return sb3.Op("add", value, sb3.Known(offset))
 
-def comptimeUndoTwosComplement(width: int, val: int | float) -> int | float:
+def comptimeUndoTwosComplement(val: int | float, width: int) -> int | float:
   if val >= 2**(width-1):
     val -= 2**width
   return val
@@ -1402,10 +1486,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_exact:
-            signed_left = undoTwosComplement(width, left)
-            signed_right = undoTwosComplement(width, right)
+            signed_left = undoTwosComplement(left, width)
+            signed_right = undoTwosComplement(right, width)
 
-            res_val = twosComplement(width, sb3.Op("div", signed_left, signed_right))
+            res_val = twosComplement(sb3.Op("div", signed_left, signed_right), width)
           else:
             left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
             right, rblocks = flatAsTuple(optimizeValueUse(right, 2, ctx))
@@ -1814,13 +1898,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
         case ir.ConvOpcode.SIToFP:
           assert isinstance(from_ty, ir.IntegerTy)
-          res_val = undoTwosComplement(from_ty.width, value)
+          res_val = undoTwosComplement(value, from_ty.width)
 
         case ir.ConvOpcode.PtrToInt | ir.ConvOpcode.PtrToAddr | ir.ConvOpcode.IntToPtr:
           # TODO: truncation and zero extension if int type is different width to pointer
           int_ty = instr.value.type if instr.opcode == ir.ConvOpcode.IntToPtr else instr.res_type
           assert isinstance(int_ty, ir.IntegerTy)
-          assert int_ty.width == PTR_SIZE_BITS
+          assert int_ty.width == PTR_WIDTH_BITS
 
           # No-op
           res_val = value
@@ -1852,7 +1936,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"integers or pointers, got type {type(instr.left.type)}")
 
-      width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else PTR_SIZE_BITS
+      width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else PTR_WIDTH_BITS
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
         raise CompException(f"Instruction icmp currently supports "
@@ -1987,25 +2071,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
 
-      offsets: list[sb3.Value] = []
-      if known_offset != 0:
-        offsets.append(sb3.Known(known_offset))
-
-      for offset_size, sized_offsets in unknown_offsets.items():
-        assert len(sized_offsets) > 0 # Shouldn't happen with default dict
-        total_sized_offsets = sized_offsets[0]
-        for sized_offset in sized_offsets[1:]:
-          total_sized_offsets = sb3.Op("add", total_sized_offsets, sized_offset)
-
-        if offset_size > 1:
-          offsets.append(sb3.Op("mul", sb3.Known(offset_size), total_sized_offsets))
-        else:
-          # Crazy optimization right here
-          offsets.append(total_sized_offsets)
-
-      offset_ptr = base_ptr.value
-      for offset in offsets:
-        offset_ptr = sb3.Op("add", offset_ptr, offset)
+      offset_ptr = applyGepOffsets(base_ptr.value, known_offset, unknown_offsets, ctx)
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2028,7 +2094,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       match instr.value.type:
         case ir.IntegerTy() | ir.PointerTy():
           width = instr.value.type.width if isinstance(instr.value.type, ir.IntegerTy) \
-            else PTR_SIZE_BITS
+            else PTR_WIDTH_BITS
 
           # Works with NaN, Infinity, invalid values (mod turns infinity to NaN but
           # floor doesn't, so doesn't work other way around)
