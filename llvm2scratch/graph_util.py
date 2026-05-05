@@ -3,9 +3,10 @@ from dataclasses import dataclass, field
 from copy import deepcopy
 
 from scipy.sparse import csc_array
-import networkx as nx
+import igraph as ig
 import numpy as np
 import itertools
+import math
 
 @dataclass
 class NodeInfo:
@@ -53,22 +54,35 @@ class CallGraphAnalysis:
       self.analyzed = set()
 
 def findNodesWithCycle(graph: dict[str, list[str]]) -> set[str]:
-  g = nx.DiGraph(graph)
-  return {
-    node
-    for scc in nx.strongly_connected_components(g)
-    if len(scc) > 1
-    for node in scc
-  } | set(nx.nodes_with_selfloops(g))
+  nodes = list(graph.keys())
+  node_idx = {n: i for i, n in enumerate(nodes)}
+  edges = [(node_idx[u], node_idx[v]) for u in graph for v in graph[u]]
+  g = ig.Graph(directed=True)
+  g.add_vertices(len(nodes))
+  g.add_edges(edges)
+
+  sccs = g.components(mode="STRONG")
+  result = {
+    nodes[v]
+    for comp in sccs
+    if len(comp) > 1
+    for v in comp
+  }
+
+  self_loops = {nodes[e.tuple[0]] for e in g.es if e.tuple[0] == e.tuple[1]}
+  return result | self_loops
 
 def selectCycleChecks(graph: dict[str, list[str]]) -> list[str]:
   # TODO: if graph has a very large amount of cycles, then use findNodesWithCycle instead
-  # Find all cycles
-  g = nx.DiGraph(graph)
-  nodes = sorted(g.nodes())
+  nodes = sorted(graph.keys())
   node_idx = {n: i for i, n in enumerate(nodes)}
-  g_int = nx.relabel_nodes(g, node_idx)
-  cycles = list(nx.simple_cycles(g_int))
+  edges = [(node_idx[u], node_idx[v]) for u in graph for v in graph[u]]
+
+  g = ig.Graph(directed=True)
+  g.add_vertices(len(nodes))
+  g.add_edges(edges)
+
+  cycles = g.simple_cycles()
 
   if not cycles: return []
   # Any node that can call itself must have a stack check; therefore we can ignore cycles
@@ -129,17 +143,32 @@ def greedyHittingSet(cycles: list[list[int]], nodes: list[str]) -> list[int]:
   return np.flatnonzero(soln).tolist()
 
 def unavoidableNodes(graph: dict[str, list[str]], source: str, target: str) -> set[str]:
-  g = nx.DiGraph(graph)
-  dominators = nx.immediate_dominators(g, source)
+  nodes = list(graph.keys())
+  node_idx = {n: i for i, n in enumerate(nodes)}
+  edges = [(node_idx[u], node_idx[v]) for u in graph for v in graph[u]]
 
-  if target not in dominators:
+  g = ig.Graph(directed=True)
+  g.add_vertices(len(nodes))
+  g.add_edges(edges)
+
+  source_idx = node_idx[source]
+  target_idx = node_idx.get(target, None)
+
+  if target_idx is None:
+    return {source}
+
+  idom = g.dominator(source_idx, mode="OUT")
+
+  if idom[target_idx] == -1:
     return {source}
 
   unavoidable = set()
-  node = target
-  while node != source:
-    unavoidable.add(node)
-    node = dominators[node]
+  node = target_idx
+  while node != source_idx:
+    if math.isnan(node):
+      break
+    unavoidable.add(nodes[node])
+    node = idom[node]
   unavoidable.add(source)
 
   return unavoidable
