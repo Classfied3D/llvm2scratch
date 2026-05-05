@@ -347,6 +347,9 @@ class GetElementPtr(Instr, HasResult):
   base_ptr_type: Type
   base_ptr: Value
   indices: list[Value]
+  is_inbounds: bool
+  is_nusw: bool
+  is_nuw: bool
 
 @dataclass
 class Conversion(Instr, HasResult):

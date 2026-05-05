@@ -594,7 +594,15 @@ def parseTypeConstantTokens(tokens: list[str], structs: dict[str, StructTy], fun
     assert isinstance(base_ptr.type, PointerTy)
 
     return ConstExprVal(ty,
-      GetElementPtr(ResultLocalVar(""), base_ptr_type, base_ptr, parsed_parts[1:])), tokens[i+1:]
+      GetElementPtr(
+        ResultLocalVar(""),
+        base_ptr_type,
+        base_ptr,
+        parsed_parts[1:],
+        False, False, False, # Shouldn't matter to the compiler for a known offset
+                             # TODO constant GEP keywords
+      )
+    ), tokens[i+1:]
 
   elif tokens[0] == "extractelement":
     agg, idx = getConstExprBracketValues(tokens[1], 2, structs, func_names)

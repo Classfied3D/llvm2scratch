@@ -264,21 +264,33 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
       index_values = [decodeValue(idx, mod, structs, func_names) for idx in indices]
 
       rest = raw_instr_no_res.split("getelementptr ", 1)[1].strip()
-      keywords = ["inbounds", "inrange", "nusw", "nsw", "nuw"]
+      all_keywords = {"inbounds", "inrange", "nusw", "nuw"}
+      keywords: set[str] = set()
       has_keyword = True
       while has_keyword:
         has_keyword = False
-        for kw in keywords:
+        for kw in all_keywords:
           if rest.startswith(kw):
+            keywords.add(kw)
             if kw != "inrange":
               rest = rest.removeprefix(kw + " ")
             else:
               kw = kw.split(")", 1)[-1]
             has_keyword = True
 
+      is_inbounds = "inbounds" in keywords
+
       ptr_type, _ = parseTypeTokens(parseUntilComma(rest), structs)
 
-      return GetElementPtr(result, ptr_type, decodeValue(base_ptr, mod, structs, func_names), index_values)
+      return GetElementPtr(
+        result,
+        ptr_type,
+        decodeValue(base_ptr, mod, structs, func_names),
+        index_values,
+        "inbounds" in keywords,
+        "nusw" in keywords,
+        "nuw" in keywords,
+      )
 
     case "trunc" | "zext" | "sext" | "fptrunc" | "fpext" | "fptoui" | "fptosi" | \
          "uitofp" | "sitofp" | "ptrtoint" | "ptrtoaddr" | "inttoptr" | "bitcast" | \
