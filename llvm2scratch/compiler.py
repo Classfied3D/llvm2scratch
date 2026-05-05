@@ -644,6 +644,9 @@ def undoTwosComplementWithOffset(val: sb3.Value, width: int) -> tuple[sb3.Value,
   # e.g. with 8 bits: output = ( ( input + 129 ) mod -256 ) + 127
   # this reverses two's complement in 3 values and only uses the input value once, as well as providing
   # an offset which can be optimized somewhere else with the power of maths
+
+  # ( ( input + 2^(N/2) ) mod 2^N ) - 2^(N/2) would also work but this is way cooler so I'm keeping it
+
   return (
     sb3.Op("mod", sb3.Op("add", val, sb3.Known(2 ** (width - 1) + 1)), sb3.Known(-(2 ** width))),
     (2 ** (width - 1) - 1)

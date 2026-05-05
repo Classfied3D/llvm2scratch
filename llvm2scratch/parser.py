@@ -407,8 +407,9 @@ def decodeModule(mod: llvm.ModuleRef) -> Module:
     start += 1
 
     end = start
-    while not tokens[end].endswith(","):
+    while end < len(tokens) - 1 and not tokens[end].endswith(","):
       end += 1
+
     if tokens[end] == ",":
       end -= 1
     else:
