@@ -3377,6 +3377,12 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Return value is set above.
   ]), ctx)
 
+  # Changing the volume at all forces scratch to render a
+  # frame, even in a run without screen refresh procedure
+  ctx = addFunc("SB3_render", [], sb3.BlockList([
+    sb3.EditVolume("change", sb3.Known(0)),
+  ]), ctx)
+
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
@@ -3392,7 +3398,24 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.Say(sb3.GetParameter(localizeParameter("input"))),
   ]), ctx)
 
+  # Wait at least duration seconds while rendering
+  # Like wait seconds block, but don't stop rendering
+  # like wait block in a no screen refresh procedure
+  # TODO use timer blocks instead of days since 2000
+  # to consider turbowarp's pausing in calculations
   ctx = addFunc("SB3_wait", ["duration"], sb3.BlockList([
+    sb3.EditVar("set", "end", sb3.Op("add",
+      sb3.DaysSince2000(),
+      sb3.Op("div", sb3.GetParameter(localizeParameter("duration")), sb3.Known(24*60*60)))),
+    # Always wait a frame, even for negative values, just like the wait block in scratch
+    sb3.ProcedureCall("SB3_render", []),
+    sb3.ControlFlow("until", sb3.BoolOp(">", sb3.DaysSince2000(), sb3.GetVar("end")), sb3.BlockList([
+      sb3.ProcedureCall("SB3_render", []),
+    ])),
+  ]), ctx)
+
+  # Wait at least duration seconds without rendering
+  ctx = addFunc("SB3_wait_no_render", ["duration"], sb3.BlockList([
     sb3.Wait(sb3.GetParameter(localizeParameter("duration"))),
   ]), ctx)
 
@@ -3470,22 +3493,22 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
     # Put startup code in initialization function for run without screen refresh
     sb3.ProcedureCall("!init", []),
   ]))
-  initblocks = sb3.BlockList([sb3.ProcedureDef("!init", [])])
+  init_blocks = sb3.BlockList([sb3.ProcedureDef("!init", [])])
 
   # Setup memory and get global/function ptr addresses
-  init_blocks, ctx = initMemory(mod, ctx)
-  initblocks.add(init_blocks)
-  initblocks.add(initLocalStack(ctx))
+  init_mem, ctx = initMemory(mod, ctx)
+  init_blocks.add(init_mem)
+  init_blocks.add(initLocalStack(ctx))
 
   # Reset debug info on initialisation
   if cfg.do_debug_branch_log:
-    initblocks.add(sb3.EditList("deleteall", cfg.debug_branch_log_var, None, None))
+    init_blocks.add(sb3.EditList("deleteall", cfg.debug_branch_log_var, None, None))
 
     debug_branch_list_length = (ctx.next_fn_id * 2) + 10 # Adding 10 for safety + bc it doesn't really matter
     if debug_branch_list_length > SCRATCH_LIST_LIMIT:
       raise CompException("Too many functions; could not add them all to the recursive branch debug list")
 
-    initblocks.add(sb3.ControlFlow("reptimes", sb3.Known(debug_branch_list_length), sb3.BlockList([
+    init_blocks.add(sb3.ControlFlow("reptimes", sb3.Known(debug_branch_list_length), sb3.BlockList([
       sb3.EditList("addto", cfg.debug_branch_log_var, None, sb3.Known(0))
     ])))
 
@@ -3494,10 +3517,10 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
 
   # Start program after initialization
   start_program_blocks, ctx = transEntrypointCall(ctx)
-  initblocks.add(start_program_blocks)
+  init_blocks.add(start_program_blocks)
 
   # Add init code
-  ctx.proj.code.append(initblocks)
+  ctx.proj.code.append(init_blocks)
 
   # Optimise scratch project
   if cfg.opti:

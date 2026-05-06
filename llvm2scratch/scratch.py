@@ -537,6 +537,26 @@ class CostumeInfo(Value):
   def stringify(self) -> str:
     return f"(costume {self.op})"
 
+# Sounds
+# The set/change volume block is particularily useful as it causes scratch to render a frame, even in a
+# run without screen refresh block
+@dataclass
+class EditVolume(Block):
+  op: Literal["set", "change"]
+  value: Value
+
+  def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
+    raw_vol, ctx = self.value.getRawValue(my_id, ctx, ScratchCast.TO_STR)
+
+    return {
+      "opcode": "sound_setvolumeto" if self.op == "set" else "sound_changevolumeby",
+      "inputs": {"VOLUME": raw_vol},
+    }, ctx
+
+  def stringify(self) -> str:
+    inner = self.value.stringify()
+    return ("set volume to " if self.op == "set" else "change volume by ") + inner
+
 # Events
 # Thank you @RetrogradeDev for this wonderful MIT licensed broadcast code which I have now stolen
 @dataclass
