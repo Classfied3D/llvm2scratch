@@ -24,6 +24,13 @@ project should have included the source code used to compile it, so check the pr
 If you really want to read the generated scratch code (which is quite difficult to understand), the \
 author may have also provided a text version.\
 """
+SCRATCHBLOCKS_MESSAGE = """\
+(::ring)Compiled with llvm2scratch!(::ring)::extension ring // Special blocks used internally by the compiler
+(bool as int <>::extension) // This converts a boolean to an int using the round(_) block if necessary
+(str to float ()::extension) // This converts a string to a float using the (_ + 0) block if necessary
+<true::extension> // Known true block using the <not <>> block
+<false::extension> // Known false block using an empty boolean input\
+"""
 DEFAULT_BROADCAST_MESSAGE = "message1"
 COUNTER_REPLACEMENT_NAME = "!control:counter"
 EMPTY_SVG = """<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="0" height="0" viewBox="0,0,0,0"></svg>"""
@@ -107,8 +114,14 @@ class Project:
     """Exports the project into a .sb3/.sprite3 file"""
     exportScratchFile(self.getCtx(), filename, format)
 
-  def stringify(self):
-    return "\n\n".join(l.stringify() for l in self.code)
+  def stringify(self, scratch_blocks: bool=False):
+    """
+    Convert project to readable text. If "scratch_blocks" is True then
+    output text compatible with scratchblocks
+    """
+    res = SCRATCHBLOCKS_MESSAGE + "\n\n" if scratch_blocks else ""
+    res += "\n\n".join(l.stringify(scratch_blocks) for l in self.code)
+    return res
 
   def addCostume(self, name: str) -> int:
     """Adds a costume and returns its costume number"""
@@ -290,7 +303,8 @@ class Block():
   def isEnd(self) -> bool:
     return False
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
+    """Convert to readable text. If "sb" is True then output text compatible with scratchblocks"""
     raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
 
 @dataclass
@@ -377,8 +391,9 @@ class BlockList:
   def __len__(self) -> int:
     return len(self.blocks)
 
-  def stringify(self) -> str:
-    return "\n".join(b.stringify() for b in self.blocks)
+  def stringify(self, sb: bool=False) -> str:
+    """Convert to readable text. If "sb" is True then output text compatible with scratchblocks"""
+    return "\n".join(b.stringify(sb) for b in self.blocks)
 
 @dataclass
 class RawBlock(Block):
@@ -394,7 +409,8 @@ class Value:
     """Gets the json that can be put in the "inputs" field of a block"""
     raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
+    """Convert to readable text. If "sb" is True than output text compatible with scratchblocks"""
     raise ScratchCompException("Cannot stringify for generic type 'Value'; must be a derived class")
 
 @dataclass
@@ -424,7 +440,7 @@ class Known(Value):
 
     return [1, val], ctx
 
-  def getRawVarInit(self, preserve_booleans=True) -> str | float | bool:
+  def getRawVarInit(self, preserve_booleans: bool=True) -> str | float | bool:
     """
     Get the raw value to set a var to when it starts with this value
     preserve_booleans - if enabled store booleans as strings, otherwise
@@ -449,8 +465,11 @@ class Known(Value):
 
     return raw
 
-  def stringify(self) -> str:
-    return f'"{self.known}"' if isinstance(self.known, str) else f"{self.getRawVarInit()}"
+  def stringify(self, sb: bool=False, dropdown: bool=False) -> str:
+    if not sb:
+      return f'"{self.known}"' if isinstance(self.known, str) else f"{self.getRawVarInit()}"
+    else:
+      return knownToScratchBlocks(self.known, dropdown)
 
 @dataclass
 class KnownBool(Known, BooleanValue):
@@ -469,8 +488,11 @@ class KnownBool(Known, BooleanValue):
     """Get the raw value to set a var to when it starts with this value"""
     return "true" if self.known else "false"
 
-  def stringify(self):
-    return f"<{self.getRawVarInit()}>"
+  def stringify(self, sb: bool=False, dropdown: bool=False):
+    if not sb:
+      return f"<{self.getRawVarInit()}>"
+    else:
+      return knownToScratchBlocks(self.known, dropdown)
 
 # Looks
 @dataclass
@@ -486,8 +508,8 @@ class Say(Block):
       }
     }, ctx
 
-  def stringify(self) -> str:
-    return f"say {self.value.stringify()}"
+  def stringify(self, sb: bool=False) -> str:
+    return f"say {self.value.stringify(sb)}"
 
 @dataclass
 class SwitchCostume(Block):
@@ -515,8 +537,12 @@ class SwitchCostume(Block):
       "inputs": {"COSTUME": raw_name},
     }, ctx
 
-  def stringify(self) -> str:
-    return f"switch costume to {self.value.stringify()}"
+  def stringify(self, sb: bool=False) -> str:
+    if sb and isinstance(self.value, Known):
+      inner = self.value.stringify(sb, dropdown=True)
+    else:
+      inner = self.value.stringify(sb)
+    return f"switch costume to {inner}"
 
 @dataclass
 class CostumeInfo(Value):
@@ -534,8 +560,11 @@ class CostumeInfo(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
-    return f"(costume {self.op})"
+  def stringify(self, sb: bool=False) -> str:
+    if sb:
+      return f"(costume [{self.op} v])"
+    else:
+      return f"(costume {self.op})"
 
 # Sounds
 # The set/change volume block is particularily useful as it causes scratch to render a frame, even in a
@@ -553,8 +582,8 @@ class EditVolume(Block):
       "inputs": {"VOLUME": raw_vol},
     }, ctx
 
-  def stringify(self) -> str:
-    inner = self.value.stringify()
+  def stringify(self, sb: bool=False) -> str:
+    inner = self.value.stringify(sb)
     return ("set volume to " if self.op == "set" else "change volume by ") + inner
 
 # Events
@@ -582,8 +611,12 @@ class Broadcast(Block):
       "inputs": {"BROADCAST_INPUT": raw_value},
     }, ctx
 
-  def stringify(self) -> str:
-    return f"broadcast {self.value.stringify()}" + (" and wait" if self.wait else "")
+  def stringify(self, sb: bool=False) -> str:
+    if sb and isinstance(self.value, Known):
+      inner = self.value.stringify(sb, dropdown=True)
+    else:
+      inner = self.value.stringify(sb)
+    return f"broadcast {self.value.stringify(sb)}" + (" and wait" if self.wait else "")
 
 @dataclass
 class OnBroadcast(StartBlock):
@@ -597,8 +630,8 @@ class OnBroadcast(StartBlock):
       "fields": {"BROADCAST_OPTION": [self.name, id]}
     }, ctx
 
-  def stringify(self) -> str:
-    return f"when I recieve {self.name}"
+  def stringify(self, sb: bool=False) -> str:
+    return f"when I recieve " + ("[" * sb) + self.name + (" v]" * sb)
 
 # Control
 @dataclass
@@ -608,7 +641,7 @@ class OnStartFlag(StartBlock):
       "opcode": "event_whenflagclicked"
     }, ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     return f"when green flag clicked"
 
 FlowOp = Literal["if", "if_else", "reptimes", "until", "while", "forever"]
@@ -671,10 +704,10 @@ class ControlFlow(Block):
       "inputs": inputs
     }, ctx
 
-  def indent(self, input: BlockList) -> str:
-    return "\n".join("  " + x for x in input.stringify().split("\n"))
+  def indent(self, input: BlockList, sb: bool=False) -> str:
+    return "\n".join("  " + x for x in input.stringify(sb).split("\n"))
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     res = {
       "if": "if",
       "if_else": "if",
@@ -682,10 +715,28 @@ class ControlFlow(Block):
       "while": "while",
       "reptimes": "repeat",
       "forever": "forever"
-    }[self.op] + (" " + self.value.stringify() if self.value is not None else "") \
-               + "\n" + self.indent(self.blocks)
+    }[self.op]
+
+    if self.value is not None:
+      res += " " + self.value.stringify(sb)
+
+    if sb:
+      if self.op == "while":
+        res += " {"
+      elif self.op in {"if", "if_else"}:
+        res += " then"
+
+    res += "\n" + self.indent(self.blocks, sb)
+
     if self.else_blocks is not None:
-      res += "\nelse\n" + self.indent(self.else_blocks)
+      res += "\nelse\n" + self.indent(self.else_blocks, sb)
+
+    if sb:
+      if self.op == "while":
+        res += "\n}@loopArrow::control"
+      else:
+        res += "\nend"
+
     return res
 
   def isEnd(self) -> bool:
@@ -701,8 +752,10 @@ class StopScript(EndBlock):
       "fields": {"STOP_OPTION": ["all" if self.op == "stopall" else "this script", None]}
     }, ctx
 
-  def stringify(self) -> str:
-    return "stop this script" if self.op == "stopthis" else "stop all"
+  def stringify(self, sb: bool=False) -> str:
+    op = "this script" if self.op == "stopthis" else "stop all"
+    if sb: op = f"[{op} v]"
+    return f"stop {op}"
 
 @dataclass
 class GetCounter(Value):
@@ -720,8 +773,8 @@ class GetCounter(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
-    return "(counter)"
+  def stringify(self, sb: bool=False) -> str:
+    return "(counter)" if not sb else "(counter::control)"
 
 @dataclass
 class EditCounter(Block):
@@ -739,8 +792,9 @@ class EditCounter(Block):
       "opcode": "control_incr_counter" if self.op == "incr" else "control_clear_counter",
     }, ctx
 
-  def stringify(self) -> str:
-    return "increment counter" if self.op == "incr" else "clear counter"
+  def stringify(self, sb: bool=False) -> str:
+    return ("increment counter" if self.op == "incr" else "clear counter") \
+         + ("::control" if sb else "")
 
 @dataclass
 class Wait(Block):
@@ -755,8 +809,8 @@ class Wait(Block):
       },
     }, ctx
 
-  def stringify(self) -> str:
-    return f"wait {self.duration.stringify()} seconds"
+  def stringify(self, sb: bool=False) -> str:
+    return f"wait {self.duration.stringify(sb)} seconds"
 
 # Sensing
 @dataclass
@@ -772,8 +826,8 @@ class Ask(Block):
       }
     }, ctx
 
-  def stringify(self) -> str:
-    return f"ask {self.value.stringify()} and wait"
+  def stringify(self, sb: bool=False) -> str:
+    return f"ask {self.value.stringify(sb)} and wait"
 
 @dataclass
 class GetAnswer(Value):
@@ -786,7 +840,7 @@ class GetAnswer(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     return "(answer)"
 
 @dataclass
@@ -800,7 +854,7 @@ class DaysSince2000(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     return "(days since 2000)"
 
 # Operators
@@ -876,8 +930,25 @@ class Op(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
-    return f"({self.op} {self.left.stringify()}{'' if self.right is None else ' ' + self.right.stringify()})"
+  def stringify(self, sb: bool=False) -> str:
+    left = self.left.stringify(sb)
+    right = self.right.stringify(sb) if self.right is not None else None
+    match self.op:
+      case "add" | "sub" | "mul" | "div" | "mod":
+        fmt_op = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "mod"}[self.op]
+        return f"({left} {fmt_op} {right})"
+      case "rand_between": return f"(pick random {left} to {right})"
+      case "join":         return f"(join {left} {right})"
+      case "letter_n_of":  return f"(letter {left} of {right})"
+      case "length_of" | "round" | "bool_as_int" | "str_to_float":
+        force_colour = "::extension" if sb and self.op in {"bool_as_int", "str_to_float"} else ""
+        fmt_op = self.op.replace("_", " ")
+        return f"({fmt_op} {left}{force_colour})"
+      case _:
+        if sb:
+          return f"([{self.op} v] of {left})"
+        else:
+          return f"({self.op} of {left})"
 
 BoolOpCodes = Literal["not", "and", "or", "=", "<", ">", "contains"]
 @dataclass
@@ -935,11 +1006,11 @@ class BoolOp(BooleanValue):
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
     return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     if self.right is None:
-      return f"<{self.op} {self.left.stringify()}>"
+      return f"<{self.op} {self.left.stringify(sb)}>"
     else:
-      return f"<{self.left.stringify()} {self.op} {self.right.stringify()}>"
+      return f"<{self.left.stringify(sb)} {self.op} {self.right.stringify(sb)}>"
 
 # Variables
 @dataclass
@@ -950,8 +1021,16 @@ class GetVar(Value):
     id = ctx.addOrGetVar(self.var_name)
     return [3, [12, self.var_name, id]], ctx
 
-  def stringify(self) -> str:
-    return f"({self.var_name})"
+  def stringify(self, sb: bool=False) -> str:
+    if not sb: return f"({self.var_name})"
+    else:
+      name = escapeScratchBlocksStr(self.var_name)
+
+      # Make sure not treated as a number, only as a variable
+      if all([char.isdigit() or char in {"-", "."} for char in name]):
+        name += "::variables"
+
+      return f"({name})"
 
 @dataclass
 class EditVar(Block):
@@ -969,11 +1048,19 @@ class EditVar(Block):
       "fields": {"VARIABLE": [self.var_name, id]}
     }, ctx
 
-  def stringify(self) -> str:
-    if self.op == "set":
-      return f"{self.var_name} = {self.value.stringify()}"
+  def stringify(self, sb: bool=False) -> str:
+    inner = self.value.stringify(sb)
+    if not sb:
+      var = self.var_name
     else:
-      return f"change {self.var_name} by {self.value.stringify()}"
+      var = Known(self.var_name).stringify(sb, dropdown=True)
+
+    if self.op == "set" and not sb:
+      return f"{var} = {inner}"
+    elif self.op == "set":
+      return f"set {var} to {inner}"
+    else:
+      return f"change {var} by {inner}"
 
 @dataclass
 class GetList(Value):
@@ -983,8 +1070,12 @@ class GetList(Value):
     id = ctx.addOrGetList(self.list_name)
     return [3, [13, self.list_name, id]], ctx
 
-  def stringify(self) -> str:
-    return f"(list {self.list_name})"
+  def stringify(self, sb: bool=False) -> str:
+    if not sb:
+      return f"(list {self.list_name})"
+    else:
+      # Ensure scratchblocks doesn't treat the list as a variable
+      return f"({escapeScratchBlocksStr(self.list_name)}::list)"
 
 @dataclass
 class GetOfList(Value):
@@ -1008,11 +1099,16 @@ class GetOfList(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
-    if self.op == "atindex":
-      return f"(item {self.value.stringify()} of {self.list_name})"
+  def stringify(self, sb: bool=False) -> str:
+    if not sb:
+      var = self.list_name
     else:
-      return f"(item # of {self.value.stringify()} in {self.list_name})"
+      var = Known(self.list_name).stringify(sb, dropdown=True)
+
+    if self.op == "atindex":
+      return f"(item {self.value.stringify(sb)} of {var})"
+    else:
+      return f"(item # of {self.value.stringify(sb)} in {var})"
 
 @dataclass
 class GetListLength(Value):
@@ -1029,7 +1125,10 @@ class GetListLength(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
+    if sb:
+      var = Known(self.list_name).stringify(sb, dropdown=True)
+      return f"(length of {var})"
     return f"(length of list {self.list_name})"
 
 @dataclass
@@ -1061,24 +1160,29 @@ class EditList(Block):
       "fields": {"LIST": [self.list_name, list_id]},
     }, ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
+    if not sb:
+      var = self.list_name
+    else:
+      var = Known(self.list_name).stringify(sb, dropdown=True)
+
     match self.op:
       case "addto":
         assert self.item is not None
-        return f"add {self.item.stringify()} to {self.list_name}"
+        return f"add {self.item.stringify(sb)} to {var}"
       case "replaceat":
         assert self.item is not None
         assert self.index is not None
-        return f"replace item {self.index.stringify()} of {self.list_name} with {self.item.stringify()}"
+        return f"replace item {self.index.stringify(sb)} of {var} with {self.item.stringify(sb)}"
       case "insertat":
         assert self.item is not None
         assert self.index is not None
-        return f"insert {self.item.stringify()} at {self.item.stringify()} of {self.list_name}"
+        return f"insert {self.item.stringify(sb)} at {self.item.stringify(sb)} of {var}"
       case "deleteat":
         assert self.index is not None
-        return f"delete {self.index.stringify()} of {self.list_name}"
+        return f"delete {self.index.stringify(sb)} of {var}"
       case "deleteall":
-        return f"delete all of {self.list_name}"
+        return f"delete all of {var}"
       case _:
         raise ValueError(f"Could not find operation {self.op}")
 
@@ -1128,7 +1232,7 @@ class ProcedureDef(StartBlock):
       "inputs": {"custom_block": [1, proto_id]}
     }, ctx
 
-  def stringify(self) -> str:
+  def stringify(self, sb: bool=False) -> str:
     return " ".join(["define", self.name, *(f"({p})" for p in self.params)])
 
 @dataclass
@@ -1157,8 +1261,14 @@ class ProcedureCall(LateBlock):
       }
     }, ctx
 
-  def stringify(self) -> str:
-    return " ".join(["call", self.proc_name, *(a.stringify() for a in self.arguments)])
+  def stringify(self, sb: bool=False) -> str:
+    parts = [self.proc_name, *(a.stringify(sb) for a in self.arguments)]
+    if not sb:
+      parts.insert(0, "call")
+    else:
+      # Force scratchblocks to treat as a custom block, even if it's not defined
+      parts.append("::custom")
+    return " ".join(parts)
 
 @dataclass
 class GetParameter(Value):
@@ -1174,8 +1284,14 @@ class GetParameter(Value):
 
     return [3, id], ctx
 
-  def stringify(self) -> str:
-    return f"(param {self.param_name})"
+  def stringify(self, sb: bool=False) -> str:
+    if not sb:
+      return f"(param {self.param_name})"
+    else:
+      name = escapeScratchBlocksStr(self.param_name)
+      # Force scratchblocks to treat as a parameter, even if it's not in the current
+      # function definition
+      return f"({name}::custom)"
 
 
 class ScratchCompException(Exception):
@@ -1239,6 +1355,45 @@ def scratchCompare(left: Known, right: Known) -> float:
     left_val = scratchCastToStr(left).lower()
     right_val = scratchCastToStr(right).lower()
     return 0 if left_val == right_val else (-1 if left_val < right_val else 1)
+
+def escapeScratchBlocksStr(val: str):
+  # Escape special characters
+  res = val \
+    .replace("\\", "\\\\") \
+    .replace("]", "\\]") \
+    .replace(">", "\\>") \
+    .replace(")", "\\)") \
+    .replace(":", "\\:")
+
+  # Escape " v" so scratchblocks doesn't mistake this as a dropdown
+  if res.endswith(" v"):
+    res = res[:-1] + "\\v"
+
+  return res
+
+def knownToScratchBlocks(val: str | float | bool | int, dropdown: bool=False) -> str:
+  match val:
+    case bool():
+      return "<" + ("true" if val else "false") + "::extension>"
+
+    case int() | float():
+      if int(val) == float(val):
+        val = int(val)
+
+      if val == float("+inf"):
+        return "[Infinity]"
+      elif val == float("-inf"):
+        return "[-Infinity]"
+      elif isinstance(val, float) and math.isnan(val):
+        return "[NaN]"
+
+      return "(" + str(val) + ")"
+
+    case str():
+      return "[" + escapeScratchBlocksStr(val) + (" v" * dropdown) + "]"
+
+    case _:
+      raise ValueError(f"Invalid type: {val}")
 
 def makeEmptyCostume(name: str) -> dict:
   return {

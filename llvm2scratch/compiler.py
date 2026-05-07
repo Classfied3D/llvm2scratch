@@ -168,8 +168,9 @@ class IdxbleValue:
   """A collection of values that can be indexed over (e.g. a string)"""
   vals: list[sb3.Value] = field(default_factory=list)
 
-  def stringify(self):
-    return str([v.stringify() for v in self.vals])
+  def stringify(self, sb: bool=False):
+    """Convert to readable text. If "sb" is True then output text compatible with scratchblocks"""
+    return str([v.stringify(sb) for v in self.vals])
 
 @dataclass
 class IdxbleValueAndBlocks:

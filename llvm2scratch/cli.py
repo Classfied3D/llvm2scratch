@@ -83,10 +83,16 @@ def main():
          "This allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "
          "Disabling this may break programs that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR.")
   parser.add_argument(
-    "--debug-scratch-code",
+    "--debug-scratch-text",
     type=Path,
     default=None,
-    help="Output scratch code to a text file so it can be viewed"
+    help="Output readable scratch code to a text file so it can be viewed"
+  )
+  parser.add_argument(
+    "--debug-scratchblocks",
+    type=Path,
+    default=None,
+    help="Output scratchblocks compatible code to a text file so it can be viewed. See https://scratchblocks.github.io/"
   )
   parser.add_argument(
     "--replace-hacked-blocks",
@@ -148,9 +154,13 @@ def main():
   with open(args.input, "r") as file:
     proj, _ = compiler.compile(file.read(), cfg)
 
-  if args.debug_scratch_code is not None:
-    with open(args.debug_scratch_code, "w") as file:
+  if args.debug_scratch_text is not None:
+    with open(args.debug_scratch_text, "w") as file:
       file.write(proj.stringify())
+
+  if args.debug_scratchblocks is not None:
+    with open(args.debug_scratchblocks, "w") as file:
+      file.write(proj.stringify(scratch_blocks=True))
 
   if args.format == "infer":
     extension = str(args.output).rsplit(".")[-1]
