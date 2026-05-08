@@ -454,7 +454,8 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
   return result
 
 def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListInfo] | None=None,
-  ignore_external_change: set[str] | None=None, is_ending_blocklist=True) -> BlockListInfo:
+  ignore_external_change: set[str] | None=None, is_ending_blocklist: bool=True,
+  inputs_only: bool=False, ignore_inputs: bool=False) -> BlockListInfo:
   """
   Returns what a block list sometimes modifies, always modifies and depends on.
   Ignore external change: a set of variables in which even though might be modified outside
@@ -462,6 +463,11 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
 
   If this blocklist is a repeating substack or a substack not at the end on a toplevel blocklist,
   set is_ending_blocklist to False
+
+  inputs_only - only consider the direct inputs inside a block. This is useful for example, with
+  procedures to distinguish things that are fine to elide
+
+  ignore_inputs - v.v. of inputs_only
   """
   info = BlockListInfo(set(), set(), set(), set(), set())
 
@@ -469,17 +475,20 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
     ignore_external_change = set()
 
   for i, block in enumerate(blocklist.blocks):
-    # Work out what any values used depend on
-    all_value_dependent: set[str] = set()
-    for value in getInputs(block):
-      value_dependent, counts = getValueVarUse(value)
-      all_value_dependent |= value_dependent
-      if isinstance(block, sb3.ControlFlow) and block.op in ["until", "while", "forever"]:
-        # Might be depended on an unlimited amount of times
-        info.use_counts += Counter({key: float("inf") for key in counts})
-      else:
-        info.use_counts += counts
-    info.dependent |= all_value_dependent - info.always_modify
+    if not ignore_inputs:
+      # Work out what any direct inputs vars used depended upon
+      all_value_dependent: set[str] = set()
+      for value in getInputs(block):
+        value_dependent, counts = getValueVarUse(value)
+        all_value_dependent |= value_dependent
+        if isinstance(block, sb3.ControlFlow) and block.op in ["until", "while", "forever"]:
+          # Might be depended on an unlimited amount of times
+          info.use_counts += Counter({key: float("inf") for key in counts})
+        else:
+          info.use_counts += counts
+      info.dependent |= all_value_dependent - info.always_modify
+
+    if inputs_only: continue
 
     is_end_of_blocklist = i == len(blocklist.blocks) - 1
     # If the next block is a stop this script block, then this block is an ending block, regardless
@@ -770,16 +779,37 @@ def assignmentElision(proj: sb3.Project,
         if other_name != name:
           cannot_elide |= other_info.dependent | other_info.might_modify | other_info.always_modify
 
+      # Whether to consider the entire block next iteration
+      consider_whole_block = False
       # Each variable that could be elided and its dependents
       to_elide: dict[str, tuple[set[str], sb3.Value]] = {}
       # A variable's dependents might have changed but it can still be elided if not read after this
       changed_but_unread: dict[str, tuple[set[str], sb3.Value]] = {}
-
+      # Amount of times a variable is used
       var_use_counts: Counter[str] = Counter()
 
-      for i, block in enumerate(blocklist.blocks):
+      i = 0
+      while i < len(blocklist.blocks):
+        block = blocklist.blocks[i]
         is_ending = i == len(blocklist.blocks) - 1
-        use = getBlockListVarUse(sb3.BlockList([block]), recu_fn_info, ignore_external_change, is_ending)
+
+        if consider_whole_block:
+          # Consider the whole block - we only looked at direct inputs last time
+          inputs_only = False
+          consider_whole_block = False
+          ignore_inputs = True
+        else:
+          # For some blocks (procedure calls and control flow blocks that do not re-evaluate the condition,
+          # considering the direct inputs alone without the modifing block means more elisions can be made)
+          inputs_only = isinstance(block, sb3.ProcedureCall) and len(block.arguments) > 0 or \
+            isinstance(block, sb3.ControlFlow) and block.op in {"if", "if_else", "reptimes"}
+          consider_whole_block = inputs_only
+          ignore_inputs = False
+
+        if not consider_whole_block: i += 1
+
+        use = getBlockListVarUse(sb3.BlockList([block]),
+          recu_fn_info, ignore_external_change, is_ending, inputs_only, ignore_inputs)
         var_use_counts += use.use_counts
 
         to_remove = []
