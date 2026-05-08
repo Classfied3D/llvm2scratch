@@ -160,7 +160,7 @@ def main():
 
   if args.debug_scratchblocks is not None:
     with open(args.debug_scratchblocks, "w") as file:
-      file.write(proj.stringify(scratch_blocks=True))
+      file.write(proj.stringify(scratchblocks=True))
 
   if args.format == "infer":
     extension = str(args.output).rsplit(".")[-1]

@@ -14,8 +14,8 @@ import math
 MAIN_SPRITE_NAME = "DONT OPEN" # Incorrect grammar so it can fit in sprite name box lol
                                # Alternatively lowercase uses less horizontal space: Do Not Open could fit
 EMPTY_SPRITE_NAME = "Empty"
-MESSAGE = """\
-WARNING: The 'DONT OPEN' sprite may contain a lot of blocks and cause the scratch editor to crash! \
+EMPTY_SPRITE_COMMENT = f"""\
+WARNING: The '{MAIN_SPRITE_NAME}' sprite may contain a lot of blocks and cause the scratch editor to crash! \
 Make a backup of the project before opening! Also, opening it may cause any project.json tweaks enabled \
 to break (not all projects use these so it should be fine).
 
@@ -114,13 +114,13 @@ class Project:
     """Exports the project into a .sb3/.sprite3 file"""
     exportScratchFile(self.getCtx(), filename, format)
 
-  def stringify(self, scratch_blocks: bool=False):
+  def stringify(self, scratchblocks: bool=False):
     """
-    Convert project to readable text. If "scratch_blocks" is True then
+    Convert project to readable text. If "scratchblocks" is True then
     output text compatible with scratchblocks
     """
-    res = SCRATCHBLOCKS_MESSAGE + "\n\n" if scratch_blocks else ""
-    res += "\n\n".join(l.stringify(scratch_blocks) for l in self.code)
+    res = SCRATCHBLOCKS_MESSAGE + "\n\n" if scratchblocks else ""
+    res += "\n\n".join(l.stringify(scratchblocks) for l in self.code)
     return res
 
   def addCostume(self, name: str) -> int:
@@ -130,7 +130,7 @@ class Project:
 
   def getCtx(self) -> ScratchContext:
     """Converts the project into a ScratchContext which can be used to get the raw project"""
-    ctx = ScratchContext(self.cfg) # pyright: ignore[reportCallIssue] this error only appears sometimes??
+    ctx = ScratchContext(self.cfg)
     for name, scratch_list in self.lists.items():
       ctx.addOrGetList(name, scratch_list)
     for block_list in self.code:
@@ -1010,7 +1010,7 @@ class BoolOp(BooleanValue):
     if self.right is None:
       return f"<{self.op} {self.left.stringify(sb)}>"
     else:
-      return f"<{self.left.stringify(sb)} {self.op} {self.right.stringify(sb)}>"
+      return f"<{self.left.stringify(sb)} {self.op} {self.right.stringify(sb)}" + "?" * (sb and self.op == "contains") + ">"
 
 # Variables
 @dataclass
@@ -1189,7 +1189,7 @@ class EditList(Block):
 # Procedures
 @dataclass
 class ProcedureDef(StartBlock):
-  name: str
+  proc_name: str
   params: list[str]
   run_without_refresh: bool = True
 
@@ -1197,7 +1197,7 @@ class ProcedureDef(StartBlock):
     proto_id = ctx.genId()
     param_ids = [ctx.genId() for _ in self.params]
 
-    ctx.addFunc(self.name, param_ids, self.run_without_refresh)
+    ctx.addFunc(self.proc_name, param_ids, self.run_without_refresh)
 
     param_block_ids = []
     for param in self.params:
@@ -1216,7 +1216,7 @@ class ProcedureDef(StartBlock):
         "tagName": "mutation",
         # Seems to be necessary - while project is still able to run, loading project causes a crash
         "children": [],
-        "proccode": sanitizeProcName(self.name, False) + (" %s" * len(self.params)),
+        "proccode": sanitizeProcName(self.proc_name, False) + (" %s" * len(self.params)),
         "argumentids": json.dumps(param_ids),
         "argumentnames": json.dumps([sanitizeProcName(param, True) for param in self.params]),
         "argumentdefaults": json.dumps(["" for _ in self.params]),
@@ -1233,7 +1233,8 @@ class ProcedureDef(StartBlock):
     }, ctx
 
   def stringify(self, sb: bool=False) -> str:
-    return " ".join(["define", self.name, *(f"({p})" for p in self.params)])
+    name = escapeScratchBlocksStr(self.proc_name) if sb else self.proc_name
+    return " ".join(["define", name, *(f"({p})" for p in self.params)])
 
 @dataclass
 class ProcedureCall(LateBlock):
@@ -1262,7 +1263,8 @@ class ProcedureCall(LateBlock):
     }, ctx
 
   def stringify(self, sb: bool=False) -> str:
-    parts = [self.proc_name, *(a.stringify(sb) for a in self.arguments)]
+    name = escapeScratchBlocksStr(self.proc_name) if sb else self.proc_name
+    parts = [name, *(a.stringify(sb) for a in self.arguments)]
     if not sb:
       parts.insert(0, "call")
     else:
@@ -1463,7 +1465,7 @@ def exportData(ctx: ScratchContext, format: Format) -> str:
           "width": 500,
           "height": 300,
           "minimized": False,
-          "text": MESSAGE
+          "text": EMPTY_SPRITE_COMMENT
         }
       }
 

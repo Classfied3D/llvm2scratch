@@ -711,7 +711,7 @@ def assignmentElision(proj: sb3.Project,
       first_block = blocklist.blocks[0]
       match first_block:
         case sb3.ProcedureDef():
-          name = "func:" + first_block.name
+          name = "func:" + first_block.proc_name
         case sb3.OnBroadcast():
           name = "broadcast:" + first_block.name
         case sb3.OnStartFlag():
