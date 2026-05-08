@@ -42,7 +42,7 @@ class Config:
   memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
-  max_branch_recursion: int = 3000 # Maximum depth of scratch's call stack before resetting it
+  max_branch_recursion: int = 2000 # Maximum depth of scratch's call stack before resetting it
   # If extra padding bytes should be added to each value in memory so that it takes up the
   # space it would normally in bytes. This allows byte indexing to be more accurate at the
   # cost of requiring ~3x more space in the memory list. Disabling this may break programs

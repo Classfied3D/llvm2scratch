@@ -73,7 +73,7 @@ options:
                         recursing; max value is 200,000; default is 512
   --max-branch-recursion MAX_BRANCH_RECURSION
                         Maximum depth of scratch's call stack before resetting it; defaults
-                        to 3000
+                        to 2000
   --no-accurate-byte-spacing
                         Disable extra padding bytes added to each value in memory so that it
                         takes up the space it would normally in bytes. This allows byte
