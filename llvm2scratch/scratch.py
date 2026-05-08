@@ -1365,7 +1365,7 @@ def escapeScratchBlocksStr(val: str):
     .replace("]", "\\]") \
     .replace(">", "\\>") \
     .replace(")", "\\)") \
-    .replace(":", "\\:")
+    .replace("::", "\\:\\:")
 
   # Escape " v" so scratchblocks doesn't mistake this as a dropdown
   if res.endswith(" v"):
