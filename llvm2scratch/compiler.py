@@ -7,6 +7,7 @@ from collections import defaultdict
 from ordered_set import OrderedSet
 from copy import deepcopy
 
+import warnings
 import random
 import math
 
@@ -42,13 +43,17 @@ class Config:
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
   binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 3000 # Maximum depth of scratch's call stack before resetting it
-  accurate_byte_spacing: bool = True # If extra padding bytes should be added to each value in memory so that it takes up the
-                                     # space it would normally in bytes. This allows byte indexing to be more accurate at the
-                                     # cost of requiring ~3x more space in the memory list. Disabling this may break programs
-                                     # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
+  # If extra padding bytes should be added to each value in memory so that it takes up the
+  # space it would normally in bytes. This allows byte indexing to be more accurate at the
+  # cost of requiring ~3x more space in the memory list. Disabling this may break programs
+  # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
+  accurate_byte_spacing: bool = True
   entrypoint: str = "main" # Name of function to call to start the program
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch serializer
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
+  # Any functions which might call a non-existent fn ptr in an unreachable branch.
+  # This defaults to a few clib funcs with this property to avoid warnings
+  no_warn_missing_fn_sig: set[str] = field(default_factory=lambda: {"exit", "__call_exitprocs"})
 
   return_var = "!return value" # Name of the variable for returing values
   mem_var = "!mem" # Name of the list for the memory list
@@ -230,6 +235,10 @@ class Variable:
 
 class CompException(Exception):
   """Exception in the compiler"""
+  pass
+
+class CompWarning(Warning):
+  """Warning in the compiler"""
   pass
 
 def flatAsTuple(obj):
@@ -630,6 +639,13 @@ def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAn
     tmp = genTempVar(ctx)
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
   return ValueAndBlocks(val)
+
+def scratchRuntimeError(message: str) -> sb3.BlockList:
+  return sb3.BlockList([
+    sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetAnswer(), sb3.Known("ignore")), sb3.BlockList([
+      sb3.Ask(sb3.Known(f"L2S ERROR: {message}")),
+    ]))
+  ])
 
 def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
   """
@@ -2329,15 +2345,23 @@ def getFuncPtrAddr(ptr: str, ctx: Context) -> int:
 
   raise CompException(f"Could not find function pointer for {ptr}")
 
-def getFuncPtrSignatureInfo(signature: ir.FuncTy, ctx: Context) -> tuple[int, list[str]]:
+def getFuncPtrSignatureInfo(signature: ir.FuncTy, caller_name: str, ctx: Context,
+    warn_no_matching: bool=True
+  ) -> tuple[int, list[str]] | None:
   """
   Returns (func ptr signature id, func ptrs) for a func ptr signature (inclusive)
+  Returns None if no matching signature was found - this is valid because the path
+  may not necessarily be followed
+  warn_no_matching - whether to warn if there is no matching signature
   """
   for signature_id, (signature_other, ptrs) in enumerate(ctx.fn_ptr_sigs):
     if signature_other == signature:
       return signature_id, ptrs
 
-  raise CompException(f"Could not find function signature for {signature}")
+  # TODO config to disable these warnings
+  if warn_no_matching and caller_name not in ctx.cfg.no_warn_missing_fn_sig:
+    warnings.warn(f"Could not find function signature for {signature} in {caller_name}", CompWarning)
+  return None
 
 def transReturnAddr(return_address: sb3.Value, info: FuncInfo | FuncPtrSigInfo, ctx: Context) -> sb3.BlockList:
   """
@@ -2377,6 +2401,8 @@ def transTerminatorInstr(instr: ir.Instr,
   blocks = sb3.BlockList()
   match instr:
     case ir.Unreachable(): # Never reached if not UB
+      # TODO config to disable these errors
+      blocks.add(scratchRuntimeError("Reached unreachable branch"))
       blocks.end = True
 
     case ir.Ret(): # Return from a func
@@ -2708,14 +2734,19 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
               # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
               # the call instruction's vararg support
               signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
-              signature_id, could_call = getFuncPtrSignatureInfo(signature, ctx)
+              sig_info = getFuncPtrSignatureInfo(signature, fn.name, ctx)
+              is_direct_call = False
 
-              # If function pointer which could only be one thing, then treat as a direct call
-              if len(could_call) == 1:
-                is_direct_call = True
+              if sig_info is None:
+                could_call = []
               else:
-                fn_ptr_sig_called_by[signature_id].add(fn.name)
-                fn_ptr_sig_return_addrs[signature_id].append(localized_call_id)
+                signature_id, could_call = sig_info
+                # If function pointer which could only be one thing, then treat as a direct call
+                if len(could_call) == 1:
+                  is_direct_call = True
+                else:
+                  fn_ptr_sig_called_by[signature_id].add(fn.name)
+                  fn_ptr_sig_return_addrs[signature_id].append(localized_call_id)
 
             if is_direct_call and could_call[0] in defined_func_names:
               return_addresses.setdefault(could_call[0], list())
@@ -2725,7 +2756,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
               if called_name in defined_func_names:
                 calls.add(called_name)
 
-            call_id += 1 # Note: external funcs still contribute to call ids even if unused
+            # Note: external funcs still contribute to call ids even if unused
+            call_id += 1
 
           case ir.Alloca():
             branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type,
@@ -3056,8 +3088,16 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
             # the call instruction's vararg support
             signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
-            signature_id, could_call = getFuncPtrSignatureInfo(signature, ctx)
+            # Don't warn again - we did this earlier in getFnInfo
+            sig_info = getFuncPtrSignatureInfo(signature, bctx.fn.name, ctx, warn_no_matching=False)
 
+            if sig_info is None:
+              # TODO config to disable these errors
+              bctx.code.add(scratchRuntimeError("Unmatched function signature"))
+              bctx.next_call_id += 1
+              continue
+
+            signature_id, could_call = sig_info
             if len(could_call) == 1:
               # Treat as a direct call instead
               callee_info = ctx.fn_info[could_call[0]]
@@ -3067,11 +3107,12 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
               args = [instr.func, *args]
 
           else:
+            if instr.func.name not in ctx.fn_info:
+              raise CompException(f"Could not find function {instr.func.name}")
             callee_info = ctx.fn_info[instr.func.name] if instr.intrinsic is None else None
 
           if instr.intrinsic is not None:
-            instr_code = transIntrinsic(instr.intrinsic, args, result, ctx, bctx)
-            bctx.code.add(instr_code)
+            bctx.code.add(transIntrinsic(instr.intrinsic, args, result, ctx, bctx))
             bctx.next_call_id += 1
 
           else:
@@ -3474,6 +3515,13 @@ def addForeignFunctions(ctx: Context) -> Context:
   # These functions are used in libc in Scratch-Stdlib. Eventually they will be moved there
   # when a sufficient FFI API is supported
 
+  #ctx = addFunc("_exit", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("_exit called"))]), ctx)
+  #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
+  #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
+  #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
+  #ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
+  #ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
+
   # Increment the heap pointer by incr. Currently this does not check for out of memory
   ctx = addFunc("sbrk", ["incr"], sb3.BlockList([
     # Return the old pointer
@@ -3482,12 +3530,8 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("change", ctx.cfg.heap_pointer_var, sb3.GetParameter(localizeParameter("incr"))),
     # TODO check for out of memory, if so return -1 and set @errno
   ]), ctx)
-  #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
-  #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
-  #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
-  #ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
+
   #ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("write called"))]), ctx)
-  #ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
 
   return ctx
 
