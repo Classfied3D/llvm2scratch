@@ -3108,8 +3108,9 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
               args = [instr.func, *args]
 
           else:
-            if instr.func.name not in ctx.fn_info:
+            if instr.intrinsic is None and instr.func.name not in ctx.fn_info:
               raise CompException(f"Could not find function {instr.func.name}")
+
             callee_info = ctx.fn_info[instr.func.name] if instr.intrinsic is None else None
 
           if instr.intrinsic is not None:
