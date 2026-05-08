@@ -94,6 +94,9 @@ class Intrinsic(Enum):
   LifetimeStart = "llvm.lifetime.start"
   LifetimeEnd = "llvm.lifetime.end"
   NoAliasScopeDecl = "llvm.experimental.noalias.scope.decl"
+  Expect = "llvm.expect"
+  ExpectWithProbability = "llvm.expect.with.probability"
+  Assume = "llvm.assume"
 
 @dataclass
 class ResultLocalVar:

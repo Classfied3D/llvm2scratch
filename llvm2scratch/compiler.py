@@ -2541,7 +2541,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
 
   # For some intrinsics, they are no-op, etc and we don't need to translate args
   match intrinsic:
-    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl:
+    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl | ir.Intrinsic.Expect | \
+         ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
       return blocks
 
   metadata: list[ir.MetadataVal] = []
