@@ -8,7 +8,7 @@ from .ir import *
 def getResultLocalVar(instr: llvm.ValueRef) -> ResultLocalVar | None:
   stringified = str(instr).strip()
   if stringified.startswith("%"):
-    return ResultLocalVar(stringified.split("=")[0][1:])
+    return ResultLocalVar(stringified.split("=")[0][1:].strip())
   return None
 
 def decodeType(type: llvm.TypeRef, structs: dict[str, StructTy], func_names: list[str]) -> Type:
