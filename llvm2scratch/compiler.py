@@ -641,6 +641,7 @@ def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAn
   return ValueAndBlocks(val)
 
 def scratchRuntimeError(message: str) -> sb3.BlockList:
+  # TODO: this would be logged to stdout
   return sb3.BlockList([
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetAnswer(), sb3.Known("ignore")), sb3.BlockList([
       sb3.Ask(sb3.Known(f"L2S ERROR: {message}")),
@@ -3515,7 +3516,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   # These functions are used in libc in Scratch-Stdlib. Eventually they will be moved there
   # when a sufficient FFI API is supported
 
-  #ctx = addFunc("_exit", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("_exit called"))]), ctx)
+  ctx = addFunc("_exit", ["status"], sb3.BlockList([
+    # TODO: this would be logged to stdout
+    sb3.Ask(sb3.Op("join", sb3.Known("exit called with status "), sb3.GetParameter(localizeParameter("status")))),
+    sb3.StopScript("stopall"),
+  ]), ctx)
+
   #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
   #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
   #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)

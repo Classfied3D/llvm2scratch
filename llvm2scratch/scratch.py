@@ -1301,8 +1301,10 @@ class ScratchCompException(Exception):
   pass
 
 def sanitizeProcName(name: str, is_param: bool) -> str:
-  """Fixes the Bunching Blocks Bug (https://en.scratch-wiki.info/wiki/My_Blocks#Glitches)
-  and the hasOwnProperty bug by replacing % with a similar unicode character when necessary"""
+  """
+  Fixes the Bunching Blocks Bug (https://en.scratch-wiki.info/wiki/My_Blocks#Glitches)
+  and the hasOwnProperty bug by replacing % with a similar unicode character when necessary
+  """
   if (is_param and name in ["%b", "%n"]) or (not is_param and name == "%"):
     return name.replace("%", "\uFF05")
   elif not is_param and name == "hasOwnProperty":
