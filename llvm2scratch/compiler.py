@@ -1387,27 +1387,29 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         ])))
 
     case ir.Store(): # Copy a value to an address on the stack
-      value = transValue(instr.value, ctx, bctx)
-      blocks.add(value.blocks)
-      value = value.value
-
       address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
       address = address.value
 
-      if isinstance(address, IdxbleValue):
-        raise CompException(f"Address to store cannot be an indexable value in {instr}")
+      # TODO: technically the store should still happen if volatile
+      if not isinstance(instr.value, ir.UndefVal):
+        value = transValue(instr.value, ctx, bctx)
+        blocks.add(value.blocks)
+        value = value.value
 
-      # TODO FIX: properly skip over padding bytes when storing
-      if ctx.cfg.accurate_byte_spacing and isinstance(instr.value.type, (ir.ArrayTy, ir.StructTy)):
-        raise CompException(f"Storing aggregates with accurate padding not supported yet: {instr}")
+        if isinstance(address, IdxbleValue):
+          raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
-      if isinstance(value, sb3.Value):
-        blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.mem_var, address, value)]))
-      else:
-        for offset, val in enumerate(value.vals):
-          offset_val = sb3.Known(offset)
-          blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val))
+        # TODO FIX: properly skip over padding bytes when storing
+        if ctx.cfg.accurate_byte_spacing and isinstance(instr.value.type, (ir.ArrayTy, ir.StructTy)):
+          raise CompException(f"Storing aggregates with accurate padding not supported yet: {instr}")
+
+        if isinstance(value, sb3.Value):
+          blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.mem_var, address, value)]))
+        else:
+          for offset, val in enumerate(value.vals):
+            offset_val = sb3.Known(offset)
+            blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val))
 
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
