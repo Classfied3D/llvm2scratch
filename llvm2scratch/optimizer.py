@@ -878,6 +878,7 @@ def assignmentElision(proj: sb3.Project,
       # Perform the elision
       blocklist, did_elide = assignmentElisionBlock(blocklist, final_elisions)
       did_total_opti |= did_elide
+
     fn_blocks[name] = blocklist
 
   proj.code = list(fn_blocks.values())

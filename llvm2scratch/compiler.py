@@ -54,6 +54,7 @@ class Config:
   mem_var = "!mem" # Name of the list for the memory list
   init_mem_var = "!mem init" # Name of the list for the initialize memory list
   stack_pointer_var = "!stack pointer" # Name of the variable for the stack pointer
+  heap_pointer_var = "!heap pointer" # Name of the variable for the heap pointer
   local_stack_var = "!local stack" # Name of the list to store variables that will be used recursively
   local_stack_size_var = "!local stack size" # Name of the variable to store the label stack's size
   jump_table_id_var = "!call stack reset id" # Name of the variable to store the ID of the current branch on a stack reset
@@ -3213,6 +3214,10 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
     # Reset stack pointer
     sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(starting_stack_ptr)),
 
+    # Reset heap pointer
+    # TODO: this should be part of FFI
+    sb3.EditVar("set", ctx.cfg.heap_pointer_var, sb3.Known(starting_heap_ptr)),
+
     # Saturate memory - it needs to be filled for replace var to work
     sb3.ControlFlow("if", sb3.BoolOp("not", list_is_saturated), sb3.BlockList([
       sb3.EditList("deleteall", ctx.cfg.mem_var, None, None),
@@ -3466,7 +3471,17 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.EditVar("set", ctx.cfg.return_var, sb3.DaysSince2000()),
   ]), ctx)
 
-  #ctx = addFunc("sbrk", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("sbrk called"))]), ctx)
+  # These functions are used in libc in Scratch-Stdlib. Eventually they will be moved there
+  # when a sufficient FFI API is supported
+
+  # Increment the heap pointer by incr. Currently this does not check for out of memory
+  ctx = addFunc("sbrk", ["incr"], sb3.BlockList([
+    # Return the old pointer
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.GetVar(ctx.cfg.heap_pointer_var)),
+    # Increment the heap pointer
+    sb3.EditVar("change", ctx.cfg.heap_pointer_var, sb3.GetParameter(localizeParameter("incr"))),
+    # TODO check for out of memory, if so return -1 and set @errno
+  ]), ctx)
   #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
   #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
   #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)

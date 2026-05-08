@@ -4,7 +4,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Progress
 
-- 🆕 Stack Allocation, Deallocation, Loading + Storing
+- 🆕 Stack + Heap Allocation, Deallocation, Loading + Storing
 - 🔢 Integer (Up to 48 bits) and Float Operations
 - 🔃 Functions + Return Values + Recursion + Function Pointers
 - 🔀 Branch + Switch Instructions
