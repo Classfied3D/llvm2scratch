@@ -113,39 +113,6 @@ minify options:
                         allow this error to occur
 ```
 
-## Info
-
-### How multiplication works
-
-- Scratch uses JS' Number which can store a maximum of [2 ^ 53 - 1](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER) before the accuracy is less than 1
-- This means 32 bit multiplication `(2^32 * 2^32) mod 2^32` does not give the correct result because the number calculated is 2^64 which is not accurate enough (it works with up to 26-bit integers)
-- To resolve this the following maths is used:
-  - Assuming `a`, `a0`, `b1`, `b`, `b0` and `b1` are positive 32-bit integers
-  - Assuming `a0` and `b0` are less than `2^16` (always possible with a 32-bit `a` and `b`)
-  - Where `a = a1 * 2^16 + a0`
-  - And `b = b1 * 2^16 + b0`
-  - Then `(2^32 * 2^32) mod 2^32 = (a1 * 2^16 + a0)(b1 * 2^16 + b0) mod 2 ^ 32`
-  - If we expand the brackets of the second part:
-  - `(a1b1 * 2^32 + (a0b1 + b0a1) * 2^16 + a0b0) mod 2^32`
-  - Then simplify:
-  - `((a0b1 + b0a1) * 2^16 + a0b0) mod 2^32`
-  - Then because `a0`, `a1`, `b0` and `b1` are less than `2^16` the highest number that is calculated is
-  - `((2^16)^2 * 2) * 2^16 + (2^16)^2 = 2^49`
-  - It can be generalised for n bits as
-  - `((a0b1 + b0a1) * 2^floor(n/2) + a0b0) mod 2^n`
-  - We can calculate `a0 = a % mod 2^floor(n/2)`, `a1 = a // 2^floor(n/2)`, etc
-  - This works with up to 34 bits, after which it can be rewritten as
-  - `(((a0b1 + b0a1) mod (2^n / 2^floor(n/2))) * 2^floor(n/2) + a0b0) mod 2^n`
-  - or `(((a0b1 + b0a1) mod 2^ceil(n/2)) * 2^floor(n/2) + a0b0) mod 2^n`
-
-## Planning
-
-- Opti: unused param elision
-- Opti: known list (lookup table) progagation
-- Opti: remove Repeat(Known(1))
-- Opti: `set a (a + n)` -> `change a by n`
-- Opti: `set a (a * 2)` -> `change a by a`
-
 ## Block Perf
 
 ```
@@ -181,3 +148,56 @@ Answer:    0.331
 Cost Num:  0.241
 Cost Name: 0.654
 ```
+
+## Planning
+
+- Opti: unused param elision
+- Opti: known list (lookup table) progagation
+- Opti: remove Repeat(Known(1))
+- Opti: `set a (a + n)` -> `change a by n`
+- Opti: `set a (a * 2)` -> `change a by a`
+
+## Proofs
+
+### Multiplication
+
+- Scratch uses JS' Number which can store a maximum of [2 ^ 53 - 1](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER) before the accuracy is less than 1
+- This means 32 bit multiplication `(2^32 * 2^32) mod 2^32` does not give the correct result because the number calculated is 2^64 which is not accurate enough (it works with up to 26-bit integers)
+- To resolve this the following maths is used:
+  - Assuming `a`, `a0`, `b1`, `b`, `b0` and `b1` are positive 32-bit integers
+  - Assuming `a0` and `b0` are less than `2^16` (always possible with a 32-bit `a` and `b`)
+  - Where `a = a1 * 2^16 + a0`
+  - And `b = b1 * 2^16 + b0`
+  - Then `(2^32 * 2^32) mod 2^32 = (a1 * 2^16 + a0)(b1 * 2^16 + b0) mod 2 ^ 32`
+  - If we expand the brackets of the second part:
+  - `(a1b1 * 2^32 + (a0b1 + b0a1) * 2^16 + a0b0) mod 2^32`
+  - Then simplify:
+  - `((a0b1 + b0a1) * 2^16 + a0b0) mod 2^32`
+  - Then because `a0`, `a1`, `b0` and `b1` are less than `2^16` the highest number that is calculated is
+  - `((2^16)^2 * 2) * 2^16 + (2^16)^2 = 2^49`
+  - It can be generalised for n bits as
+  - `((a0b1 + b0a1) * 2^floor(n/2) + a0b0) mod 2^n`
+  - We can calculate `a0 = a % mod 2^floor(n/2)`, `a1 = a // 2^floor(n/2)`, etc
+  - This works with up to 34 bits, after which it can be rewritten as
+  - `(((a0b1 + b0a1) mod (2^n / 2^floor(n/2))) * 2^floor(n/2) + a0b0) mod 2^n`
+  - or `(((a0b1 + b0a1) mod 2^ceil(n/2)) * 2^floor(n/2) + a0b0) mod 2^n`
+
+### AND/OR/XOR
+
+- AND uses a joint bitmask (via div/floor/modulo/mul) and lookup table approach when one side is known. To take advantage of this in other operations, the following equalities are used:
+  - `A | B = (A & !B) + B`
+  - Proved by:
+    | A | B | A & !B | (A & !B) + B | A \| B |
+    | --- | --- | ------ | ------------ | ------ |
+    | 0 | 0 | 0 | 0 | 0 |
+    | 0 | 1 | 0 | 1 | 1 |
+    | 1 | 0 | 1 | 1 | 1 |
+    | 1 | 1 | 0 | 1 | 1 |
+  - `A ^ B = A - 2(A & B) + B`
+  - Proved by:
+    | A | B | A + B | 2(A & B) | A - 2(A & B) + B | A ^ B |
+    | --- | --- | ----- | -------- | ---------------- | ----- |
+    | 0 | 0 | 0 | 0 | 0 | 0 |
+    | 0 | 1 | 1 | 0 | 1 | 1 |
+    | 1 | 0 | 1 | 0 | 1 | 1 |
+    | 1 | 1 | 2 | 2 | 0 | 0 |

@@ -27,7 +27,7 @@ author may have also provided a text version.\
 SCRATCHBLOCKS_MESSAGE = """\
 (::ring)Compiled with llvm2scratch!(::ring)::extension ring // Special blocks used internally by the compiler
 (bool as int <>::extension) // This converts a boolean to an int using the round(_) block if necessary
-(str to float ()::extension) // This converts a string to a float using the (_ + 0) block if necessary
+(str as float ()::extension) // This converts a string to a float using the (_ + 0) block if necessary
 <true::extension> // Known true block using the <not <>> block
 <false::extension> // Known false block using an empty boolean input\
 """
@@ -61,7 +61,7 @@ SHORT_OP_TO_OPCODE = {
   "indexof": "data_itemnumoflist",
 
   # Operators
-  "str_to_float": "operator_add",
+  "str_as_float": "operator_add",
   "add": "operator_add",
   "sub": "operator_subtract",
   "mul": "operator_multiply",
@@ -858,7 +858,7 @@ class DaysSince2000(Value):
     return "(days since 2000)"
 
 # Operators
-OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_to_float",
+OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_as_int", "str_as_float",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
 @dataclass
 class Op(Value):
@@ -867,7 +867,7 @@ class Op(Value):
   right: Value | None = None
 
   def __post_init__(self):
-    takes_one_op = self.op in ["length_of", "round", "bool_as_int", "str_to_float"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
+    takes_one_op = self.op in ["length_of", "round", "bool_as_int", "str_as_float"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
     given_one_op = self.right is None
 
     if takes_one_op != given_one_op:
@@ -875,12 +875,12 @@ class Op(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     # We don't need to round the number if it gets casted to int anyway
-    if self.op == "bool_as_int" and cast == ScratchCast.TO_INT:
+    if self.op in {"bool_as_int", "str_as_float"} and cast == ScratchCast.TO_INT:
       return self.left.getRawValue(parent, ctx, cast)
 
     id = ctx.genId()
 
-    right = self.right if self.op != "str_to_float" else Known(0)
+    right = self.right if self.op != "str_as_float" else Known(0)
 
     takes_one_op = right is None
 
@@ -940,8 +940,8 @@ class Op(Value):
       case "rand_between": return f"(pick random {left} to {right})"
       case "join":         return f"(join {left} {right})"
       case "letter_n_of":  return f"(letter {left} of {right})"
-      case "length_of" | "round" | "bool_as_int" | "str_to_float":
-        force_colour = "::extension" if sb and self.op in {"bool_as_int", "str_to_float"} else ""
+      case "length_of" | "round" | "bool_as_int" | "str_as_float":
+        force_colour = "::extension" if sb and self.op in {"bool_as_int", "str_as_float"} else ""
         fmt_op = self.op.replace("_", " ")
         return f"({fmt_op} {left}{force_colour})"
       case _:

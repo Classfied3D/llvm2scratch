@@ -23,6 +23,7 @@ VARIABLE_MAX_BITS = 48       # Maximum amount of bits to store in a fp variable.
                              # and more than PTR_SIZE_BITS (currently 32, see below)
 SCRATCH_LIST_LIMIT = 200_000 # Max elements in a scratch list (without importing a larger list or project.json hacks)
 PTR_WIDTH_BITS = 32          # Bits per pointer - this is 32 as we are compiling for a 32 bit system
+BINOP_LOOKUP_BITS = 8        # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
 EXIT_CALL_ID = 0             # Jump table call ID of corresponding to exit
 ENTRY_CALL_ID = 1            # Jump table call ID of corresponding to entry
 START_STACK_RESET_ID = 2     # Starting jump table call ID of stack reset
@@ -41,7 +42,6 @@ class Config:
 
   memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
-  binop_lookup_bits: int = 8 # Amount of bits to use for AND/OR/XOR tables, creates (2**(2*n) elements per table)
   max_branch_recursion: int = 2000 # Maximum depth of scratch's call stack before resetting it
   # If extra padding bytes should be added to each value in memory so that it takes up the
   # space it would normally in bytes. This allows byte indexing to be more accurate at the
@@ -66,8 +66,8 @@ class Config:
   debug_branch_log_var = "!!debug_branch_log" # Name of the list to store debug info (using underscores
                                               # to avoid spaces in exported filename for convenience)
 
-  ascii_lookup_var = "!ascii lookup"
-  pow2_lookup_var = "!pow2 lookup"
+  ascii_lookup_var = "!ASCII lookup"
+  pow2_lookup_var = "!POW2 lookup"
   lowercase_var = "!lowercase"
 
   return_address_local = "return address" # Name of the local variable or parameter to the id of func the return to
@@ -96,6 +96,10 @@ class Context:
   min_func_ptr_addr: int = 0
   # [(func_name, branch_name)]. List of all locations which contain a stack check
   all_check_locations: list[tuple[str, str]] = field(default_factory=list)
+  # Get which lookup tables are needed
+  needs_and_lut: bool = False
+  needs_or_lut: bool = False
+  needs_xor_lut: bool = False
   # Info about a scratch project which can be used in future compilations for optimization
   debug_info: DebugInfo = field(default_factory=DebugInfo)
 
@@ -919,6 +923,389 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
   return IdxbleValueAndBlocks(IdxbleValue(best_sum_nodes), best_blocks)
 
+def sumValueParts(parts: list[sb3.Value], default: int | None=None) -> sb3.Value:
+  if len(parts) == 0:
+    assert default is not None
+    return sb3.Known(default)
+
+  res = parts[0]
+  for i, part in enumerate(parts):
+    if i == 0: continue
+    res = sb3.Op("add", res, part)
+
+  return res
+
+def extractBits(
+    val: sb3.Value, width: int, start: int, bits: int,
+    in_place: bool=False, skip_floor: bool=False
+  ) -> tuple[sb3.Value, int]:
+  """
+  Extract the first 'bits' bits after the 'start + 1'th MSB on an integer 'val' of width 'width'
+  If in_place is True then shift the bits back afterward so they end up back in the same place they started
+  If skip_floor is True the floor of the retured value is equal to the extracted bits
+  Returns (result, shift) where shift is the bit shift used internally
+  """
+  end = start + bits
+  shift = width - end
+  assert start >= 0 and end <= width
+
+  # If we skip floor, than the error will not be corrected by an external floor
+  assert not (in_place and skip_floor)
+
+  res = val
+  # Shift right if necessary
+  if shift != 0:
+    res = sb3.Op("div", val, sb3.Known(2 ** shift))
+    if not skip_floor:
+      res = sb3.Op("floor", res)
+  # Bit mask any extra bits with modulo. It is fine that the input may not be floored
+  if start != 0: res = sb3.Op("mod", res, sb3.Known(2 ** bits))
+  # Shift left if in place
+  if in_place and shift != 0: res = sb3.Op("mul", res, sb3.Known(2 ** shift))
+
+  return res, shift
+
+def getKnownBitGroups(val: int, width: int) -> list[tuple[int, int]]:
+  """Returns [(bit, length)] for each group of similar bits in val, starting from the MSB"""
+  current_bit = None
+  current_len = 0
+  bit_groups: list[tuple[int, int]] = []
+
+  # e.g. with 64 bits [63, 62, ..., 1, 0]
+  for i in range(width - 1, -1, -1):
+    bit = (val >> i) & 1
+    if bit != current_bit:
+      if current_bit is not None: bit_groups.append((current_bit, current_len))
+      current_bit = bit
+      current_len = 0
+    current_len += 1
+
+  assert current_bit is not None
+  bit_groups.append((current_bit, current_len))
+  return bit_groups
+
+def getBinOpLookupTableName(op: Literal["and", "or", "xor"], ctx: Context) -> str:
+  return f"!{op.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
+
+def binOpPartViaLookupTable(
+    op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
+    width: int, start: int, ctx: Context, bits=BINOP_LOOKUP_BITS,
+  ) -> sb3.Value:
+  """
+  Calculates 'bits' of a AND, OR or XOR on two values using a lookup table from the
+  'start'th MSB. The caller is responsible for ensuring the lookup table is created if the result
+  is used. 'bits' must be less than or equal to BINOP_LOOKUP_BITS
+  """
+
+  assert bits <= BINOP_LOOKUP_BITS
+
+  table_name = getBinOpLookupTableName(op, ctx)
+
+  # It is faster for the known value to be left because this means
+  # a multiplication can be skipped
+  if isinstance(rgt, sb3.Known):
+    tmp = lft
+    lft = rgt
+    rgt = tmp
+
+  if width >= bits:
+    # Extract the bits used
+    extracted_lft, shift_l = extractBits(lft, width, start, bits)
+    # We can skip flooring this value as scratch's "get item _ of _" block
+    # floors the index internally
+    extracted_rgt, shift_r = extractBits(rgt, width, start, bits, skip_floor=True)
+    assert shift_l == shift_r
+
+  else:
+    # If the size is small enough that extracting the bits would cause an error,
+    # the extracted values are the original values
+    extracted_lft, extracted_rgt, shift_l = lft, rgt, 0
+
+  # e.g. A & B = and_lookup[A * 256 + B]
+  lookup_index = sb3.Op("add",
+    sb3.Op("mul", extracted_lft, sb3.Known(2 ** BINOP_LOOKUP_BITS)),
+    extracted_rgt,
+  )
+
+  # If the index is 0, "" is returned. We need to ensure this is casted to zero,
+  # so use str_to_float. Most of the time this should be optimized away.
+  res = sb3.Op("str_as_float", sb3.GetOfList("atindex", table_name, lookup_index))
+  # Shift left the result back to put it back in place
+  if shift_l != 0: res = sb3.Op("mul", res, sb3.Known(2 ** shift_l))
+
+  return res
+
+def binOpWithKnownViaLookupTable(
+    op: Literal["and", "or", "xor"], unknown: sb3.Value, known: int,
+    width: int, ctx: Context
+  ) -> sb3.Value:
+  """
+  Calculates AND/OR/XOR against a known value using its lookup table. The caller is
+  responsible for ensuring the respective lookup table is created.
+  """
+
+  # Type checker moment
+  op_literal: Literal["and", "or", "xor"] = op
+
+  i = 0
+  final_offset = 0
+  parts = []
+  while i < width:
+    if op != "xor":
+      # Skip over 0s in AND, skip over 1s in OR
+      skip_over = 0 if op == "and" else 1
+
+      get_shift = lambda i: width - i - 1
+      while i < width and (known >> get_shift(i)) & 1 == skip_over:
+        # If we skipped over a 1 we need to add it to the offset at the end
+        if op == "or":
+          final_offset += 1 << get_shift(i)
+        i += 1
+
+      if i >= width: break
+
+    bits = min(BINOP_LOOKUP_BITS, width - i)
+    parts.append(binOpPartViaLookupTable(op_literal, unknown, sb3.Known(known), width, i, ctx, bits))
+    i += BINOP_LOOKUP_BITS
+
+  if final_offset > 0: parts.append(sb3.Known(final_offset))
+
+  return sumValueParts(parts, default=0)
+
+def binOpWithUnknownViaLookupTable(op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
+    width: int, ctx: Context
+  ) -> sb3.Value:
+  """
+  Calculates AND/OR/XOR between two unknown values using a lookup table. The caller is
+  responsible for ensuring the respective lookup table is created
+  """
+  parts = []
+  for i in range(0, width, BINOP_LOOKUP_BITS):
+    bits = min(BINOP_LOOKUP_BITS, width - i)
+    parts.append(binOpPartViaLookupTable(op, lft, rgt, width, i, ctx, bits))
+
+  return sumValueParts(parts, default=0)
+
+def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Context) -> tuple[list[sb3.Value], bool]:
+  """
+  Calculates AND of a known and unknown value. Returns the ([val], needs_lut) where the
+  sum of the list of values is the result and needs_lut means if a lookup table needs to
+  be created.
+  """
+
+  needs_lut = False
+  current_bit_idx = 0
+  parts = []
+  groups = getKnownBitGroups(known, width)
+  i = 0
+  while current_bit_idx < width:
+    bit, length = groups[i]
+    # X & 0 = 0
+    if bit == 0:
+      current_bit_idx += length
+      i += 1
+      continue
+
+    # Get the next regions in the BINOP_LOOKUP_BITS bits (not including regions cut off by it)
+    j = i
+    next_regions: list[tuple[int, int, int]] = []
+    current_reg_bit_idx = current_bit_idx
+
+    # While the current bit is within the region and we're not out of range
+    region_end = min(current_bit_idx + BINOP_LOOKUP_BITS, width)
+    while current_reg_bit_idx < region_end:
+      reg_bit, reg_len = groups[j]
+
+      # Set the next region, which will be added if it fits
+      current_region = (current_reg_bit_idx, reg_len, j)
+      current_reg_bit_idx += reg_len
+      if reg_bit == 1 and current_reg_bit_idx <= region_end:
+        next_regions.append(current_region)
+
+      j += 1
+      if j >= len(groups): break
+
+    last_region_index = j - 1
+    last_region_cut_off_by = reg_len - (current_reg_bit_idx - region_end)
+
+    # Calculate the cost of extracting the values in each region
+    extract_region = lambda idx, reg_len: extractBits(unknown, width, idx, reg_len, in_place=True)[0]
+    extracted_regions: list[sb3.Value] = []
+    for reg_start, reg_len, _ in next_regions:
+      extracted_regions.append(extract_region(reg_start, reg_len))
+    extract_region_method = sumValueParts(extracted_regions, default=0)
+
+    lookup_table_method = None
+    if len(next_regions) == 0:
+      # There is no advantage to using a lookup table because the region is too large (or zero)
+      use_lut_method = False
+    else:
+      # Don't AND more bits than exist
+      bits = min(BINOP_LOOKUP_BITS, width - current_bit_idx)
+      # Create a new region for the binop lookup table equal to the size of regions it skips over
+      lookup_table_method = opt.simplifyValue(
+        binOpPartViaLookupTable("and", unknown, sb3.Known(known), width, current_bit_idx, ctx, bits))
+      # If it's faster to use a lookup table, then use it!
+      use_lut_method = opt.getValueCost(lookup_table_method) < opt.getValueCost(extract_region_method)
+
+    if use_lut_method:
+      needs_lut = True
+
+      assert lookup_table_method is not None
+      parts.append(lookup_table_method)
+
+      # The lookup table might have AND'd some extra bits not inside the last region. Correct
+      # this by increasing the length of bits in the region before and decreasing the length
+      # of bits in that region
+      old_region = groups[last_region_index]
+      groups[last_region_index] = (old_region[0], old_region[1] - last_region_cut_off_by)
+
+      old_region_before = groups[last_region_index - 1]
+      groups[last_region_index - 1] = (old_region_before[0], old_region_before[1] + last_region_cut_off_by)
+
+      # Set the index to the index after the final region
+      reg_start, _, reg_i = next_regions[-1]
+      i = reg_i + 1
+      current_bit_idx = reg_start + groups[reg_i][1]
+      # If when we changed groups the regions' start was shifted forward, then shift the current
+      # bit forward too
+      if reg_i >= last_region_index:
+        current_bit_idx += last_region_cut_off_by
+
+    else:
+      parts.append(extract_region(current_bit_idx, length))
+      current_bit_idx += length
+      i += 1
+
+  return parts, needs_lut
+
+def andWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) -> tuple[sb3.Value, bool]:
+  """
+  Returns (result, needs_and_lut) where 'result' is the the result and needs_and_lut
+  is if a AND lookup table is required
+  """
+  parts, needs_lut = andWithKnownMaskParts(unknown, known, width, ctx)
+  # Don't break if ANDing with zero
+  return sumValueParts(parts, default=0), needs_lut
+
+def orWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) -> tuple[sb3.Value, bool, bool]:
+  """
+  Returns (result, needs_and_lut, needs_or_lut) where 'result' is the result and
+  needs_abc_lut is if a abc lookup table is required
+  """
+  # a | b = (a & !b) + b, see README for proof
+  not_b = (2 ** width - 1) - known
+  a_and_b, needs_and_lut = andWithKnownMask(unknown, not_b, width, ctx)
+  a_or_b_with_and = sb3.Op("add", a_and_b, sb3.Known(known))
+  a_or_b_specialized_lut = opt.simplifyValue(binOpWithKnownViaLookupTable("or", unknown, known, width, ctx))
+  if opt.getValueCost(a_or_b_with_and) < opt.getValueCost(a_or_b_specialized_lut):
+    return a_or_b_with_and, needs_and_lut, False
+  else:
+    return a_or_b_specialized_lut, False, True
+
+def xorWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) -> tuple[sb3.Value, bool, bool]:
+  """
+  Returns (result, needs_and_lut, needs_xor_lut) where 'result' is the result and
+  needs_abc_lut is if a abc lookup table is required
+  """
+
+  # Special case: a ^ -1. Via the AND path this would be a - 2a + b, but the optimizer
+  # is not smart enough yet to rearrange this to b - a
+  if known == 2 ** width - 1:
+    return sb3.Op("sub", sb3.Known(known), unknown), False, False
+
+  a_and_b_parts, needs_and_lut = andWithKnownMaskParts(unknown, known, width, ctx)
+  # Multiply each coefficient by 2 if there is already a multiplication for each part
+  # otherwise, multiply the sum by two
+  use_parts = True
+  a_and_b_times_2_parts = []
+  for part in a_and_b_parts:
+    if isinstance(part, sb3.Op) and part == "mul" and \
+       isinstance(part.right, sb3.Known) and isinstance(part.right.known, float):
+      part_times_2 = sb3.Op(part.op, part.left, sb3.Known(float(part.right.known) * 2))
+      a_and_b_times_2_parts.append(part_times_2)
+    else:
+      use_parts = False
+      break
+
+  if use_parts:
+    a_and_b_times_2 = sumValueParts(a_and_b_times_2_parts, default=0)
+  else:
+    a_and_b_times_2 = sb3.Op("mul", sumValueParts(a_and_b_parts, default=0), sb3.Known(2))
+
+  # a ^ b = a - 2 * (a & b) + b, see README for proof
+  a_xor_b_with_and = sb3.Op("add", sb3.Op("sub", unknown, a_and_b_times_2), sb3.Known(known))
+  a_xor_b_specialized_lut = opt.simplifyValue(binOpWithKnownViaLookupTable("xor", unknown, known, width, ctx))
+  if opt.getValueCost(a_xor_b_with_and) < opt.getValueCost(a_xor_b_specialized_lut):
+    return a_xor_b_with_and, needs_and_lut, False
+  else:
+    return a_xor_b_specialized_lut, False, True
+
+def binOp(op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
+    width: int, ctx: Context, is_disjoint: bool=False
+  ) -> tuple[sb3.Value, Context]:
+  """
+  Calculates AND/OR/XOR of two values, taking advantage of one of the values being known. May create
+  lookup tables which are saved to ctx. is_disjoint - if no bits in lft and rgt overlap. Only allowed
+  on an OR operation.
+  """
+
+  lft_is_known = isinstance(lft, sb3.Known)
+  rgt_is_known = isinstance(rgt, sb3.Known)
+
+  # No overlap, therefore a | b = a + b
+  if is_disjoint:
+    assert op == "or"
+    return sb3.Op("add", lft, rgt), ctx
+
+  # For 1 bit values, more simple and/or/xor methods can be used
+  if width == 1:
+    if op == "and":
+      # lft * rgt
+      return sb3.Op("mul", lft, rgt), ctx
+    elif op == "or":
+      # lft + rgt > 0
+      # the bool as int is usually optimized away here
+      return sb3.Op("bool_as_int", sb3.BoolOp(">", sb3.Op("add", lft, rgt), sb3.Known(0))), ctx
+    elif op == "xor":
+      if lft_is_known or rgt_is_known:
+        unknown = rgt if lft_is_known else lft
+        # 1 - unknown, the optimizer wouldn't be able to optimize the generic case to this
+        return sb3.Op("sub", sb3.Known(1), unknown), ctx
+      else:
+        # lft + rgt mod 2
+        return sb3.Op("mod", sb3.Op("add", lft, rgt), sb3.Known(2)), ctx
+
+  if lft_is_known or rgt_is_known:
+    known = lft if lft_is_known else rgt
+    assert isinstance(known, sb3.Known)
+
+    if isinstance(known.known, str) or int(known.known) != known.known:
+      raise CompException(f"Cannot {op} against invalid known value: {known.known}")
+
+    known = int(known.known)
+    unknown = rgt if lft_is_known else lft
+
+    needs_and_lut = needs_or_lut = needs_xor_lut = False
+    if op == "and":
+      res, needs_and_lut = andWithKnownMask(unknown, known, width, ctx)
+    elif op == "or":
+      res, needs_and_lut, needs_or_lut = orWithKnownMask(unknown, known, width, ctx)
+    else:
+      res, needs_and_lut, needs_xor_lut = xorWithKnownMask(unknown, known, width, ctx)
+
+    ctx.needs_and_lut |= needs_and_lut
+    ctx.needs_or_lut  |= needs_or_lut
+    ctx.needs_xor_lut |= needs_xor_lut
+
+    return res, ctx
+
+  else:
+    ctx.needs_and_lut |= op == "and"
+    ctx.needs_or_lut  |= op == "or"
+    ctx.needs_xor_lut |= op == "xor"
+    return binOpWithUnknownViaLookupTable(op, lft, rgt, width, ctx), ctx
+
 def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond, cfg: Config) -> sb3.BooleanValue:
   special_signed_handling = cfg.opti and \
                             mode in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
@@ -1441,7 +1828,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_val = None
 
       match instr.opcode:
-        case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub:
+        case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub | ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor:
           pass
         case _:
           if isinstance(left, IdxbleValue) or \
@@ -1734,67 +2121,31 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor: # Calculate binary operation
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
 
           width = instr.left.type.width
-          # TODO FIX: support larger values
+
+          match instr.opcode:
+            case ir.BinaryOpcode.And: op = "and"
+            case ir.BinaryOpcode.Or:  op = "or"
+            case ir.BinaryOpcode.Xor: op = "xor"
+
           if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports "
-                                f"integers with <= {VARIABLE_MAX_BITS} bits")
+            assert isinstance(left, IdxbleValue) and isinstance(right, IdxbleValue)
 
-          if instr.opcode == ir.BinaryOpcode.Or and instr.is_disjoint:
-            # If there would be no carry
-            res_val = sb3.Op("add", left, right)
+            res_vals = IdxbleValue()
+            for i in range(len(left.vals)):
+              val, ctx = binOp(op, left.vals[i], right.vals[i], width, ctx, instr.is_disjoint)
+              res_vals.vals.append(val)
+
+            blocks.add(res_var.setAllValues(res_vals))
+            res_val = False
+
           else:
-            # TODO: use mod for known values
-            if width > ctx.cfg.binop_lookup_bits:
-              uses = width / ctx.cfg.binop_lookup_bits
-              left, lblocks = flatAsTuple(optimizeValueUse(left, uses, ctx))
-              right, rblocks = flatAsTuple(optimizeValueUse(right, uses, ctx))
-              blocks.add(lblocks)
-              blocks.add(rblocks)
-
-            lookup_size = 2 ** ctx.cfg.binop_lookup_bits
-            name = f"!{instr.opcode.value.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
-
-            if name not in ctx.proj.lists:
-              lookup: list[int | float | str | bool] = []
-              match instr.opcode:
-                case ir.BinaryOpcode.And:
-                  lookup = [l & r for l in range(lookup_size) for r in range(lookup_size)]
-                case ir.BinaryOpcode.Or:
-                  lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
-                case ir.BinaryOpcode.Xor:
-                  lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
-              # Since 0 &/|/^ 0 is 0, an empty value being treated as zero is fine
-              ctx.proj.lists[name] = [sb3.Known(v) for v in lookup[1:]]
-
-            results = []
-            for offset in range(0, width, ctx.cfg.binop_lookup_bits):
-              left_index = left
-              right_index = right
-              if offset > 0:
-                left_index = sb3.Op("floor", sb3.Op("div", left_index, sb3.Known(2 ** offset)))
-                # No floor instruction needed because scratch rounds down with atindex
-                right_index = sb3.Op("div", right_index, sb3.Known(2 ** offset))
-              if offset + ctx.cfg.binop_lookup_bits < width:
-                left_index = sb3.Op("mod", left_index, sb3.Known(lookup_size))
-                right_index = sb3.Op("mod", right_index, sb3.Known(lookup_size))
-              left_index = sb3.Op("mul", left_index, sb3.Known(lookup_size))
-
-              result = sb3.GetOfList("atindex", name, sb3.Op("add", left_index, right_index))
-              if offset > 0: result = sb3.Op("mul", result, sb3.Known(2 ** offset))
-              results.append(result)
-
-            if len(results) > 1:
-              res_val = sb3.Op("add", results.pop(), results.pop())
-              while len(results) > 0:
-                res_val = sb3.Op("add", res_val, results.pop())
-            else:
-              res_val = results[0]
+            assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+            res_val, ctx = binOp(op, left, right, width, ctx, instr.is_disjoint)
 
         case ir.BinaryOpcode.FAdd | ir.BinaryOpcode.FSub | \
              ir.BinaryOpcode.FMul | ir.BinaryOpcode.FDiv: # Basic float operations
@@ -3294,6 +3645,27 @@ def initLocalStack(ctx: Context) -> sb3.BlockList:
     ]))
   ])
 
+def buildLookupTableComptime(op: Literal["and", "or", "xor"], ctx: Context) -> Context:
+  name = getBinOpLookupTableName(op, ctx)
+  lookup_size = 2 ** BINOP_LOOKUP_BITS
+
+  lookup: list[int] = []
+  match op:
+    case "and": lookup = [l & r for l in range(lookup_size) for r in range(lookup_size)]
+    case "or":  lookup = [l | r for l in range(lookup_size) for r in range(lookup_size)]
+    case "xor": lookup = [l ^ r for l in range(lookup_size) for r in range(lookup_size)]
+
+  # Binary op lookup tables are zero-indexed
+  ctx.proj.lists[name] = [sb3.Known(v) for v in lookup[1:]]
+
+  return ctx
+
+def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
+  if ctx.needs_and_lut: ctx = buildLookupTableComptime("and", ctx)
+  if ctx.needs_or_lut:  ctx = buildLookupTableComptime("or", ctx)
+  if ctx.needs_xor_lut: ctx = buildLookupTableComptime("xor", ctx)
+  return sb3.BlockList(), ctx
+
 def getDontRemove(ctx: Context) -> set[str]:
   res = {ctx.cfg.return_var}
   if ctx.highest_return_size is not None:
@@ -3505,7 +3877,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
-    sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
+    sb3.EditVar("set", "char", sb3.Op("str_as_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
     sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
 
     # Return 1 if successful (casted value == original value), else 0
@@ -3584,6 +3956,10 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
 
   # Translate functions
   ctx = transFuncs(mod, ctx)
+
+  # Build required lookup tables used by functions
+  init_lookups, ctx = initLookupTables(ctx)
+  init_blocks.add(init_lookups)
 
   # Start program after initialization
   start_program_blocks, ctx = transEntrypointCall(ctx)
