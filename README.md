@@ -115,38 +115,95 @@ minify options:
 
 ## Block Perf
 
+### Scratch
+
 ```
-Time (s) per 1,000,000 iterations:
+time (s) per 1,000,000 iterations:
 
-Set Var:   7.550
-Get Var:   1.538
-Get Param: 1.178
+set var:   7.550
+get var:   1.538
+get param: 1.178
 
-Add:       0.765
-Mod:       0.715
-Rand:      2.473
-Not:       0.725
-And:       0.864
-Eq:        0.929
-Abs:       1.607
-Join:      1.091
-Letter Of: 0.737
-Length Of: 0.483
-Cntin Str: 1.272
-Round Int: 0.304
-Round Flt: 1.250
+add:       0.765
+mod:       0.715
+rand:      2.473
+not:       0.725
+and:       0.864
+eq:        0.929
+abs:       1.607
+join:      1.091
+letter of: 0.737
+length of: 0.483
+cntin str: 1.272
+round int: 0.304
+round flt: 1.250
 
-Get List:  5.814 (Changes with size)
-Item:      1.679
-Item #:    4.920 (Changes with size)
-List Len:  0.713
+get list:  5.814 (changes with contents)
+item:      1.679
+item #:    4.920 (changes with contents)
+list len:  0.713
 
-Counter:   0.190
+counter:   0.190
 
-Answer:    0.331
+answer:    0.331
 
-Cost Num:  0.241
-Cost Name: 0.654
+cost num:  0.241
+cost name: 0.654
+```
+
+### Turbowarp
+
+```
+time (s) per 5,000,000 iterations (JIT + Warp Timer disabled):
+
+set var:   1.307
+change vr: 5.719
+get var:   0.495 (interesting a lot higher when modifing the same value at 4.203)
+get param: 3.796
+
+add:       0.002
+sub:       0.002
+mul:       0.002
+div:       0.002
+mod:       6.531 (3.654 when modulus is known with my PR)
+rand:      3.599
+not:       0.002
+and:       0.002
+or:        0.002
+eq:        0.418
+abs:       0.847
+floor:     0.843
+ceil:      0.844
+sqrt:      4.589
+sin:       7.505
+cos:       7.527
+tan:       11.125
+asin:      5.656
+acos:      5.779
+atan:      2.513
+ln:        4.981
+log:       5.694
+e ^:       1.803
+10 ^:      0.028
+join:      0.006
+letter of: 0.679
+length of: 0.136
+cntin str: 3.853 (changes with contents)
+round int: 0.889
+round flt: 0.583
+
+get list:  31.636 (changes with contents)
+item:      4.388
+item #:    35.467 (changes with contents)
+length:    0.610
+
+counter:   0.544
+incr cnt:  2.020
+
+answer:    0.426
+
+cost num:  0.807
+cost name: 3.007
 ```
 
 ## Planning
