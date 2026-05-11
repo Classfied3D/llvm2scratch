@@ -812,6 +812,9 @@ class Wait(Block):
   def stringify(self, sb: bool=False) -> str:
     return f"wait {self.duration.stringify(sb)} seconds"
 
+# TODO: when adding delete clone block, make sure to exclude it in optimizer from being
+# inlined when in an if statement. This is because on the main sprite it does nothing
+
 # Sensing
 @dataclass
 class Ask(Block):

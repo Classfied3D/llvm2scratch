@@ -357,6 +357,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
     # Finally, optimise the blocks themselves depending on the value
     add_block = True
     did_opti = False
+    is_end_blocklist = lambda blocks: len(blocks) > 0 and blocks.blocks[-1].isEnd()
     match block:
       case sb3.ControlFlow():
         if isinstance(block.value, sb3.Known):
@@ -366,8 +367,13 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
               add_block = False
               if block.value.known:
                 new_blocklist.add(block.blocks)
+                # Ending block - remove all blocks after this
+                # TODO don't do this with delete clone - with the delete clone block, keep in the if statement
+                if is_end_blocklist(block.blocks): break
               elif block.else_blocks is not None:
                 new_blocklist.add(block.else_blocks)
+                if is_end_blocklist(block.else_blocks): break
+
             case "until" | "while":
               did_opti = True
               inverted = block == "while"
@@ -375,8 +381,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
               if is_forever:
                 block.op = "forever"
                 block.value = None
-
-                # No blocks come after a forever block
+                # No blocks come after a forever block - remove the next blocks
                 new_blocklist.add(block)
                 break
               else:
@@ -384,6 +389,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
         elif isinstance(block.value, sb3.BoolOp) and block.value.op == "not":
           match block.op:
             case "if_else":
+              # Swap if and else blocks
               did_opti = True
               assert block.else_blocks is not None
               tmp = block.blocks
@@ -391,6 +397,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
               block.else_blocks = tmp
               block.value = block.value.left
             case "until" | "while":
+              # Swap between repeat until and while
               did_opti = True
               block.op = "until" if block.op == "while" else "while"
               block.value = block.value.left

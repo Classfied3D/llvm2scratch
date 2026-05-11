@@ -52,6 +52,12 @@ def main():
       EditVar("set", "char", GetOfList("atindex", "!stack", GetVar("ptr"))),
     ])),
     Say(GetVar("buffer")),
+    ControlFlow("if", KnownBool(True), BlockList([
+      Say(Known("hello")),
+    ])),
+    ControlFlow("if", KnownBool(True), BlockList([
+      StopScript("stopthis"),
+    ])),
     EditVar("set", "return", Known(0)),
   ]))
 
