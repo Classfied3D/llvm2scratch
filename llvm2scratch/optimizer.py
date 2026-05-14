@@ -708,7 +708,8 @@ def assignmentElisionBlock(blocklist: sb3.BlockList, to_elide: dict[str, sb3.Val
 
 def assignmentElision(proj: sb3.Project,
                       dont_remove: set[str] | None = None, \
-                      ignore_external_change: set[str] | None = None) -> tuple[sb3.Project, bool]:
+                      ignore_external_change: set[str] | None = None
+  ) -> tuple[sb3.Project, bool]:
   """
   Optimise a code block by removing variable assignments which only lead to one read.
   Don't remove: a set of variable names in which assignments should not be elided for (e.g.
@@ -718,10 +719,7 @@ def assignmentElision(proj: sb3.Project,
   """
   _value_varuse_cache.clear()
 
-  if dont_remove is None:
-    dont_remove = set()
-  else:
-    dont_remove = {"var:" + var_name for var_name in dont_remove}
+  dont_remove = set() if dont_remove is None else {"var:" + var_name for var_name in dont_remove}
 
   if ignore_external_change is None:
     ignore_external_change = set()
@@ -789,8 +787,9 @@ def assignmentElision(proj: sb3.Project,
     while did_elide:
       did_elide = False
 
+      # Variables that shouldn't be removed shouldn't be elided
+      cannot_elide: set[str] = deepcopy(dont_remove)
       # Find every variable that isn't used elsewhere
-      cannot_elide: set[str] = set()
       for other_name, other_info in fn_info.items():
         # FUTURE OPTI: across function value elison - would require working out where each function returns
         if other_name != name:
@@ -810,6 +809,10 @@ def assignmentElision(proj: sb3.Project,
         block = blocklist.blocks[i]
         is_ending = i == len(blocklist.blocks) - 1
 
+        # All blocks outside of these have dependencies only on inputs, which are evaluated before the block
+        # can modify anything
+        cannot_write_before_read = not isinstance(block, (sb3.ControlFlow, sb3.ProcedureCall, sb3.Broadcast))
+
         if consider_whole_block:
           # Consider the whole block - we only looked at direct inputs last time
           inputs_only = False
@@ -819,7 +822,8 @@ def assignmentElision(proj: sb3.Project,
           # For some blocks (procedure calls and control flow blocks that do not re-evaluate the condition,
           # considering the direct inputs alone without the modifing block means more elisions can be made)
           inputs_only = isinstance(block, sb3.ProcedureCall) and len(block.arguments) > 0 or \
-            isinstance(block, sb3.ControlFlow) and block.op in {"if", "if_else", "reptimes"}
+            isinstance(block, sb3.ControlFlow) and block.op in {"if", "if_else", "reptimes"} or \
+            isinstance(block, sb3.Broadcast)
           consider_whole_block = inputs_only
           ignore_inputs = False
 
@@ -851,8 +855,9 @@ def assignmentElision(proj: sb3.Project,
 
             # If the block modifies the a dependency, and also depends on the
             # variable, then the variable could have had its dependency change then
-            # read, so it cannot be elided
-            if var_name not in use.dependent:
+            # read, so it cannot be elided assuming the block can write before
+            # reading
+            if cannot_write_before_read or var_name not in use.dependent:
               changed_but_unread[var_name] = var_dependents, var_value
 
         for var_name in to_remove:
@@ -868,11 +873,6 @@ def assignmentElision(proj: sb3.Project,
             to_elide[var_name] = depends_on, block.value
 
       to_elide.update(changed_but_unread)
-
-      # Don't elide vars in dont_remove
-      for var_name in dont_remove:
-        if var_name in to_elide:
-          del to_elide[var_name]
 
       # Calculate if it is actually faster to elide
       slower_to_elide: set[str] = set()
