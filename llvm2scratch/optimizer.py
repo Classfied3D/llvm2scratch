@@ -28,7 +28,7 @@ JOIN_COST = 1.091
 LETTER_OF_COST = 0.737
 LENGTH_OF_STR_COST = 0.483
 CONTAINS_STR_COST = 1.272
-BOOL_AS_INT_COST = 0.304 # Bool to int use round on a boolean value, which is cheaper than a round on a fp value
+BOOL_TO_FLOAT_COST = 0.304 # Bool to float uses round on a boolean value, which is cheaper than a round on a fp value
 ROUND_COST = 1.250
 GET_LIST_COST = 5.814 # Unreliable benchmark
 GET_ITEM_COST = 1.679
@@ -203,8 +203,8 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
                     sb3.BoolOp(value.op, unknown_comp, known_comp)
 
       elif value.op in ["<", ">", "="] and \
-           ((isinstance(value.left, sb3.Op) and value.left.op == "bool_as_int") ^ \
-           (isinstance(value.right, sb3.Op) and value.right.op == "bool_as_int")) and \
+           ((isinstance(value.left, sb3.Op) and value.left.op == "bool_to_float") ^ \
+           (isinstance(value.right, sb3.Op) and value.right.op == "bool_to_float")) and \
            (isinstance(value.left, sb3.Known) ^ isinstance(value.right, sb3.Known)):
         did_opti_total = True
         op = value.op
@@ -258,7 +258,7 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
             value = sb3.Known(left / right)
           case "mod":
             value = sb3.Known(left % right)
-          case "bool_as_int":
+          case "bool_to_float" | "str_to_float":
             value = sb3.Known(left)
           case "abs":
             value = sb3.Known(abs(left))
@@ -614,7 +614,8 @@ def getValueCost(value: sb3.Value) -> float:
       elif value.op == "join":         cost = JOIN_COST
       elif value.op == "rand_between": cost = RAND_COST
       elif value.op == "round":        cost = ROUND_COST
-      elif value.op == "bool_as_int":  cost = BOOL_AS_INT_COST
+      elif value.op == "bool_to_float":  cost = BOOL_TO_FLOAT_COST
+      elif value.op == "str_to_float": cost = 0 # Usually a no-op
       else:                            cost = MATH_FUNC_COST
     case sb3.BoolOp():
       if value.op in ["=", "<", ">"]:  cost = COMPARISON_COST

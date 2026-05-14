@@ -1030,7 +1030,7 @@ def binOpPartViaLookupTable(
 
   # If the index is 0, "" is returned. We need to ensure this is casted to zero,
   # so use str_to_float. Most of the time this should be optimized away.
-  res = sb3.Op("str_as_float", sb3.GetOfList("atindex", table_name, lookup_index))
+  res = sb3.Op("str_to_float", sb3.GetOfList("atindex", table_name, lookup_index))
   # Shift left the result back to put it back in place
   if shift_l != 0: res = sb3.Op("mul", res, sb3.Known(2 ** shift_l))
 
@@ -1266,8 +1266,8 @@ def binOp(op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
       return sb3.Op("mul", lft, rgt), ctx
     elif op == "or":
       # lft + rgt > 0
-      # the bool as int is usually optimized away here
-      return sb3.Op("bool_as_int", sb3.BoolOp(">", sb3.Op("add", lft, rgt), sb3.Known(0))), ctx
+      # the bool to float is usually optimized away here
+      return sb3.Op("bool_to_float", sb3.BoolOp(">", sb3.Op("add", lft, rgt), sb3.Known(0))), ctx
     elif op == "xor":
       if lft_is_known or rgt_is_known:
         unknown = rgt if lft_is_known else lft
@@ -2334,8 +2334,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       result = intCompare(left, right, width, instr.cond, ctx.cfg)
 
-      # Bool as int will cast to an int if needed (so the bool is treated as 1 instead of 'true')
-      casted_result = sb3.Op("bool_as_int", result)
+      # Bool to float will cast to an int if needed (so the bool is treated as 1 instead of 'true')
+      casted_result = sb3.Op("bool_to_float", result)
 
       blocks.add(res_var.setValue(casted_result))
 
@@ -2398,8 +2398,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         case _:
           raise CompException(f"fcmp does not support comparsion mode {instr.cond}")
 
-      # Bool as int will cast to an int if needed (so the bool isn't treated as 'true')
-      res_val = sb3.Op("bool_as_int", res_val)
+      # Bool to float will cast to an int if needed (so the bool isn't treated as 'true')
+      res_val = sb3.Op("bool_to_float", res_val)
 
       blocks.add(res_var.setValue(res_val))
 
@@ -3735,7 +3735,7 @@ def addForeignFunctions(ctx: Context) -> Context:
       sb3.GetParameter(localizeParameter("alphabet_pos")),
       sb3.GetVar("original")),
     sb3.EditVar("set", ctx.cfg.return_var,
-      sb3.Op("bool_as_int", sb3.BoolOp("=",
+      sb3.Op("bool_to_float", sb3.BoolOp("=",
         sb3.CostumeInfo("number"),
         sb3.Known(lc_costume_num),
       ))),
@@ -3819,7 +3819,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
     sb3.SwitchCostume(sb3.GetVar("cost")),
 
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", enough_space)),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_to_float", enough_space)),
 
     # Return value is set above.
   ]), ctx)
@@ -3900,11 +3900,11 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
-    sb3.EditVar("set", "char", sb3.Op("str_as_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
+    sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
     sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
 
     # Return 1 if successful (casted value == original value), else 0
-    sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_as_int", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_to_float", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
   ]), ctx)
 
   # Returns the days since 2000 in UTC time
