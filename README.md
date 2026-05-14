@@ -208,11 +208,9 @@ cost name: 3.007
 
 ## Planning
 
-- Opti: unused param elision
-- Opti: known list (lookup table) progagation
-- Opti: remove Repeat(Known(1))
-- Opti: `set a (a + n)` -> `change a by n`
-- Opti: `set a (a * 2)` -> `change a by a`
+- Opt: remove Repeat(Known(1))
+- Opt: `set a (a + n)` -> `change a by n`
+- Opt: `set a (a * 2)` -> `change a by a`
 
 ## Proofs
 

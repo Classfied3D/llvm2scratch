@@ -652,6 +652,11 @@ def scratchRuntimeError(message: str) -> sb3.BlockList:
     ]))
   ])
 
+def getPow2Offset() -> int:
+  # To calculate 2^x with x = -VARIABLE_MAX_BITS corresponds to the 1st item in the list (index of 1)
+  # Then f(x) = 1 => -VARIABLE_MAX_BITS + offset = 1 => offset = VARIABLE_MAX_BITS + 1
+  return VARIABLE_MAX_BITS + 1
+
 def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
   """
   Creates a pow2 lookup table for 2^n for -VARIABLE_MAX_BITS <= n <= VARIABLE_MAX_BITS.
@@ -661,11 +666,7 @@ def makePow2LookupTable(ctx: Context) -> tuple[str, int, Context]:
   if name not in ctx.proj.lists:
     ctx.proj.lists[name] = [sb3.Known(2 ** x) for x in range(-VARIABLE_MAX_BITS, VARIABLE_MAX_BITS + 1)]
 
-  # To calculate 2^x with x = -VARIABLE_MAX_BITS corresponds to the 1st item in the list (index of 1)
-  # Then f(x) = 1 => -VARIABLE_MAX_BITS + offset = 1 => offset = VARIABLE_MAX_BITS + 1
-  offset = VARIABLE_MAX_BITS + 1
-
-  return name, offset, ctx
+  return name, getPow2Offset(), ctx
 
 def twosComplement(val: sb3.Value, width: int) -> sb3.Value:
   return sb3.Op("mod", val, sb3.Known(2 ** width))
@@ -984,7 +985,7 @@ def getKnownBitGroups(val: int, width: int) -> list[tuple[int, int]]:
   bit_groups.append((current_bit, current_len))
   return bit_groups
 
-def getBinOpLookupTableName(op: Literal["and", "or", "xor"], ctx: Context) -> str:
+def getOpLookupTableName(op: Literal["and", "or", "xor"], ctx: Context) -> str:
   return f"!{op.upper()} lookup{ctx.cfg.zero_indexed_suffix}"
 
 def binOpPartViaLookupTable(
@@ -999,7 +1000,7 @@ def binOpPartViaLookupTable(
 
   assert bits <= BINOP_LOOKUP_BITS
 
-  table_name = getBinOpLookupTableName(op, ctx)
+  table_name = getOpLookupTableName(op, ctx)
 
   # It is faster for the known value to be left because this means
   # a multiplication can be skipped
@@ -3646,7 +3647,7 @@ def initLocalStack(ctx: Context) -> sb3.BlockList:
   ])
 
 def buildLookupTableComptime(op: Literal["and", "or", "xor"], ctx: Context) -> Context:
-  name = getBinOpLookupTableName(op, ctx)
+  name = getOpLookupTableName(op, ctx)
   lookup_size = 2 ** BINOP_LOOKUP_BITS
 
   lookup: list[int] = []
@@ -3665,6 +3666,28 @@ def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
   if ctx.needs_or_lut:  ctx = buildLookupTableComptime("or", ctx)
   if ctx.needs_xor_lut: ctx = buildLookupTableComptime("xor", ctx)
   return sb3.BlockList(), ctx
+
+def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Known | None:
+  # This will be called a lot for globals - reject early
+  if table_name == ctx.cfg.mem_var: return None
+
+  # Scratch always floors indices
+  index = math.floor(sb3.scratchCastToNum(index_val))
+  matches_op = lambda op: table_name == getOpLookupTableName(op, ctx)
+
+  # Wait this is actually so clean lmao
+  if binop := next(filter(lambda op: matches_op(op), ["and", "or", "xor"]), None):
+    lft = index >> BINOP_LOOKUP_BITS
+    rgt = index & (1 << BINOP_LOOKUP_BITS) - 1
+    match binop:
+      case "and": return sb3.Known(lft & rgt)
+      case "or":  return sb3.Known(lft | rgt)
+      case "xor": return sb3.Known(lft ^ rgt)
+      case _:     assert False
+
+  if table_name == ctx.cfg.pow2_lookup_var:
+    power = index - getPow2Offset()
+    return sb3.Known(2 ** power)
 
 def getDontRemove(ctx: Context) -> set[str]:
   res = {ctx.cfg.return_var}
@@ -3973,7 +3996,8 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
     ctx.proj = opt.optimize(ctx.proj,
                             all_opti = cfg.opti_passes,
                             dont_remove = getDontRemove(ctx),
-                            ignore_external_change = {ctx.cfg.stack_pointer_var})
+                            ignore_external_change = {ctx.cfg.stack_pointer_var},
+                            lookup_func = lambda n, i: tableLookup(n, i, ctx))
 
   # Export debug info
   if cfg.do_debug_branch_log:

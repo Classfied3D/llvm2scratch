@@ -2,6 +2,7 @@
 
 from collections import defaultdict, deque, Counter
 from dataclasses import dataclass, field
+from typing import Callable
 from copy import deepcopy
 from enum import Enum
 
@@ -38,6 +39,8 @@ ANSWER_COST = 0.331
 COSTUME_NUMBER_COST = 0.241
 COSTUME_NAME_COST = 0.654
 KNOWN_COST = 0 # Included in the cost of the block that uses it
+
+LookupFunc = Callable[[str, sb3.Known], sb3.Known | None]
 
 @dataclass
 class OptimizationInfo:
@@ -122,15 +125,15 @@ def getKnownAndUnknown(value: sb3.Op | sb3.BoolOp) -> tuple[sb3.Known, sb3.Value
     return value.right, value.left, False
   return None
 
-def partialSimplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
+def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3.Value, bool]:
   """Optimise a value by using context"""
   did_opti_total = False
   match value:
     case sb3.BoolOp():
-      value.left, did_opti_1 = partialSimplifyValue(value.left)
+      value.left, did_opti_1 = partialSimplifyValue(value.left, lookup_func)
       did_opti_2 = False
       if value.right is not None:
-        value.right, did_opti_2 = partialSimplifyValue(value.right)
+        value.right, did_opti_2 = partialSimplifyValue(value.right, lookup_func)
       did_opti_total |= did_opti_1 or did_opti_2
 
       if value.op == "not":
@@ -234,10 +237,10 @@ def partialSimplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
           value = sb3.BoolOp("not", unknown.left)
 
     case sb3.Op():
-      value.left, did_opti_1 = partialSimplifyValue(value.left)
+      value.left, did_opti_1 = partialSimplifyValue(value.left, lookup_func)
       did_opti_2 = False
       if value.right is not None:
-        value.right, did_opti_2 = partialSimplifyValue(value.right)
+        value.right, did_opti_2 = partialSimplifyValue(value.right, lookup_func)
       did_opti_total |= did_opti_1 or did_opti_2
 
       if isinstance(value.left, sb3.Known) and (isinstance(value.right, sb3.Known) or value.right is None):
@@ -315,21 +318,26 @@ def partialSimplifyValue(value: sb3.Value) -> tuple[sb3.Value, bool]:
                 did_opti_total = True
 
     case sb3.GetOfList():
-      value.value, did_opti = partialSimplifyValue(value.value)
+      value.value, did_opti = partialSimplifyValue(value.value, lookup_func)
+      # Simplify lookup tables
+      if isinstance(value.value, sb3.Known):
+        looked_up = lookup_func(value.list_name, value.value)
+        if looked_up is not None:
+          value = looked_up
       did_opti_total |= did_opti
-      # TODO OPTI: known values of lists can be looked up (assuming the list stays constant)
 
     case _:
       did_opti_total |= False
   return value, did_opti_total
 
-def simplifyValue(value: sb3.Value) -> sb3.Value:
+def simplifyValue(value: sb3.Value, lookup_func: LookupFunc | None = None) -> sb3.Value:
+  if lookup_func is None: lookup_func = lambda _, _2: None
   did_opti = True
   while did_opti:
-    value, did_opti = partialSimplifyValue(value)
+    value, did_opti = partialSimplifyValue(value, lookup_func)
   return value
 
-def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList, bool]:
+def knownValuePropagationBlock(blocklist: sb3.BlockList, lookup_func: LookupFunc) -> tuple[sb3.BlockList, bool]:
   """Optimise a code block by evaluating known values or general optimisation"""
   did_opti_total = False
   new_blocklist = sb3.BlockList()
@@ -340,17 +348,17 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
       did_opti = False
       inputs = getInputs(block)
       for i, value in enumerate(inputs):
-        inputs[i], did_opti_value = partialSimplifyValue(value)
+        inputs[i], did_opti_value = partialSimplifyValue(value, lookup_func)
         did_opti |= did_opti_value
       block = setInputs(block, inputs)
       did_opti_total |= did_opti
 
     # Then, repeat for any sub block lists
     if isinstance(block, sb3.ControlFlow):
-      block.blocks, did_opti_1 = knownValuePropagationBlock(block.blocks)
+      block.blocks, did_opti_1 = knownValuePropagationBlock(block.blocks, lookup_func)
       did_opti_2 = False
       if block.else_blocks is not None:
-        block.else_blocks, did_opti_2 = knownValuePropagationBlock(block.else_blocks)
+        block.else_blocks, did_opti_2 = knownValuePropagationBlock(block.else_blocks, lookup_func)
 
       did_opti_total |= did_opti_1 or did_opti_2
 
@@ -408,13 +416,14 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList) -> tuple[sb3.BlockList,
 
   return new_blocklist, did_opti_total
 
-def knownValuePropagation(proj: sb3.Project) -> tuple[sb3.Project, bool]:
+def knownValuePropagation(proj: sb3.Project, lookup_func: LookupFunc | None = None) -> tuple[sb3.Project, bool]:
+  if lookup_func is None: lookup_func = lambda _, _2: None
   new_code = []
   did_total_opti = False
   for blocklist in proj.code:
     did_opti = True
     while did_opti:
-      blocklist, did_opti = knownValuePropagationBlock(blocklist)
+      blocklist, did_opti = knownValuePropagationBlock(blocklist, lookup_func)
       did_total_opti |= did_opti
     new_code.append(blocklist)
   proj.code = new_code
@@ -893,9 +902,11 @@ def assignmentElision(proj: sb3.Project,
   return proj, did_total_opti
 
 def optimize(proj: sb3.Project,
-             all_opti: set[Optimization] | None = None, \
-             dont_remove: set[str] | None = None, \
-             ignore_external_change: set[str] | None = None) -> sb3.Project:
+             all_opti: set[Optimization] | None = None,
+             dont_remove: set[str] | None = None,
+             ignore_external_change: set[str] | None = None,
+             lookup_func: LookupFunc | None = None
+) -> sb3.Project:
   """
   Perform various optimizations (definied in all_opti) on a project.
   Don't remove: a set of variable names in which assignments should not be elided for (e.g.
@@ -903,8 +914,7 @@ def optimize(proj: sb3.Project,
   Ignore external change: a set of variables in which even though might be modified outside
   the function lead to no overall change (e.g. current stack size).
   """
-  if all_opti is None:
-    all_opti = ALL_OPTIMIZATIONS
+  if all_opti is None: all_opti = ALL_OPTIMIZATIONS
 
   times_optimized = 0
   opti_to_perform = deepcopy(all_opti)
@@ -914,7 +924,7 @@ def optimize(proj: sb3.Project,
       case Optimization.ASSIGNMENT_ELISION:
         proj, did_opti = assignmentElision(proj, dont_remove, ignore_external_change)
       case Optimization.KNOWN_VALUE_PROPAGATION:
-        proj, did_opti = knownValuePropagation(proj)
+        proj, did_opti = knownValuePropagation(proj, lookup_func)
       case _:
         raise OptimizerException(f"Unknown Optimisation {current_opti}")
     if did_opti: opti_to_perform = deepcopy(all_opti) - {current_opti}
