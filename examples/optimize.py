@@ -43,7 +43,7 @@ def main():
   proj.code.append(BlockList([
     ProcedureDef("puts", ["%input"]),
     EditVar("set", "buffer", Known("")),
-    EditVar("set", "ptr", GetParameter("%input")),
+    EditVar("set", "ptr", GetParam("%input")),
     EditVar("set", "char", GetOfList("atindex", "!stack", GetVar("ptr"))),
     ControlFlow("until", BoolOp("=", GetVar("char"), Known(0)), BlockList([
       EditVar("set", "buffer",

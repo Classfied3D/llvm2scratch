@@ -14,7 +14,7 @@ def main():
     ControlFlow("while", BoolOp("=", Op("div", GetVar("hello3"), Known(30)), Known(0)), BlockList([
       EditVar("set", "hello2", Known(10)),
     ])),
-    ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParameter("%1"))), Known(3)]),
+    ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParam("%1"))), Known(3)]),
     EditCounter("clear"),
     EditCounter("incr"),
     Say(GetCounter()),

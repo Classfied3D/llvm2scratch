@@ -438,7 +438,7 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
     return _value_varuse_cache[key]
 
   match value:
-    case sb3.Known() | sb3.GetParameter() | sb3.DaysSince2000():
+    case sb3.Known() | sb3.GetParam() | sb3.DaysSince2000():
       result = set(), Counter()
     case sb3.GetVar():
       name = "var:" + value.var_name
@@ -632,7 +632,7 @@ def getValueCost(value: sb3.Value) -> float:
     case sb3.GetOfList():
       cost = GET_ITEM_COST if value.op == "atindex" else ITEM_NUM_COST
     case sb3.GetListLength():          cost = LIST_LEN_COST
-    case sb3.GetParameter():           cost = GET_PARAM_COST
+    case sb3.GetParam():           cost = GET_PARAM_COST
     case _:
       raise OptimizerException(f"Unknown value, {type(value)}")
 
@@ -654,7 +654,7 @@ def shouldElide(value: sb3.Value, times_used: float) -> bool:
 
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
   match value:
-    case sb3.Known() | sb3.GetParameter() | sb3.GetCounter() | \
+    case sb3.Known() | sb3.GetParam() | sb3.GetCounter() | \
          sb3.GetAnswer() | sb3.CostumeInfo() | sb3.GetList() | \
          sb3.DaysSince2000() | sb3.GetListLength():
       result = value

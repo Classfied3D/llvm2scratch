@@ -1273,7 +1273,7 @@ class ProcedureCall(LateBlock):
     return " ".join(parts)
 
 @dataclass
-class GetParameter(Value):
+class GetParam(Value):
   param_name: str
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:

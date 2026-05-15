@@ -11,7 +11,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 - 🔁 Loops (Which unwind scratch's call stack when necessary)
 - ⏺ Arrays and Structs (getelementptr support)
 - 🔡 Static Variables
-- 📚 [Partial cstdlib support](https://github.com/Classfied3D/newlib-scratch)
+- 📚 [Partial libc support](https://github.com/Classfied3D/newlib-scratch)
 - ⚡ Optimizations (Known Value Propagation, Assignment Elision)
 - 📝 .sb3 + .sprite3 + scratchblocks file output
 

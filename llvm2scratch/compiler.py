@@ -199,7 +199,7 @@ class Variable:
       case "global":
         return f"@{self.var_name}"
       case "param":
-        return localizeParameter(self.var_name)
+        return localizeParam(self.var_name)
       case "var":
         assert self.fn_name is not None
         return f"%{self.fn_name}:{self.var_name}" # Localize variables per function
@@ -216,7 +216,7 @@ class Variable:
   def getValue(self, index: int | None = None) -> sb3.Value:
     name = self.getRawVarName(index)
     if self.var_type == "param":
-      return sb3.GetParameter(name)
+      return sb3.GetParam(name)
     return sb3.GetVar(name)
 
   def getAllValues(self, value_len: int) -> IdxbleValue:
@@ -599,7 +599,7 @@ def localizeVar(name: str, is_global: bool, bctx: BlockInfo | None) -> Variable:
 
   return Variable(name, var_type, fn_name)
 
-def localizeParameter(name: str) -> str:
+def localizeParam(name: str) -> str:
   return "%" + name
 
 def localizeLabel(label: str, fn_name: str) -> str:
@@ -3302,7 +3302,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
     branches = dict()
     for name in could_call:
       branch = sb3.BlockList()
-      branch.add(sb3.ProcedureCall(name, [sb3.GetParameter(arg) for arg in arguments]))
+      branch.add(sb3.ProcedureCall(name, [sb3.GetParam(arg) for arg in arguments]))
 
       # If we return to an address and the callee doesn't then jump to our callback ourselves
       if info.returns_to_address and not ctx.fn_info[name].returns_to_address:
@@ -3677,6 +3677,7 @@ def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Know
 
   # Wait this is actually so clean lmao
   if binop := next(filter(lambda op: matches_op(op), ["and", "or", "xor"]), None):
+    assert index >= 1 and index <= 2 ** (2 * BINOP_LOOKUP_BITS)
     lft = index >> BINOP_LOOKUP_BITS
     rgt = index & (1 << BINOP_LOOKUP_BITS) - 1
     match binop:
@@ -3686,6 +3687,7 @@ def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Know
       case _:     assert False
 
   if table_name == ctx.cfg.pow2_lookup_var:
+    assert index >= 1
     power = index - getPow2Offset()
     return sb3.Known(2 ** power)
 
@@ -3724,15 +3726,15 @@ def addForeignFunctions(ctx: Context) -> Context:
   # The caller is responsible for setting the costume back to the original
   ctx = addFunc("!helper_is_lowercase", ["char", "alphabet_pos"], sb3.BlockList([
     sb3.EditVar("set", "original",
-      sb3.GetOfList("atindex", ctx.cfg.lowercase_var, sb3.GetParameter(localizeParameter("alphabet_pos"))),
+      sb3.GetOfList("atindex", ctx.cfg.lowercase_var, sb3.GetParam(localizeParam("alphabet_pos"))),
     ),
     sb3.EditList("replaceat", ctx.cfg.lowercase_var,
-      sb3.GetParameter(localizeParameter("alphabet_pos")),
-      sb3.GetParameter(localizeParameter("char"))),
+      sb3.GetParam(localizeParam("alphabet_pos")),
+      sb3.GetParam(localizeParam("char"))),
     sb3.SwitchCostume(sb3.Known(uppercase_costume_name)),
     sb3.SwitchCostume(sb3.GetList(ctx.cfg.lowercase_var)),
     sb3.EditList("replaceat", ctx.cfg.lowercase_var,
-      sb3.GetParameter(localizeParameter("alphabet_pos")),
+      sb3.GetParam(localizeParam("alphabet_pos")),
       sb3.GetVar("original")),
     sb3.EditVar("set", ctx.cfg.return_var,
       sb3.Op("bool_to_float", sb3.BoolOp("=",
@@ -3745,7 +3747,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_str2scratch", ["input"], sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
-    sb3.EditVar("set", "ptr", sb3.GetParameter(localizeParameter("input"))),
+    sb3.EditVar("set", "ptr", sb3.GetParam(localizeParam("input"))),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", ctx.cfg.return_var,
@@ -3761,14 +3763,14 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # True if the limit is high enough.
   enough_space = sb3.BoolOp("<",
-    sb3.Op("length_of", sb3.GetParameter(localizeParameter("input"))),
-    sb3.GetParameter(localizeParameter("count")))
+    sb3.Op("length_of", sb3.GetParam(localizeParam("input"))),
+    sb3.GetParam(localizeParam("count")))
 
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_scratch2str", ["input", "str", "count"], sb3.BlockList([
     # Subtract one here so that i can be one indexed (which letter_n_of is)
-    sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParameter(localizeParameter("str")), sb3.Known(1))),
+    sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParam(localizeParam("str")), sb3.Known(1))),
     sb3.EditVar("set", "i", sb3.Known(1)),
     # TODO should use cost variable no idea why not setting
     sb3.EditVar("set", "cost", sb3.CostumeInfo("number")),
@@ -3780,21 +3782,21 @@ def addForeignFunctions(ctx: Context) -> Context:
       # Re-using the "char" variable for counting how many letters should be copied.
       # I think it makes sense, right?
       # Also, according to @Classified3D and the README, calculating the length twice is the fastest option.
-      sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParameter(localizeParameter("input")))),
+      sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParam(localizeParam("input")))),
     ]),
     # Else
     sb3.BlockList([
       # The limit is lower than the inputted string.
       # Return False and reduce the letter count.
       # Doing -1 to account for the NULL at the end.
-      sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParameter(localizeParameter("count")), sb3.Known(1))),
+      sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParam(localizeParam("count")), sb3.Known(1))),
     ])),
 
     sb3.ControlFlow("reptimes", sb3.GetVar("char"), sb3.BlockList([
       sb3.EditVar("set", "ascii",
         sb3.GetOfList("indexof",
           (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-          sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input"))))),
+          sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))))),
       sb3.ControlFlow("if",
         sb3.BoolOp("and",
           sb3.BoolOp(">", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1)),
@@ -3803,7 +3805,7 @@ def addForeignFunctions(ctx: Context) -> Context:
         sb3.BlockList([
           # TODO set costume back to original in after helper_scratch2str finishes
           sb3.ProcedureCall("!helper_is_lowercase", [
-            sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParameter(localizeParameter("input"))),
+            sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))),
             sb3.Op("sub", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1))
           ]),
           sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar(ctx.cfg.return_var), sb3.Known(1)), sb3.BlockList([
@@ -3831,18 +3833,18 @@ def addForeignFunctions(ctx: Context) -> Context:
   ]), ctx)
 
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
     sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
   ]), ctx)
 
   ctx = addFunc("SB3_say_char", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex",
       (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-      sb3.GetParameter(localizeParameter("input")))),
+      sb3.GetParam(localizeParam("input")))),
   ]), ctx)
 
   ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
-    sb3.Say(sb3.GetParameter(localizeParameter("input"))),
+    sb3.Say(sb3.GetParam(localizeParam("input"))),
   ]), ctx)
 
   # Wait at least duration seconds while rendering
@@ -3853,7 +3855,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("SB3_wait", ["duration"], sb3.BlockList([
     sb3.EditVar("set", "end", sb3.Op("add",
       sb3.DaysSince2000(),
-      sb3.Op("div", sb3.GetParameter(localizeParameter("duration")), sb3.Known(24*60*60)))),
+      sb3.Op("div", sb3.GetParam(localizeParam("duration")), sb3.Known(24*60*60)))),
     # Always wait a frame, even for negative values, just like the wait block in scratch
     sb3.ProcedureCall("SB3_render", []),
     sb3.ControlFlow("until", sb3.BoolOp(">", sb3.DaysSince2000(), sb3.GetVar("end")), sb3.BlockList([
@@ -3863,20 +3865,20 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Wait at least duration seconds without rendering
   ctx = addFunc("SB3_wait_no_render", ["duration"], sb3.BlockList([
-    sb3.Wait(sb3.GetParameter(localizeParameter("duration"))),
+    sb3.Wait(sb3.GetParam(localizeParam("duration"))),
   ]), ctx)
 
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
   # count  (int): The maximum length of the string.
   ctx = addFunc("SB3_ask_str", ["output", "input", "count"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.ProcedureCall("!helper_scratch2str", [
       sb3.GetAnswer(),
-      sb3.GetParameter(localizeParameter("output")),
-      sb3.GetParameter(localizeParameter("count"))
+      sb3.GetParam(localizeParam("output")),
+      sb3.GetParam(localizeParam("count"))
     ]),
     # Return value is set by scratch2str.
   ]), ctx)
@@ -3884,12 +3886,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
   ctx = addFunc("SB3_ask_str_unsafe", ["output", "input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.ProcedureCall("!helper_scratch2str", [
       sb3.GetAnswer(),
-      sb3.GetParameter(localizeParameter("output")),
+      sb3.GetParam(localizeParam("output")),
       sb3.Known("Infinity"),
     ]),
     # Return value is set by scratch2str. It's always going to be 1.
@@ -3897,11 +3899,11 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Same as SB3_ask_str, but it outputs a double.
   ctx = addFunc("SB3_ask_dbl", ["output", "input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParameter(localizeParameter("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
-    sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParameter(localizeParameter("output")), sb3.GetVar("char")),
+    sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParam(localizeParam("output")), sb3.GetVar("char")),
 
     # Return 1 if successful (casted value == original value), else 0
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_to_float", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
@@ -3917,7 +3919,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   ctx = addFunc("_exit", ["status"], sb3.BlockList([
     # TODO: this would be logged to stdout
-    sb3.Ask(sb3.Op("join", sb3.Known("exit called with status "), sb3.GetParameter(localizeParameter("status")))),
+    sb3.Ask(sb3.Op("join", sb3.Known("exit called with status "), sb3.GetParam(localizeParam("status")))),
     sb3.StopScript("stopall"),
   ]), ctx)
 
@@ -3932,7 +3934,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Return the old pointer
     sb3.EditVar("set", ctx.cfg.return_var, sb3.GetVar(ctx.cfg.heap_pointer_var)),
     # Increment the heap pointer
-    sb3.EditVar("change", ctx.cfg.heap_pointer_var, sb3.GetParameter(localizeParameter("incr"))),
+    sb3.EditVar("change", ctx.cfg.heap_pointer_var, sb3.GetParam(localizeParam("incr"))),
     # TODO check for out of memory, if so return -1 and set @errno
   ]), ctx)
 
