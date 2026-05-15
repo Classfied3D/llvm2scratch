@@ -688,9 +688,6 @@ class ControlFlow(Block):
     else:
       raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_INT)
 
-    blocks_id = ctx.addBlockList(self.blocks, my_id)
-    inputs = {"SUBSTACK": [2, blocks_id]}
-
     input_name = "TIMES" if op == "reptimes" else "CONDITION"
     if raw_val is not None: inputs.update({input_name: raw_val})
 
