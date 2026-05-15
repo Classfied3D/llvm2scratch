@@ -17,6 +17,7 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Project Showcase
 
+- [ELIZA-scratch](https://github.com/Callen44/ELIZA-scratch) by [@Callen44](https://github.com/Callen44) - port of the ELIZA chatbot to scratch
 - [LLM from Scratch](https://github.com/Broyojo/llm_from_scratch) by [@Broyojo](https://github.com/Broyojo) - `llama2.c` running in scratch
 - [asm2scratch](https://github.com/RetrogradeDev/asm2scratch) by [@RetrogradeDev](https://github.com/RetrogradeDev) - early llvm2scratch fork to support compiling assembly directly instead
 - [sha2scratch](https://github.com/Classfied3D/sha2scratch) by me - SHA-256 algorithm ported to scratch
