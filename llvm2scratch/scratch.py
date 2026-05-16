@@ -48,6 +48,7 @@ SHORT_OP_TO_OPCODE = {
   "until": "control_repeat_until",
   "while": "control_while",
   "forever": "control_forever",
+  "for_each": "control_for_each",
 
   # Variables
   "set": "data_setvariableto",
@@ -168,26 +169,41 @@ class ScratchContext:
     last_id = parent
     first_id = curr_id = self.genId()
     next_id = self.genId()
+    for_each_var_set = False
     end = False
 
-    for (i, block) in enumerate(blocks.blocks):
+    i = 0
+    while i < len(blocks.blocks):
+      block = blocks.blocks[i]
       if i == len(blocks.blocks) - 1: next_id = None
 
       is_start = last_id is None
 
       assert curr_id is not None
 
-      if last_id is not None and block.isStart(): raise ScratchCompException(f"Starting block {type(block)} has blocks before it")
+      if last_id is not None and block.isStart():
+        raise ScratchCompException(f"Starting block {type(block)} has blocks before it")
       if end: raise ScratchCompException(f"Reached ending block {type(block)} but more blocks are left")
 
       end = block.isEnd()
-
       meta = BlockMeta(last_id, next_id)
+
+      # Temporary solution for putting multiple blocks in one for for each block when allow hacked blocks
+      # is disabled
+      if not self.cfg.allow_hacked_blocks and isinstance(block, ControlFlow) and block.op == "for_each":
+        assert block.var is not None
+        if not for_each_var_set:
+          block = EditVar("set", block.var, Known(0))
+          i -= 1
+        for_each_var_set = not for_each_var_set
+
       self.addBlock(curr_id, block, meta)
 
       last_id = curr_id
       curr_id = next_id
       next_id = self.genId()
+
+      i += 1
 
     return first_id
 
@@ -362,10 +378,10 @@ class BlockList:
   blocks: list[Block]
   end: bool
 
-  def __init__(self, blocks: list[Block] | None=None):
+  def __init__(self, blocks: list[Block] | None=None, end: bool=False):
     if blocks is None:
       blocks = []
-    self.end = False
+    self.end = end
     for block in blocks:
       if self.end: raise ScratchCompException("List of blocks contains blocks after an ending block")
       self.end |= block.isEnd()
@@ -522,7 +538,7 @@ class SwitchCostume(Block):
 
       proto_id = ctx.genId()
       # Add prototype costume
-      ctx.addBlock(proto_id, RawBlock( {
+      ctx.addBlock(proto_id, RawBlock({
         "opcode": "looks_costume",
         "fields": {"COSTUME": [name_str, None]},
       }), BlockMeta(my_id, None, True))
@@ -644,13 +660,23 @@ class OnStartFlag(StartBlock):
   def stringify(self, sb: bool=False) -> str:
     return f"when green flag clicked"
 
-FlowOp = Literal["if", "if_else", "reptimes", "until", "while", "forever"]
+FlowOp = Literal["if", "if_else", "reptimes", "until", "while", "forever", "for_each"]
 @dataclass
 class ControlFlow(Block):
+  """
+  A control flow statement (if, if else, repeat, repeat until, while, forever or for each).
+  Note that the "for each" block does not guarantee the following unlike in scratch:
+  * The value set is changed back if modified - it does not always work in recursion for that reason
+  * The value passed in is ceiling'd - only consistent with integers
+  * The counter will not be set to the value if the value is <= 0/a string/NaN
+
+  This is due to it using the repeat block when allow_hacked_blocks is disabled
+  """
   op: FlowOp
   value: Value | None
   blocks: BlockList
   else_blocks: BlockList | None = None
+  var: str | None = None
 
   def __post_init__(self):
     if self.op == "forever" and self.value is not None:
@@ -658,19 +684,38 @@ class ControlFlow(Block):
     elif self.op != "forever" and self.value is None:
       raise ScratchCompException(f"{self.op} requires a value!")
 
-    if self.op in ["if", "if_else", "until", "while"] and not isinstance(self.value, BooleanValue):
+    if self.op in {"if", "if_else", "until", "while"} and not isinstance(self.value, BooleanValue):
       raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
 
     if self.op == "if_else" and self.else_blocks is None:
       raise ScratchCompException("An if-else statement must contain blocks in the else case")
 
+    if self.op == "for_each" and self.var is None:
+      raise ScratchCompException("A for-each block requires a variable input")
+
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     op, val = self.op, self.value
+    blocks = self.blocks
+
+    if not ctx.cfg.allow_hacked_blocks:
+      if op == "while":
+        assert val is not None
+        op = "until"
+        val = BoolOp("not", val)
+      elif op == "for_each":
+        assert self.var is not None
+        op = "reptimes"
+        # The inital set var is in addBlockList
+        blocks = BlockList([
+          EditVar("change", self.var, Known(1)),
+          *blocks.blocks,
+        ], blocks.end)
+
     opcode = SHORT_OP_TO_OPCODE[op]
-    blocks_id = ctx.addBlockList(self.blocks, my_id)
+    blocks_id = ctx.addBlockList(blocks, my_id)
     inputs = {"SUBSTACK": [2, blocks_id]}
 
-    if self.op == "forever":
+    if op == "forever":
       return {
         "opcode": opcode,
         "inputs": inputs
@@ -678,17 +723,16 @@ class ControlFlow(Block):
 
     assert val is not None
 
-    if self.op == "while" and not ctx.cfg.allow_hacked_blocks:
-      op = "until"
-      val = BoolOp("not", val)
-
-    if op in ["if", "if_else", "until", "while"]:
+    if op in {"if", "if_else", "until", "while"}:
       assert isinstance(val, BooleanValue)
       raw_val, ctx = val.getRawBoolValue(my_id, ctx)
     else:
       raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_INT)
 
-    input_name = "TIMES" if op == "reptimes" else "CONDITION"
+    match op:
+      case "reptimes": input_name = "TIMES"
+      case "for_each": input_name = "VALUE"
+      case _:          input_name = "CONDITION"
     if raw_val is not None: inputs.update({input_name: raw_val})
 
     if op == "if_else":
@@ -696,10 +740,17 @@ class ControlFlow(Block):
       else_blocks_id = ctx.addBlockList(self.else_blocks, my_id)
       inputs.update({"SUBSTACK2": [2, else_blocks_id]})
 
-    return {
+    res = {
       "opcode": opcode,
       "inputs": inputs
-    }, ctx
+    }
+
+    if op == "for_each":
+      assert self.var is not None
+      id = ctx.addOrGetVar(self.var)
+      res["fields"] = {"VARIABLE": [self.var, id]}
+
+    return res, ctx
 
   def indent(self, input: BlockList, sb: bool=False) -> str:
     return "\n".join("  " + x for x in input.stringify(sb).split("\n"))
@@ -711,25 +762,35 @@ class ControlFlow(Block):
       "until": "repeat until",
       "while": "while",
       "reptimes": "repeat",
-      "forever": "forever"
+      "forever": "forever",
+      "for_each": "for each",
     }[self.op]
 
+    if self.op == "for_each":
+      assert self.var is not None
+      if not sb:
+        name = self.var
+      else:
+        name = Known(self.var).stringify(sb, dropdown=True)
+      res += f" {name} in"
+
     if self.value is not None:
-      res += " " + self.value.stringify(sb)
+      res += f" {self.value.stringify(sb)}"
 
     if sb:
-      if self.op == "while":
+      if self.op in {"while", "for_each"}:
         res += " {"
       elif self.op in {"if", "if_else"}:
         res += " then"
 
-    res += "\n" + self.indent(self.blocks, sb)
+    res += f"\n {self.indent(self.blocks, sb)}"
 
     if self.else_blocks is not None:
-      res += "\nelse\n" + self.indent(self.else_blocks, sb)
+      res += f"\nelse\n{self.indent(self.else_blocks, sb)}"
 
     if sb:
-      if self.op == "while":
+      if self.op in {"while", "for_each"}:
+        # Techincally the for each block doesn't have a loop arrow but I don't care lol
         res += "\n}@loopArrow::control"
       else:
         res += "\nend"

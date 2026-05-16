@@ -497,9 +497,10 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
       for value in getInputs(block):
         value_dependent, counts = getValueVarUse(value)
         all_value_dependent |= value_dependent
-        if isinstance(block, sb3.ControlFlow) and block.op in ["until", "while", "forever"]:
-          # Might be depended on an unlimited amount of times
-          info.use_counts += Counter({key: float("inf") for key in counts})
+        if isinstance(block, sb3.ControlFlow) and block.op in {"until", "while", "forever"}:
+          # Might repeat an unlimited amount of times - use 5000 as an arbitary large value
+          # to not compete with the infinity given to values that can't be elided
+          info.use_counts += Counter({key: 5000 for key in counts})
         else:
           info.use_counts += counts
       info.dependent |= all_value_dependent - info.always_modify
@@ -561,9 +562,20 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
           info.use_counts += callee_info.use_counts
       case sb3.ControlFlow():
         match block.op:
-          case "if" | "reptimes" | "until" | "while" | "forever":
+          case "if" | "reptimes" | "until" | "while" | "forever" | "for_each":
             b_info = getBlockListVarUse(
               block.blocks, func_info, ignore_external_change, is_ending and block.op == "if")
+
+            if block.op == "for_each":
+              assert block.var is not None
+              var = "var:" + block.var
+              # The inner value is used once per iteration
+              b_info.use_counts["var:" + block.var] += 1
+              # Technically for each doesn't always set the var (if value is zero), but this isn't
+              # behaviour we guarantee anyway due to the set var used in the no hacked block
+              # implementation in the serializer
+              info.always_modify.add(var)
+              info.might_modify.add(var)
 
             info.dependent    |= b_info.dependent - info.always_modify
             info.might_modify |= b_info.might_modify
@@ -572,12 +584,13 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
             if block.op == "if":
               # Assume called half the time
               info.use_counts += Counter({k: v / 2 for k, v in b_info.use_counts.items()})
-            elif block.op == "reptimes" and isinstance(block.value, sb3.Known):
+            elif block.op in {"reptimes", "for_each"} and isinstance(block.value, sb3.Known):
               times = sb3.scratchCastToNum(block.value)
               info.use_counts += Counter({k: v * times for k, v in b_info.use_counts.items()})
             else:
-              # Might repeat an unlimited amount of times
-              info.use_counts += Counter({key: float("inf") for key in b_info.use_counts})
+              # Might repeat an unlimited amount of times - use 5000 as an arbitary large value
+              # to not compete with the infinity given to values that can't be elided
+              info.use_counts += Counter({key: 5000 for key in b_info.use_counts})
           case "if_else":
             assert block.else_blocks is not None
             b1_info = getBlockListVarUse(block.blocks, func_info, ignore_external_change, is_ending)
@@ -822,7 +835,7 @@ def assignmentElision(proj: sb3.Project,
           # For some blocks (procedure calls and control flow blocks that do not re-evaluate the condition,
           # considering the direct inputs alone without the modifing block means more elisions can be made)
           inputs_only = isinstance(block, sb3.ProcedureCall) and len(block.arguments) > 0 or \
-            isinstance(block, sb3.ControlFlow) and block.op in {"if", "if_else", "reptimes"} or \
+            isinstance(block, sb3.ControlFlow) and block.op in {"if", "if_else", "reptimes", "for_each"} or \
             isinstance(block, sb3.Broadcast)
           consider_whole_block = inputs_only
           ignore_inputs = False

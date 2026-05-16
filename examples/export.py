@@ -17,7 +17,9 @@ def main():
     ProcedureCall("main", [Op("floor", GetOfList("atindex", "hello3", GetParam("%1"))), Known(3)]),
     EditCounter("clear"),
     EditCounter("incr"),
-    Say(GetCounter()),
+    ControlFlow("for_each", var="i", value=GetVar("idk"), blocks=BlockList([
+      Say(GetCounter()),
+    ])),
     Broadcast(Op("length_of", GetVar("hello2")), True),
     ControlFlow("if", KnownBool(False), BlockList()),
     StopScript("stopall"),
