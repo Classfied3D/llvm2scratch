@@ -3677,7 +3677,7 @@ def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Know
 
   # Wait this is actually so clean lmao
   if binop := next(filter(lambda op: matches_op(op), ["and", "or", "xor"]), None):
-    assert index >= 1 and index <= 2 ** (2 * BINOP_LOOKUP_BITS)
+    assert index >= 0 and index <= 2 ** (2 * BINOP_LOOKUP_BITS)
     lft = index >> BINOP_LOOKUP_BITS
     rgt = index & (1 << BINOP_LOOKUP_BITS) - 1
     match binop:
