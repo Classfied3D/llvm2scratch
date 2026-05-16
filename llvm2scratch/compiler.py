@@ -3625,13 +3625,10 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
     ])),
 
     # Reset the global values
-    # TODO this could use the for each block which is faster
-    sb3.EditVar("set", "ptr", sb3.Known(1)),
-    sb3.ControlFlow("reptimes", sb3.Known(total_size), sb3.BlockList([
+    sb3.ControlFlow("for_each", var="ptr", value=sb3.Known(total_size), blocks=sb3.BlockList([
       sb3.EditList("replaceat", ctx.cfg.mem_var,
         sb3.Op("add", sb3.Known(starting_global_addr - 1), sb3.GetVar("ptr")),
         sb3.GetOfList("atindex", ctx.cfg.init_mem_var, sb3.GetVar("ptr"))),
-      sb3.EditVar("change", "ptr", sb3.Known(1)),
     ])),
   ]))
 
