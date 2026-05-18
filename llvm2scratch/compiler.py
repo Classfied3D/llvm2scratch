@@ -3688,8 +3688,10 @@ def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Know
     power = index - getPow2Offset()
     return sb3.Known(2 ** power)
 
-def getDontRemove(ctx: Context) -> set[str]:
-  res = {ctx.cfg.return_var}
+def getDontElide(ctx: Context) -> set[str]:
+  """Returns a list of names of variables which should not be elided"""
+  # Jump table ids should not be elided as in future jump ids may be depended upon after optimization in future
+  res = {ctx.cfg.jump_table_id_var, ctx.cfg.return_var}
   if ctx.highest_return_size is not None:
     res |= {Variable(ctx.cfg.return_var, "special_var", None).getRawVarName(i) for i in range(ctx.highest_return_size)}
   return res
@@ -3994,7 +3996,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   if cfg.opti:
     ctx.proj = opt.optimize(ctx.proj,
                             all_opti = cfg.opti_passes,
-                            dont_remove = getDontRemove(ctx),
+                            dont_remove = getDontElide(ctx),
                             ignore_external_change = {ctx.cfg.stack_pointer_var},
                             lookup_func = lambda n, i: tableLookup(n, i, ctx))
 
