@@ -49,6 +49,8 @@ class Config:
   # that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR
   accurate_byte_spacing: bool = True
   entrypoint: str = "main" # Name of function to call to start the program
+  gen_lut_runtime: bool = False # If AND/OR/XOR lookup tables should be generated at runtime. This reduces resultant file size
+                                # significantly at the cost of ~0.4s of time on first start spent generating them
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch serializer
   do_debug_branch_log: bool = False # If the times a function recurses should be logged
   # Any functions which might call a non-existent fn ptr in an unreachable branch.
@@ -3659,10 +3661,126 @@ def buildLookupTableComptime(op: Literal["and", "or", "xor"], ctx: Context) -> C
   return ctx
 
 def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
-  if ctx.needs_and_lut: ctx = buildLookupTableComptime("and", ctx)
-  if ctx.needs_or_lut:  ctx = buildLookupTableComptime("or", ctx)
-  if ctx.needs_xor_lut: ctx = buildLookupTableComptime("xor", ctx)
-  return sb3.BlockList(), ctx
+  blocks = sb3.BlockList()
+  ctx.needs_and_lut = ctx.needs_or_lut = ctx.needs_xor_lut = True
+  if ctx.cfg.gen_lut_runtime:
+    if ctx.needs_and_lut or ctx.needs_or_lut or ctx.needs_xor_lut:
+      # Fast runtime lookup table generator. See my project: https://scratch.mit.edu/projects/1304776208/
+
+      # This generator requires using hex digits, so only works with byte size lookup tables
+      assert BINOP_LOOKUP_BITS == 8
+
+      # We can generate the OR table faster by using NOT the AND table in reverse (see later on)
+      include_or = ctx.needs_or_lut and not ctx.needs_and_lut
+
+      # Make a small lookup table for each nibble we compare
+      gen_small_lut = lambda f: sb3.Known("".join([f"{f(a, b):0x}" for a in range(16) for b in range(16)]))
+
+      to_generate: list[tuple[bool, str, str, sb3.Known]] = list(filter(lambda x: x[0], [
+        (ctx.needs_and_lut, getOpLookupTableName("and", ctx), "&", gen_small_lut(lambda a, b: a & b)),
+        (include_or,        getOpLookupTableName("or", ctx),  "|", gen_small_lut(lambda a, b: a | b)),
+        (ctx.needs_xor_lut, getOpLookupTableName("xor", ctx), "^", gen_small_lut(lambda a, b: a ^ b)),
+      ]))
+
+      assert len(to_generate) >= 1
+
+      expected_lut_size = sb3.Known(2 ** 16 - 1)
+
+      gen_binop_lut_blocks = sb3.BlockList([
+        # Fill lookup tables with zeros as we'll have to randomly access them
+        sb3.ControlFlow("reptimes", expected_lut_size, sb3.BlockList([
+          sb3.EditList("addto", name, None, sb3.Known(0)) for _, name, _, _ in to_generate
+        ])),
+
+        # Iterate over combinations of most significant 4 bits
+        sb3.EditVar("set", "a0", sb3.Known(0)),
+        sb3.ControlFlow("reptimes", sb3.Known(16), sb3.BlockList([
+          sb3.EditVar("set", "b0", sb3.Known(0)),
+          sb3.EditVar("set", "256b + 16a0", sb3.Op("mul", sb3.GetVar("a0"), sb3.Known(16))),
+          sb3.ControlFlow("reptimes", sb3.Known(16), sb3.BlockList([
+            *[
+              # Index the OP'd first nibble of A and B into the small lookup table using letter of
+              # and combine with an 0x prefix to allow hexadecimal coercion later
+              sb3.EditVar("set", f"0x join (a0 {op_name} b0)",
+                sb3.Op("join", sb3.Known("0x"),
+                  sb3.Op("letter_n_of",
+                    sumValueParts([sb3.Op("mul", sb3.GetVar("a0"), sb3.Known(16)), sb3.GetVar("b0"), sb3.Known(1)]),
+                    small_table
+                  )))
+              for _, _, op_name, small_table in to_generate
+            ],
+
+            # Iterate over the least significant nibbles
+            # Calculating 16b1 + 1 to avoid operations in the loop later
+            sb3.EditVar("set", "16b1 + 1", sb3.Known(1)),
+            sb3.ControlFlow("reptimes", sb3.Known(16), sb3.BlockList([
+              # Use "counter" for the innermost loop because it is the fastest
+              # counter represents a1. For each could also be used here but
+              # it seems counter is slightly faster (at least for when two tables
+              # are being generated)
+              sb3.EditCounter("clear"),
+              sb3.ControlFlow("reptimes", sb3.Known(16), sb3.BlockList([
+                *[
+                  sb3.EditList("replaceat", name,
+                    sb3.Op("add", sb3.GetVar("256b + 16a0"), sb3.GetCounter()),
+                    # Use scratch's hexadecimal coercion (e.g. "0x10" -> 16)
+                    sb3.Op("str_to_float", sb3.Op("join",
+                      sb3.GetVar(f"0x join (a0 {op_name} b0)"),
+                      sb3.Op("letter_n_of",
+                        sb3.Op("add", sb3.GetVar("16b1 + 1"), sb3.GetCounter()),
+                        small_table
+                      )
+                    ))
+                  )
+                  for _, name, op_name, small_table in to_generate
+                ],
+                sb3.EditCounter("incr"),
+              ])),
+              sb3.EditVar("change", "16b1 + 1", sb3.Known(16)),
+              sb3.EditVar("change", "256b + 16a0", sb3.Known(256)),
+            ])),
+            sb3.EditVar("change", "b0", sb3.Known(1)),
+          ])),
+          sb3.EditVar("change", "a0", sb3.Known(1)),
+        ]))
+      ])
+
+      # Generate OR table using AND table if both are required
+      # This saves a fairly significant amount of startup time
+      if ctx.needs_and_lut and ctx.needs_or_lut:
+        gen_binop_lut_blocks.add(
+          sb3.ControlFlow("for_each", var="i", value=expected_lut_size, blocks=sb3.BlockList([
+            # The OR table is equal to the reverse of the NAND table
+            # Proof:
+            # A | B = !(!A & !B)
+            # !X = 255 - X
+            # or(A, B) = 255 - and(255 - A, 255 - B)
+            # or(256A + B) = 255 - and(256(255 - A) + 255 - B)
+            # or(256A + B) = 255 - and(65535 - 256A - B)
+            # or(i) = 255 - and(65535 - i)
+            sb3.EditList("addto", getOpLookupTableName("or", ctx), None,
+              sb3.Op("sub",
+                sb3.Known(255),
+                sb3.GetOfList("atindex", getOpLookupTableName("and", ctx),
+                  sb3.Op("sub", expected_lut_size, sb3.GetVar("i"))
+                )
+              )
+            )
+          ]))
+        )
+
+      blocks.add(sb3.BlockList([
+        # If we need to generate the lookup tables
+        sb3.ControlFlow("if",
+          sb3.BoolOp("not", sb3.BoolOp("=", sb3.GetListLength(to_generate[0][1]), expected_lut_size)),
+          gen_binop_lut_blocks,
+        )
+      ]))
+  else:
+    if ctx.needs_and_lut: ctx = buildLookupTableComptime("and", ctx)
+    if ctx.needs_or_lut:  ctx = buildLookupTableComptime("or", ctx)
+    if ctx.needs_xor_lut: ctx = buildLookupTableComptime("xor", ctx)
+  return blocks, ctx
 
 def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Known | None:
   # This will be called a lot for globals - reject early

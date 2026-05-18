@@ -17,7 +17,7 @@ def main():
                  cwd=os.path.join(script_dir, "input"))
 
   with open("input/demo.ll", "r") as file:
-    proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(opti=True))
+    proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(opti=True, gen_lut_runtime=True))
     proj.export("output/out.sb3", llvm2scratch.Format.Project3)
 
 if __name__ == "__main__":

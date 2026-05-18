@@ -29,7 +29,11 @@ class CustomFormatter(argparse.HelpFormatter):
         ("all, none", "Self-explanatory"),
         ("general", "Optimize project.json's size by simplifing uids, removing falsy fields, etc"),
         ("break-glow", "Removing the parent key when minifing prevents blocks in the same sprite from "
-                       "glowing correctly due to a js error - minify futher and allow this error to occur")
+                       "glowing correctly due to a js error - minify futher and allow this error to occur"),
+        ("gen-lut-runtime", "Generate AND/OR/XOR tables at runtime rather than adding pregenerated ones to "
+                            "the file. This reduces file size significantly (by ~0.7MB) at the cost of "
+                            "~0.4s spent generating the lookup tables on the first time running the "
+                            "project (~0.01s on TurboWarp)"),
     ]:
       self.add_item(name, desc)
     self.end_section()
@@ -65,7 +69,7 @@ def main():
   )
   parser.add_argument(
     "-M",
-    choices=["all", "none", "general", "break-glow"],
+    choices=["all", "none", "general", "break-glow", "gen-lut-runtime"],
     action="append",
     dest="minify",
     default=None,
@@ -125,14 +129,15 @@ def main():
     passes = {[*filter(lambda x: x.name == o, optimizer.ALL_OPTIMIZATIONS)][0] for o in opti_opts if o != "compiler"}
 
   minify_opts = args.minify or ["general"]
-  minify = minify_break_glow = False
+  minify = minify_break_glow = gen_lut_runtime = False
   if "none" in minify_opts:
     pass
   elif "all" in minify_opts:
-    minify = minify_break_glow = True
+    minify = minify_break_glow = gen_lut_runtime = True
   else:
     minify = "general" in minify_opts
     minify_break_glow = "break-glow" in minify_opts
+    gen_lut_runtime = "gen-lut-runtime" in minify_opts
 
   scfg = scratch.ScratchConfig(
     minify=minify,
@@ -148,6 +153,7 @@ def main():
     local_stack_size=args.local_stack_size,
     max_branch_recursion=args.max_branch_recursion,
     accurate_byte_spacing=not args.no_accurate_byte_spacing,
+    gen_lut_runtime=gen_lut_runtime,
     scratch_config=scfg,
   )
 

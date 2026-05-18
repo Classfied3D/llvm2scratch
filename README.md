@@ -43,11 +43,12 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ```
 usage: llvm2scratch [-h] [-o OUTPUT] [--format {infer,project3,sprite3}]
                     [-O {all,none,compiler,assignment-elision,known-value-prop}]
-                    [-M {all,none,general,break-glow}] [--memory-size MEMORY_SIZE]
-                    [--local-stack-size LOCAL_STACK_SIZE]
+                    [-M {all,none,general,break-glow,gen-lut-runtime}]
+                    [--memory-size MEMORY_SIZE] [--local-stack-size LOCAL_STACK_SIZE]
                     [--max-branch-recursion MAX_BRANCH_RECURSION]
-                    [--no-accurate-byte-spacing] [--debug-scratch-code DEBUG_SCRATCH_CODE]
-                    [--replace-hacked-blocks] [--hide-blocks]
+                    [--no-accurate-byte-spacing] [--debug-scratch-text DEBUG_SCRATCH_TEXT]
+                    [--debug-scratchblocks DEBUG_SCRATCHBLOCKS] [--replace-hacked-blocks]
+                    [--hide-blocks]
                     input
 
 Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)
@@ -64,7 +65,7 @@ options:
                         file's extension.
   -O {all,none,compiler,assignment-elision,known-value-prop}
                         Optimizations to apply; defaults to all; see below
-  -M {all,none,general,break-glow}
+  -M {all,none,general,break-glow,gen-lut-runtime}
                         Minify settings to apply; defaults to general; see below
   --memory-size MEMORY_SIZE
                         Number of 'bytes' on 'memory' list; max value is 200,000; default is
@@ -112,6 +113,10 @@ minify options:
   break-glow            Removing the parent key when minifing prevents blocks in the same
                         sprite from glowing correctly due to a js error - minify futher and
                         allow this error to occur
+  gen-lut-runtime       Generate AND/OR/XOR tables at runtime rather than adding
+                        pregenerated ones to the file. This reduces file size significantly
+                        (by ~0.7MB) at the cost of ~0.4s spent generating the lookup tables
+                        on the first time running the project (~0.01s on TW)
 ```
 
 ## Block Perf
