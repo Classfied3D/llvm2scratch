@@ -82,6 +82,9 @@ options:
                         indexing to be more accurate at the cost of requiring ~3x more space
                         in the memory list. Disabling this may break programs that rely on
                         an 8-bit byte size, like memcpy on an array of i32s or optimized IR.
+  --entrypoint ENTRYPOINT
+                        Specify a custom entrypoint function to run once the program starts.
+                        Defaults to main.
   --debug-scratch-text DEBUG_SCRATCH_TEXT
                         Output readable scratch code to a text file so it can be viewed
   --debug-scratchblocks DEBUG_SCRATCHBLOCKS

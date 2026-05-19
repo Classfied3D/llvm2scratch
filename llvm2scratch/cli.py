@@ -86,6 +86,8 @@ def main():
     help="Disable extra padding bytes added to each value in memory so that it takes up the space it would normally in bytes. "
          "This allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "
          "Disabling this may break programs that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR.")
+  parser.add_argument("--entrypoint", type=str, default=defaults.entrypoint,
+    help=f"Specify a custom entrypoint function to run once the program starts. Defaults to {defaults.entrypoint}.")
   parser.add_argument(
     "--debug-scratch-text",
     type=Path,
@@ -153,6 +155,7 @@ def main():
     local_stack_size=args.local_stack_size,
     max_branch_recursion=args.max_branch_recursion,
     accurate_byte_spacing=not args.no_accurate_byte_spacing,
+    entrypoint=args.entrypoint,
     gen_lut_runtime=gen_lut_runtime,
     scratch_config=scfg,
   )
