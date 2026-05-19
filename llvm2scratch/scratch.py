@@ -1422,12 +1422,11 @@ def scratchCompare(left: Known, right: Known) -> float:
 
 def escapeScratchBlocksStr(val: str):
   # Escape special characters
-  res = val \
-    .replace("\\", "\\\\") \
-    .replace("]", "\\]") \
-    .replace(">", "\\>") \
-    .replace(")", "\\)") \
-    .replace("::", "\\:\\:")
+  res = val.replace("::", "\\:\\:")
+
+  special_chars = r"\()[]<>"
+  for char in special_chars:
+    res = res.replace(char, fr"\{char}")
 
   # Escape " v" so scratchblocks doesn't mistake this as a dropdown
   if res.endswith(" v"):
