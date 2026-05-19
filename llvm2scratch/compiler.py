@@ -3662,7 +3662,7 @@ def buildLookupTableComptime(op: Literal["and", "or", "xor"], ctx: Context) -> C
 
 def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
-  ctx.needs_and_lut = ctx.needs_or_lut = ctx.needs_xor_lut = True
+
   if ctx.cfg.gen_lut_runtime:
     if ctx.needs_and_lut or ctx.needs_or_lut or ctx.needs_xor_lut:
       # Fast runtime lookup table generator. See my project: https://scratch.mit.edu/projects/1304776208/
