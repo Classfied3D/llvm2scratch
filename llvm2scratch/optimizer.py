@@ -9,36 +9,10 @@ from enum import Enum
 import math
 
 from . import scratch as sb3
+from . import target
 
 # Prevent an infinite loop of optimisations
 MAX_OPTIMIZATIONS = 50
-
-# Time (s) per 1,000,000 iterations
-SET_VAR_COST = 7.550
-GET_VAR_COST = 1.538
-GET_PARAM_COST = 1.178
-MATHOP_COST = 0.765
-MOD_COST = 0.715
-RAND_COST = 2.473
-NOT_COST = 0.725
-AND_OR_COST = 0.864
-COMPARISON_COST = 0.929
-MATH_FUNC_COST = 1.607
-JOIN_COST = 1.091
-LETTER_OF_COST = 0.737
-LENGTH_OF_STR_COST = 0.483
-CONTAINS_STR_COST = 1.272
-BOOL_TO_FLOAT_COST = 0.304 # Bool to float uses round on a boolean value, which is cheaper than a round on a fp value
-ROUND_COST = 1.250
-GET_LIST_COST = 5.814 # Unreliable benchmark
-GET_ITEM_COST = 1.679
-ITEM_NUM_COST = 4.920 # Unreliable benchmark
-LIST_LEN_COST = 0.713
-GET_COUNTER_COST = 0.190
-ANSWER_COST = 0.331
-COSTUME_NUMBER_COST = 0.241
-COSTUME_NAME_COST = 0.654
-KNOWN_COST = 0 # Included in the cost of the block that uses it
 
 LookupFunc = Callable[[str, sb3.Known], sb3.Known | None]
 
@@ -611,58 +585,57 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
   assert info.might_call.issuperset(info.always_call)
   return info
 
-def getValueCost(value: sb3.Value) -> float:
+def getValueCost(value: sb3.Value, perf: target.TargetPerf) -> float:
   match value:
     case sb3.Known():
-      cost = KNOWN_COST
+      cost = 0 # Included in the cost of the block that uses it
     case sb3.CostumeInfo():
-      if value.op == "number":         cost = COSTUME_NUMBER_COST
-      elif value.op == "name":         cost = COSTUME_NAME_COST
-    case sb3.GetCounter():             cost = GET_COUNTER_COST
+      if value.op == "number":         cost = perf.cost_num
+      elif value.op == "name":         cost = perf.cost_name
+    case sb3.GetCounter():             cost = perf.counter
     case sb3.Op():
-      if value.op in ["add", "sub", "mul", "div"]: cost = MATHOP_COST
-      elif value.op == "mod":          cost = MOD_COST
-      elif value.op == "length_of":    cost = LENGTH_OF_STR_COST
-      elif value.op == "letter_n_of":  cost = LETTER_OF_COST
-      elif value.op == "join":         cost = JOIN_COST
-      elif value.op == "rand_between": cost = RAND_COST
-      elif value.op == "round":        cost = ROUND_COST
-      elif value.op == "bool_to_float":  cost = BOOL_TO_FLOAT_COST
-      elif value.op == "str_to_float": cost = 0 # Usually a no-op
-      else:                            cost = MATH_FUNC_COST
+      cost = {
+        "add": perf.add, "sub": perf.sub, "mul": perf.mul, "div": perf.div,
+        "rand": perf.rand, "join": perf.join, "letter_of": perf.letter_of,
+        "length_of": perf.length_of_str, "mod": perf.mod, "abs": perf.abs,
+        "floor": perf.floor, "ceil": perf.ceil, "sqrt": perf.sqrt,
+        "sin": perf.sin, "cos": perf.cos, "tan": perf.tan,
+        "asin": perf.asin, "acos": perf.acos, "atan": perf.atan,
+        "ln": perf.ln, "log": perf.log, "e ^": perf.exp, "10 ^": perf.pow10,
+        "bool_to_float": perf.round, # Internally uses round(_)
+        "str_to_float": perf.add,    # Internally uses _ + 0
+      }[value.op]
     case sb3.BoolOp():
-      if value.op in ["=", "<", ">"]:  cost = COMPARISON_COST
-      elif value.op in ["and", "or"]:  cost = AND_OR_COST
-      elif value.op == "not":          cost = NOT_COST
-      elif value.op == "contains":     cost = CONTAINS_STR_COST
-      else:
-        raise OptimizerException(f"Unknown BoolOp opcode, {value.op}")
-    case sb3.GetAnswer():              cost = ANSWER_COST
+      cost = {
+        ">": perf.gt, "<": perf.lt, "=": perf.eq, "and": perf.and_,
+        "or": perf.or_, "not": perf.not_, "contains": perf.contains_str,
+      }[value.op]
+    case sb3.GetAnswer():              cost = perf.answer
     # Temporary solution to prevent it from being elided across another var
     case sb3.DaysSince2000():          cost = float("inf")
-    case sb3.GetVar():                 cost = GET_VAR_COST
-    case sb3.GetList():                cost = GET_LIST_COST
+    case sb3.GetVar():                 cost = perf.get_var
+    case sb3.GetList():                cost = perf.get_list
     case sb3.GetOfList():
-      cost = GET_ITEM_COST if value.op == "atindex" else ITEM_NUM_COST
-    case sb3.GetListLength():          cost = LIST_LEN_COST
-    case sb3.GetParam():           cost = GET_PARAM_COST
+      cost = perf.at_index if value.op == "atindex" else perf.index_of
+    case sb3.GetListLength():          cost = perf.length_of_list
+    case sb3.GetParam():               cost = perf.param
     case _:
       raise OptimizerException(f"Unknown value, {type(value)}")
 
   match value:
     case sb3.Op() | sb3.BoolOp():
-      cost += getValueCost(value.left)
+      cost += getValueCost(value.left, perf)
       if value.right is not None:
-        cost += getValueCost(value.right)
+        cost += getValueCost(value.right, perf)
     case sb3.GetOfList():
-      cost += getValueCost(value.value)
+      cost += getValueCost(value.value, perf)
 
   return cost
 
-def shouldElide(value: sb3.Value, times_used: float) -> bool:
-  calc_cost = getValueCost(value)
+def shouldElide(value: sb3.Value, times_used: float, perf: target.TargetPerf) -> bool:
+  calc_cost = getValueCost(value, perf)
   elision_cost = calc_cost * times_used
-  no_elision_cost = SET_VAR_COST + calc_cost + (GET_VAR_COST * times_used)
+  no_elision_cost = perf.set_var + calc_cost + (perf.get_var * times_used)
   return no_elision_cost > elision_cost
 
 def assignmentElisionValue(value: sb3.Value, to_elide: dict[str, sb3.Value]) -> tuple[sb3.Value, bool]:
@@ -720,6 +693,7 @@ def assignmentElisionBlock(blocklist: sb3.BlockList, to_elide: dict[str, sb3.Val
   return new_blocklist, did_opti
 
 def assignmentElision(proj: sb3.Project,
+                      perf: target.TargetPerf,
                       dont_remove: set[str] | None = None, \
                       ignore_external_change: set[str] | None = None
   ) -> tuple[sb3.Project, bool]:
@@ -890,7 +864,7 @@ def assignmentElision(proj: sb3.Project,
       # Calculate if it is actually faster to elide
       slower_to_elide: set[str] = set()
       for var_name, (_, value) in to_elide.items():
-        if not shouldElide(value, var_use_counts.get(var_name, 0)):
+        if not shouldElide(value, var_use_counts.get(var_name, 0), perf):
           slower_to_elide.add(var_name)
       for var_name in slower_to_elide:
         del to_elide[var_name]
@@ -916,6 +890,7 @@ def assignmentElision(proj: sb3.Project,
   return proj, did_total_opti
 
 def optimize(proj: sb3.Project,
+             perf: target.TargetPerf,
              all_opti: set[Optimization] | None = None,
              dont_remove: set[str] | None = None,
              ignore_external_change: set[str] | None = None,
@@ -936,7 +911,7 @@ def optimize(proj: sb3.Project,
     current_opti = opti_to_perform.pop()
     match current_opti:
       case Optimization.ASSIGNMENT_ELISION:
-        proj, did_opti = assignmentElision(proj, dont_remove, ignore_external_change)
+        proj, did_opti = assignmentElision(proj, perf, dont_remove, ignore_external_change)
       case Optimization.KNOWN_VALUE_PROPAGATION:
         proj, did_opti = knownValuePropagation(proj, lookup_func)
       case _:

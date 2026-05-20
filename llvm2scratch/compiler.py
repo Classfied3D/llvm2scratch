@@ -14,6 +14,7 @@ import math
 from . import graph_util as util
 from . import scratch as sb3
 from . import optimizer as opt
+from . import target
 from . import parser
 from . import ir
 
@@ -37,8 +38,9 @@ class DebugInfo:
 @dataclass
 class Config:
   """Config options to pass to the compiler"""
-  opti: bool = True # If optimisations for scratch should be applied
-  opti_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
+  compiler_opt: bool = True # If optimisations for scratch should be applied
+  opt_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
+  opt_target: target.Target = field(default_factory=lambda: target.getTarget(target.DEFAULT_OPT_TARGET))
 
   memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
@@ -467,7 +469,7 @@ def transValue(val: ir.Value,
       if is_global_init:
         assert isinstance(val, ir.GlobalPtrVal)
 
-      if isinstance(val, ir.GlobalPtrVal) and (ctx.cfg.opti or is_global_init):
+      if isinstance(val, ir.GlobalPtrVal) and (ctx.cfg.compiler_opt or is_global_init):
         # Global variables store their address in their variable
         # when optimizations are enabled we use this address directly
         res = sb3.Known(ctx.globvar_to_ptr[val.name])
@@ -636,12 +638,12 @@ def combineIdxbleValues(vals: list[sb3.Value | IdxbleValue]) -> IdxbleValue:
 def genTempVar(ctx: Context) -> str:
   return ctx.cfg.tmp_prefix + random.randbytes(12).hex()
 
-def shouldOptimiseValueUse(val: sb3.Value, times_used: float) -> bool:
+def shouldOptimiseValueUse(val: sb3.Value, times_used: float, ctx: Context) -> bool:
   """Returns if a value that is used multiple times should be stored"""
-  return not opt.shouldElide(val, times_used)
+  return not opt.shouldElide(val, times_used, ctx.cfg.opt_target.perf)
 
 def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAndBlocks:
-  if shouldOptimiseValueUse(val, times_used):
+  if shouldOptimiseValueUse(val, times_used, ctx):
     tmp = genTempVar(ctx)
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
   return ValueAndBlocks(val)
@@ -844,7 +846,7 @@ def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value
 
   carried_sum = sb3.Op(op, raw_sum, carry)
   # When using known values, the optimizer can subtract values from both sides
-  if ctx.cfg.opti: carried_sum = opt.simplifyValue(carried_sum)
+  if ctx.cfg.compiler_opt: carried_sum = opt.simplifyValue(carried_sum)
 
   return carried_sum
 
@@ -858,7 +860,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
   if steps == 0:
     return IdxbleValueAndBlocks()
 
-  if ctx.cfg.opti:
+  if ctx.cfg.compiler_opt:
     # Optimize the values beforehand - helps with finding optimial calculation after optimizations
     left = IdxbleValue([opt.simplifyValue(l) for l in left.vals])
     right = IdxbleValue([opt.simplifyValue(r) for r in right.vals])
@@ -886,7 +888,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
         if i == 0:
           raw = sb3.Op(op_literal, left.vals[0], right.vals[0])
-          cost += opt.getValueCost(raw)
+          cost += opt.getValueCost(raw, ctx.cfg.opt_target.perf)
         else:
           earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
           prev_stored = max(earlier_stored) if earlier_stored else None
@@ -907,7 +909,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
           temp_name = genTempVar(ctx)
           stored_temp_names[i] = temp_name
           blocks.add(sb3.EditVar("set", temp_name, raw))
-          cost += opt.SET_VAR_COST + opt.getValueCost(raw)
+          cost += ctx.cfg.opt_target.perf.set_var + opt.getValueCost(raw, ctx.cfg.opt_target.perf)
 
         if i in stored_temp_names:
           expr_for_mod = sb3.GetVar(stored_temp_names[i])
@@ -915,7 +917,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
           expr_for_mod = raw
 
         mod_node = sb3.Op("mod", expr_for_mod, sb3.Known(modulus))
-        cost += opt.getValueCost(mod_node)
+        cost += opt.getValueCost(mod_node, ctx.cfg.opt_target.perf)
 
         sum_nodes.append(mod_node)
 
@@ -1149,7 +1151,8 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
       lookup_table_method = opt.simplifyValue(
         binOpPartViaLookupTable("and", unknown, sb3.Known(known), width, current_bit_idx, ctx, bits))
       # If it's faster to use a lookup table, then use it!
-      use_lut_method = opt.getValueCost(lookup_table_method) < opt.getValueCost(extract_region_method)
+      perf = ctx.cfg.opt_target.perf
+      use_lut_method = opt.getValueCost(lookup_table_method, perf) < opt.getValueCost(extract_region_method, perf)
 
     if use_lut_method:
       needs_lut = True
@@ -1201,7 +1204,8 @@ def orWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) ->
   a_and_b, needs_and_lut = andWithKnownMask(unknown, not_b, width, ctx)
   a_or_b_with_and = sb3.Op("add", a_and_b, sb3.Known(known))
   a_or_b_specialized_lut = opt.simplifyValue(binOpWithKnownViaLookupTable("or", unknown, known, width, ctx))
-  if opt.getValueCost(a_or_b_with_and) < opt.getValueCost(a_or_b_specialized_lut):
+  perf = ctx.cfg.opt_target.perf
+  if opt.getValueCost(a_or_b_with_and, perf) < opt.getValueCost(a_or_b_specialized_lut, perf):
     return a_or_b_with_and, needs_and_lut, False
   else:
     return a_or_b_specialized_lut, False, True
@@ -1239,7 +1243,8 @@ def xorWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) -
   # a ^ b = a - 2 * (a & b) + b, see README for proof
   a_xor_b_with_and = sb3.Op("add", sb3.Op("sub", unknown, a_and_b_times_2), sb3.Known(known))
   a_xor_b_specialized_lut = opt.simplifyValue(binOpWithKnownViaLookupTable("xor", unknown, known, width, ctx))
-  if opt.getValueCost(a_xor_b_with_and) < opt.getValueCost(a_xor_b_specialized_lut):
+  perf = ctx.cfg.opt_target.perf
+  if opt.getValueCost(a_xor_b_with_and, perf) < opt.getValueCost(a_xor_b_specialized_lut, perf):
     return a_xor_b_with_and, needs_and_lut, False
   else:
     return a_xor_b_specialized_lut, False, True
@@ -1310,7 +1315,7 @@ def binOp(op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
     return binOpWithUnknownViaLookupTable(op, lft, rgt, width, ctx), ctx
 
 def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond, cfg: Config) -> sb3.BooleanValue:
-  special_signed_handling = cfg.opti and \
+  special_signed_handling = cfg.compiler_opt and \
                             mode in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
                             not isinstance(left, sb3.Known) and \
                             not isinstance(right, sb3.Known)
@@ -1860,7 +1865,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           else:
             assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
 
-            if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
+            if instr.is_nsw and instr.is_nuw and ctx.cfg.compiler_opt:
               # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
               res_val = sb3.Op(str_opcode, left, right)
             else:
@@ -1874,7 +1879,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers, got type {type(instr.left.type)}")
           width = instr.left.type.width
 
-          if instr.is_nsw and instr.is_nuw and ctx.cfg.opti:
+          if instr.is_nsw and instr.is_nuw and ctx.cfg.compiler_opt:
             res_val = multiplyNoWrap(width, left, right)
           else:
             blocks_and_value = multiplyWrap(width, left, right, ctx)
@@ -1992,7 +1997,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           # TODO: Reuse if statement to work out if a / b > 0
           left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
-          right_is_temp = shouldOptimiseValueUse(right, 3)
+          right_is_temp = shouldOptimiseValueUse(right, 3, ctx)
           right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
           if right_is_temp:
             assert isinstance(right, sb3.GetVar)
@@ -3572,7 +3577,7 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   init_mem: list[sb3.Known] = []
   ptr = starting_global_addr
   for i, glob in enumerate(mod.global_vars.values()):
-    if not ctx.cfg.opti:
+    if not ctx.cfg.compiler_opt:
       globvar = localizeVar(glob.name, True, None)
       blocks.add(globvar.setValue(sb3.Known(ptr)))
 
@@ -3703,7 +3708,7 @@ def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
               # and combine with an 0x prefix to allow hexadecimal coercion later
               sb3.EditVar("set", f"0x join (a0 {op_name} b0)",
                 sb3.Op("join", sb3.Known("0x"),
-                  sb3.Op("letter_n_of",
+                  sb3.Op("letter_of",
                     sumValueParts([sb3.Op("mul", sb3.GetVar("a0"), sb3.Known(16)), sb3.GetVar("b0"), sb3.Known(1)]),
                     small_table
                   )))
@@ -3726,7 +3731,7 @@ def initLookupTables(ctx: Context) -> tuple[sb3.BlockList, Context]:
                     # Use scratch's hexadecimal coercion (e.g. "0x10" -> 16)
                     sb3.Op("str_to_float", sb3.Op("join",
                       sb3.GetVar(f"0x join (a0 {op_name} b0)"),
-                      sb3.Op("letter_n_of",
+                      sb3.Op("letter_of",
                         sb3.Op("add", sb3.GetVar("16b1 + 1"), sb3.GetCounter()),
                         small_table
                       )
@@ -3886,7 +3891,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_scratch2str", ["input", "str", "count"], sb3.BlockList([
-    # Subtract one here so that i can be one indexed (which letter_n_of is)
+    # Subtract one here so that i can be one indexed (which letter_of is)
     sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParam(localizeParam("str")), sb3.Known(1))),
     sb3.EditVar("set", "i", sb3.Known(1)),
     # TODO should use cost variable no idea why not setting
@@ -3913,7 +3918,7 @@ def addForeignFunctions(ctx: Context) -> Context:
       sb3.EditVar("set", "ascii",
         sb3.GetOfList("indexof",
           (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-          sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))))),
+          sb3.Op("letter_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))))),
       sb3.ControlFlow("if",
         sb3.BoolOp("and",
           sb3.BoolOp(">", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1)),
@@ -3922,7 +3927,7 @@ def addForeignFunctions(ctx: Context) -> Context:
         sb3.BlockList([
           # TODO set costume back to original in after helper_scratch2str finishes
           sb3.ProcedureCall("!helper_is_lowercase", [
-            sb3.Op("letter_n_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))),
+            sb3.Op("letter_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))),
             sb3.Op("sub", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1))
           ]),
           sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar(ctx.cfg.return_var), sb3.Known(1)), sb3.BlockList([
@@ -4111,9 +4116,10 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx.proj.code.append(init_blocks)
 
   # Optimise scratch project
-  if cfg.opti:
+  if cfg.compiler_opt:
     ctx.proj = opt.optimize(ctx.proj,
-                            all_opti = cfg.opti_passes,
+                            perf = ctx.cfg.opt_target.perf,
+                            all_opti = cfg.opt_passes,
                             dont_remove = getDontElide(ctx),
                             ignore_external_change = {ctx.cfg.stack_pointer_var},
                             lookup_func = lambda n, i: tableLookup(n, i, ctx))

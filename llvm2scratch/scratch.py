@@ -68,9 +68,9 @@ SHORT_OP_TO_OPCODE = {
   "mul": "operator_multiply",
   "div": "operator_divide",
   "mod": "operator_mod",
-  "rand_between": "operator_random",
+  "rand": "operator_random",
   "join": "operator_join",
-  "letter_n_of": "operator_letter_of",
+  "letter_of": "operator_letter_of",
   "length_of": "operator_length",
   "round": "operator_round",
   "bool_to_float": "operator_round",
@@ -919,7 +919,7 @@ class DaysSince2000(Value):
     return "(days since 2000)"
 
 # Operators
-OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand_between", "join", "letter_n_of", "length_of", "round", "bool_to_float", "str_to_float",
+OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand", "join", "letter_of", "length_of", "round", "bool_to_float", "str_to_float",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
 @dataclass
 class Op(Value):
@@ -946,13 +946,13 @@ class Op(Value):
     takes_one_op = right is None
 
     match self.op:
-      case "rand_between":
+      case "rand":
         lft_param = "FROM"
         rgt_param = "TO"
       case "join":
         lft_param = "STRING1"
         rgt_param = "STRING2"
-      case "letter_n_of":
+      case "letter_of":
         lft_param = "LETTER"
         rgt_param = "STRING"
       case "length_of":
@@ -973,7 +973,7 @@ class Op(Value):
     inputs = {lft_param: raw_left}
     if right is not None:
       casts_right_input_to = casts_left_input_to
-      if self.op == "letter_n_of":
+      if self.op == "letter_of":
         casts_right_input_to = ScratchCast.TO_STR
 
       raw_right, ctx = right.getRawValue(id, ctx, casts_right_input_to)
@@ -998,9 +998,9 @@ class Op(Value):
       case "add" | "sub" | "mul" | "div" | "mod":
         fmt_op = {"add": "+", "sub": "-", "mul": "*", "div": "/", "mod": "mod"}[self.op]
         return f"({left} {fmt_op} {right})"
-      case "rand_between": return f"(pick random {left} to {right})"
+      case "rand": return f"(pick random {left} to {right})"
       case "join":         return f"(join {left} {right})"
-      case "letter_n_of":  return f"(letter {left} of {right})"
+      case "letter_of":  return f"(letter {left} of {right})"
       case "length_of" | "round" | "bool_to_float" | "str_to_float":
         force_colour = "::extension" if sb and self.op in {"bool_to_float", "str_to_float"} else ""
         fmt_op = self.op.replace("_", " ")

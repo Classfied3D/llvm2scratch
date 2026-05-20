@@ -1,6 +1,7 @@
 from . import compiler
 from . import optimizer
 from . import scratch
+from . import target
 
 from pathlib import Path
 import argparse
@@ -41,6 +42,7 @@ class CustomFormatter(argparse.HelpFormatter):
 
 def main():
   defaults = compiler.Config()
+  targets = target.listTargets()
 
   parser = argparse.ArgumentParser(
     description="Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)",
@@ -58,6 +60,12 @@ def main():
     choices=["infer", *(f.value for f in scratch.Format)],
     default="infer",
     help="File format of output file. By default this infered by the output file's extension."
+  )
+  parser.add_argument(
+    "--opt-target",
+    choices=targets,
+    default=defaults.opt_target.id,
+    help=f"Optimize code with this target in mind. Defaults to {defaults.opt_target.id}."
   )
   parser.add_argument(
     "-O",
@@ -120,15 +128,15 @@ def main():
 
   args = parser.parse_args()
 
-  opti_opts = args.optimizations or ["all"]
-  compiler_opti = "all" in opti_opts or "compiler" in opti_opts
+  opt_options = args.optimizations or ["all"]
+  compiler_opt = "all" in opt_options or "compiler" in opt_options
   passes: set[optimizer.Optimization] = set()
-  if "none" in opti_opts:
+  if "none" in opt_options:
     pass
-  elif "all" in opti_opts:
+  elif "all" in opt_options:
     passes = optimizer.ALL_OPTIMIZATIONS
   else:
-    passes = {[*filter(lambda x: x.name == o, optimizer.ALL_OPTIMIZATIONS)][0] for o in opti_opts if o != "compiler"}
+    passes = {[*filter(lambda x: x.name == o, optimizer.ALL_OPTIMIZATIONS)][0] for o in opt_options if o != "compiler"}
 
   minify_opts = args.minify or ["general"]
   minify = minify_break_glow = gen_lut_runtime = False
@@ -149,8 +157,9 @@ def main():
   )
 
   cfg = compiler.Config(
-    opti=compiler_opti,
-    opti_passes=passes,
+    compiler_opt=compiler_opt,
+    opt_passes=passes,
+    opt_target=target.getTarget(args.opt_target),
     memory_size=args.memory_size,
     local_stack_size=args.local_stack_size,
     max_branch_recursion=args.max_branch_recursion,

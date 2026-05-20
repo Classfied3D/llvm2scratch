@@ -1,0 +1,75 @@
+[info]
+name = "Turbowarp"
+url = "https://turbowarp.org"
+formats = ["project3", "sprite3"]
+
+[exec]
+# Lowest crash so far had counter ~2200
+# Reduce this if crashes occur
+max-recursion-counter = 2000
+prefered-recursion-counter = 2000
+
+[perf]
+source = "My (@Classfied3D's) recordings"
+scale = "Time (s) per 5,000,000 iterations (JIT + Warp Timer disabled) in Firefox"
+
+# Looks
+cost-num = 0.807
+cost-name = 3.007
+
+# Control
+counter = 0.544
+# incr-counter = 2.020 # Unused
+
+# Sensing
+answer = 0.426
+
+# Operators
+add = 0.002
+sub = 0.002
+mul = 0.002
+div = 0.002
+rand = 3.599
+gt = 0.418
+lt = 0.419
+eq = 0.419
+and = 0.002
+or = 0.002
+not = 0.002
+join = 0.006
+letter-of = 0.679
+length-of-str = 0.136
+contains-str = 3.853 # Does vary with length but only slightly
+mod = 6.531 # 3.654 when modulus is known with my PR (which unfortunately can't be merged due to fp imprecision)
+round = 0.583
+# f(x) of ...
+abs = 0.847
+floor = 0.843
+ceil = 0.844
+sqrt = 4.589
+sin = 7.505
+cos = 7.527
+tan = 11.125
+asin = 5.656
+acos = 5.779
+atan = 2.513
+ln = 4.981
+log = 5.694
+exp = 1.803
+pow10 = 0.028
+
+# Variables
+get-var = 0.495 # interesting a lot higher when modifing the same value at 4.203
+set-var = 1.307
+# change-var = 5.719 # Unused
+
+# Lists
+# Varies with size - test size was 26
+get-list = 31.636
+at-index = 4.388
+# Varies with size - test size was 26
+index-of = 35.467
+length-of-list = 0.610
+
+# Procedures
+param = 3.796
