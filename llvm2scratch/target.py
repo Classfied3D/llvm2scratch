@@ -4,9 +4,11 @@ from typing import Any
 
 from importlib.resources.abc import Traversable
 from importlib.resources import files
+from copy import deepcopy
 import tomllib
 import dacite
 
+DEFAULT_TARGETS = ["scratch3", "turbowarp3"]
 DEFAULT_OPT_TARGET = "scratch3"
 ESCAPE_KEYWORDS = ["and", "or", "not"]
 
@@ -16,12 +18,20 @@ def getPackageData() -> Traversable:
 def getPackageTargets() -> Traversable:
   return getPackageData().joinpath("targets")
 
+_target_list_cache: list[str] | None = None
 def listTargets() -> list[str]:
+  global _target_list_cache
+  if _target_list_cache is not None:
+    return deepcopy(_target_list_cache)
+
   res: list[str] = []
   for target_file in getPackageTargets().iterdir():
     if target_file.is_file():
       res.append(target_file.name.rsplit(".", 1)[0])
-  return sorted(res)
+  res = sorted(res)
+
+  _target_list_cache = deepcopy(res)
+  return res
 
 def dashToUnderscore(data: Any) -> Any:
   if isinstance(data, dict):
@@ -62,12 +72,14 @@ class Target:
 @dataclass(frozen=True)
 class TargetInfo:
   name: str
+  url: str
+  desc: str
   formats: list[str]
 
 @dataclass(frozen=True)
 class TargetExec:
-  max_recursion_counter: int
-  prefered_recursion_counter: int
+  max_branch_recursion: int
+  preferred_branch_recursion: int
 
 @dataclass(frozen=True)
 class TargetPerf:

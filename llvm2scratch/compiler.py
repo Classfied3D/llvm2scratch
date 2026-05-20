@@ -38,6 +38,8 @@ class DebugInfo:
 @dataclass
 class Config:
   """Config options to pass to the compiler"""
+  targets: list[target.Target] = field(default_factory=lambda: [target.getTarget(t) for t in target.DEFAULT_TARGETS])
+
   compiler_opt: bool = True # If optimisations for scratch should be applied
   opt_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
   opt_target: target.Target = field(default_factory=lambda: target.getTarget(target.DEFAULT_OPT_TARGET))

@@ -41,12 +41,12 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 ## Usage
 
 ```
-usage: llvm2scratch [-h] [-o OUTPUT] [--format {infer,project3,sprite3}]
-                    [-O {all,none,compiler,assignment-elision,known-value-prop}]
-                    [-M {all,none,general,break-glow,gen-lut-runtime}]
+usage: llvm2scratch [-h] [-o OUTPUT] [-f {infer,project3,sprite3}] [-T TARGET [TARGET ...]]
+                    [-U TARGET] [-O [OPT_OPTIONS ...]] [-M [MINIFY_OPTIONS ...]]
                     [--memory-size MEMORY_SIZE] [--local-stack-size LOCAL_STACK_SIZE]
                     [--max-branch-recursion MAX_BRANCH_RECURSION]
-                    [--no-accurate-byte-spacing] [--debug-scratch-text DEBUG_SCRATCH_TEXT]
+                    [--no-accurate-byte-spacing] [--entrypoint ENTRYPOINT]
+                    [--debug-scratch-text DEBUG_SCRATCH_TEXT]
                     [--debug-scratchblocks DEBUG_SCRATCHBLOCKS] [--replace-hacked-blocks]
                     [--hide-blocks]
                     input
@@ -60,12 +60,17 @@ options:
   -h, --help            show this help message and exit
   -o OUTPUT, --output OUTPUT
                         Path to the output file (.sb3 or .sprite3)
-  --format {infer,project3,sprite3}
+  -f {infer,project3,sprite3}, --format {infer,project3,sprite3}
                         File format of output file. By default this infered by the output
                         file's extension.
-  -O {all,none,compiler,assignment-elision,known-value-prop}
-                        Optimizations to apply; defaults to all; see below
-  -M {all,none,general,break-glow,gen-lut-runtime}
+  -T TARGET [TARGET ...], --targets TARGET [TARGET ...]
+                        Compile code to support these targets. See list of targets below.
+                        Defaults to scratch3 turbowarp3
+  -U TARGET, --opt-target TARGET
+                        Optimize code with this target in mind. Defaults to scratch3 if
+                        available otherwise the first target listed.
+  -O [OPT_OPTIONS ...]  Optimizations to apply; defaults to all; see below
+  -M [MINIFY_OPTIONS ...]
                         Minify settings to apply; defaults to general; see below
   --memory-size MEMORY_SIZE
                         Number of 'bytes' on 'memory' list; max value is 200,000; default is
@@ -74,14 +79,15 @@ options:
                         Number of 'bytes' on local stack list for storing registers when
                         recursing; max value is 200,000; default is 512
   --max-branch-recursion MAX_BRANCH_RECURSION
-                        Maximum depth of scratch's call stack before resetting it; defaults
-                        to 2000
+                        Maximum depth of scratch's call stack before resetting it; default
+                        depends on targets enabled
   --no-accurate-byte-spacing
                         Disable extra padding bytes added to each value in memory so that it
-                        takes up the space it would normally in bytes. This allows byte
-                        indexing to be more accurate at the cost of requiring ~3x more space
-                        in the memory list. Disabling this may break programs that rely on
-                        an 8-bit byte size, like memcpy on an array of i32s or optimized IR.
+                        takes up the space it would normally in bytes. This spacing allows
+                        byte indexing to be more accurate at the cost of requiring ~3x more
+                        space in the memory list. Disabling this may break programs that
+                        rely on an 8-bit byte size, like memcpy on an array of i32s or
+                        optimized IR.
   --entrypoint ENTRYPOINT
                         Specify a custom entrypoint function to run once the program starts.
                         Defaults to main.
@@ -101,6 +107,16 @@ options:
                         running. Instead export to a project instead of a sprite and don't
                         click on the sprite.
 
+targets:
+  scratch3              Scratch 3.0 (https://scratch.mit.edu): The third and current major
+                        version of Scratch. Interprets scratch code in javascript. Supports
+                        formats: project3, sprite3
+  turbowarp3            TurboWarp (https://turbowarp.org): A mod of Scratch 3.0 with
+                        improved performance and other features. Compiles scratch into
+                        javascript. Accurately runs scratch code with a few different
+                        behaviours, namely a limited max recursion depth. Supports formats:
+                        project3, sprite3
+
 optimization options:
   all, none             Self-explanatory
   compiler              Enable compiler-level optimizations (e.g. addressing globals with
@@ -119,7 +135,7 @@ minify options:
   gen-lut-runtime       Generate AND/OR/XOR tables at runtime rather than adding
                         pregenerated ones to the file. This reduces file size significantly
                         (by ~0.7MB) at the cost of ~0.4s spent generating the lookup tables
-                        on the first time running the project (~0.01s on TW)
+                        on the first time running the project (~0.01s on TurboWarp)
 ```
 
 ## Block Perf

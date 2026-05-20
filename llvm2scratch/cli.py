@@ -1,10 +1,10 @@
+from pathlib import Path
+import argparse
+
 from . import compiler
 from . import optimizer
 from . import scratch
 from . import target
-
-from pathlib import Path
-import argparse
 
 class CustomFormatter(argparse.HelpFormatter):
   def add_item(self, name: str, desc: str):
@@ -17,6 +17,13 @@ class CustomFormatter(argparse.HelpFormatter):
     ])
 
   def format_help(self):
+    self.start_section("targets")
+    for id in target.listTargets():
+      t = target.getTarget(id)
+      fmt_targets = ", ".join(t.info.formats)
+      self.add_item(id, f"{t.info.name} ({t.info.url}): {t.info.desc} Supports formats: {fmt_targets}")
+    self.end_section()
+
     self.start_section("optimization options")
     for name, desc in [
         ("all, none", "Self-explanatory"),
@@ -25,6 +32,7 @@ class CustomFormatter(argparse.HelpFormatter):
     ]:
       self.add_item(name, desc)
     self.end_section()
+
     self.start_section("minify options")
     for name, desc in [
         ("all, none", "Self-explanatory"),
@@ -43,6 +51,8 @@ class CustomFormatter(argparse.HelpFormatter):
 def main():
   defaults = compiler.Config()
   targets = target.listTargets()
+  default_targets = [t.id for t in defaults.targets]
+  default_opt_target = defaults.opt_target.id
 
   parser = argparse.ArgumentParser(
     description="Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)",
@@ -56,29 +66,41 @@ def main():
     help="Path to the output file (.sb3 or .sprite3)"
   )
   parser.add_argument(
-    "--format",
+    "-f", "--format",
     choices=["infer", *(f.value for f in scratch.Format)],
     default="infer",
     help="File format of output file. By default this infered by the output file's extension."
   )
   parser.add_argument(
-    "--opt-target",
+    "-T", "--targets",
+    metavar="TARGET",
     choices=targets,
-    default=defaults.opt_target.id,
-    help=f"Optimize code with this target in mind. Defaults to {defaults.opt_target.id}."
+    nargs="+",
+    default=default_targets,
+    help=f"Compile code to support these targets. See list of targets below. Defaults to " + " ".join(default_targets)
+  )
+  parser.add_argument(
+    "-U", "--opt-target",
+    metavar="TARGET",
+    choices=targets,
+    default=None,
+    help=f"Optimize code with this target in mind. Defaults to {default_opt_target} if "
+         f"available otherwise the first target listed."
   )
   parser.add_argument(
     "-O",
+    metavar="OPT_OPTIONS",
     choices=["all", "none", "compiler", *(o.name for o in optimizer.Optimization)],
-    action="append",
+    nargs="*",
     dest="optimizations",
     default=None,
     help="Optimizations to apply; defaults to all; see below"
   )
   parser.add_argument(
     "-M",
+    metavar="MINIFY_OPTIONS",
     choices=["all", "none", "general", "break-glow", "gen-lut-runtime"],
-    action="append",
+    nargs="*",
     dest="minify",
     default=None,
     help="Minify settings to apply; defaults to general; see below"
@@ -88,11 +110,11 @@ def main():
   parser.add_argument("--local-stack-size", type=int, default=defaults.local_stack_size,
     help=f"Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000; default is "
          f"{defaults.local_stack_size}")
-  parser.add_argument("--max-branch-recursion", type=int, default=defaults.max_branch_recursion,
-    help=f"Maximum depth of scratch's call stack before resetting it; defaults to {defaults.max_branch_recursion}")
+  parser.add_argument("--max-branch-recursion", type=int, default=None,
+    help=f"Maximum depth of scratch's call stack before resetting it; default depends on targets enabled")
   parser.add_argument("--no-accurate-byte-spacing", action="store_true", default=False,
     help="Disable extra padding bytes added to each value in memory so that it takes up the space it would normally in bytes. "
-         "This allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "
+         "This spacing allows byte indexing to be more accurate at the cost of requiring ~3x more space in the memory list. "
          "Disabling this may break programs that rely on an 8-bit byte size, like memcpy on an array of i32s or optimized IR.")
   parser.add_argument("--entrypoint", type=str, default=defaults.entrypoint,
     help=f"Specify a custom entrypoint function to run once the program starts. Defaults to {defaults.entrypoint}.")
@@ -128,6 +150,49 @@ def main():
 
   args = parser.parse_args()
 
+  targets = [target.getTarget(t) for t in args.targets]
+  target_ids = [t.id for t in targets]
+
+  opt_target_id: str | None = args.opt_target
+  if args.opt_target is None:
+    opt_target_id = target_ids[0]
+    if defaults.opt_target.id in target_ids:
+      opt_target_id = defaults.opt_target.id
+  elif opt_target_id not in target_ids:
+    raise ValueError(f"Optimization target (-U/--opt-target) {opt_target_id} should be in supported "
+                     f"targets (-T/--targets) " + " ".join(target_ids))
+  assert isinstance(opt_target_id, str)
+  opt_target = target.getTarget(opt_target_id)
+
+  format_inferred = args.format == "infer"
+  if format_inferred:
+    extension = str(args.output).rsplit(".")[-1]
+    if extension == "sb3":       format = scratch.Format.Project3
+    elif extension == "sprite3": format = scratch.Format.Sprite3
+    else: raise ValueError(f"Could not infer output file format from extension \"{extension}\". "
+                           "Either use a valid extension or set -f/--format")
+  else:
+    format = scratch.Format(args.format)
+
+  for t in targets:
+    if format.value not in t.info.formats:
+      msg = f"Target (-T/--targets) {t.id} does not support format (-f/--format) {format.value}, only supports formats "
+      msg += " ".join(t.info.formats)
+      if format_inferred:
+        msg += f" (hint: format inferred from file extension .{extension}, disable by setting manually with -f)"
+      raise ValueError(msg)
+
+  max_branch_recursion = args.max_branch_recursion
+  max_allowed_branch_recursion, max_abr_reason = min((t.exec.max_branch_recursion, t.info.name) for t in targets)
+  if max_branch_recursion is not None:
+    if max_branch_recursion > max_allowed_branch_recursion:
+      raise ValueError(f"Max branch recursion (--max-branch-recursion) of {max_branch_recursion} exceeds what is allowed "
+                       f"by {max_abr_reason} ({max_allowed_branch_recursion})")
+  else:
+    # Choose preferred, or as close as possible to it
+    max_branch_recursion = min(opt_target.exec.preferred_branch_recursion, max_allowed_branch_recursion)
+  assert isinstance(max_branch_recursion, int)
+
   opt_options = args.optimizations or ["all"]
   compiler_opt = "all" in opt_options or "compiler" in opt_options
   passes: set[optimizer.Optimization] = set()
@@ -139,11 +204,8 @@ def main():
     passes = {[*filter(lambda x: x.name == o, optimizer.ALL_OPTIMIZATIONS)][0] for o in opt_options if o != "compiler"}
 
   minify_opts = args.minify or ["general"]
-  minify = minify_break_glow = gen_lut_runtime = False
-  if "none" in minify_opts:
-    pass
-  elif "all" in minify_opts:
-    minify = minify_break_glow = gen_lut_runtime = True
+  if "all" in minify_opts or "none" in minify_opts:
+    minify = minify_break_glow = gen_lut_runtime = "all" in minify_opts
   else:
     minify = "general" in minify_opts
     minify_break_glow = "break-glow" in minify_opts
@@ -159,10 +221,10 @@ def main():
   cfg = compiler.Config(
     compiler_opt=compiler_opt,
     opt_passes=passes,
-    opt_target=target.getTarget(args.opt_target),
+    opt_target=opt_target,
     memory_size=args.memory_size,
     local_stack_size=args.local_stack_size,
-    max_branch_recursion=args.max_branch_recursion,
+    max_branch_recursion=max_branch_recursion,
     accurate_byte_spacing=not args.no_accurate_byte_spacing,
     entrypoint=args.entrypoint,
     gen_lut_runtime=gen_lut_runtime,
@@ -179,15 +241,6 @@ def main():
   if args.debug_scratchblocks is not None:
     with open(args.debug_scratchblocks, "w") as file:
       file.write(proj.stringify(scratchblocks=True))
-
-  if args.format == "infer":
-    extension = str(args.output).rsplit(".")[-1]
-    if extension == "sb3":       format = scratch.Format.Project3
-    elif extension == "sprite3": format = scratch.Format.Sprite3
-    else: raise ValueError(f"Could not infer output file format from extension \"{extension}\". "
-                           "Either use a valid extension or set --format")
-  else:
-    format = args.format
 
   proj.export(args.output, format)
 

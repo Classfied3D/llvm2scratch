@@ -1,13 +1,18 @@
 [info]
-name = "Turbowarp"
+name = "TurboWarp"
 url = "https://turbowarp.org"
+desc = """\
+A mod of Scratch 3.0 with improved performance and other features. Compiles \
+scratch into javascript. Accurately runs scratch code with a few different \
+behaviours, namely a limited max recursion depth.\
+"""
 formats = ["project3", "sprite3"]
 
 [exec]
 # Lowest crash so far had counter ~2200
 # Reduce this if crashes occur
-max-recursion-counter = 2000
-prefered-recursion-counter = 2000
+max-branch-recursion = 2000
+preferred-branch-recursion = 2000
 
 [perf]
 source = "My (@Classfied3D's) recordings"

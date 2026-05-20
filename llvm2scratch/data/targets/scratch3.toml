@@ -1,12 +1,13 @@
 [info]
 name = "Scratch 3.0"
 url = "https://scratch.mit.edu"
+desc = "The third and current major version of Scratch. Interprets scratch code in javascript."
 formats = ["project3", "sprite3"]
 
 [exec]
-max-recursion-counter = 3_000_000
+max-branch-recursion = 3_000_000
 # See https://www.desmos.com/calculator/raio3grkld
-prefered-recursion-counter = 300_000
+preferred-branch-recursion = 300_000
 
 [perf]
 source = "https://scratch.mit.edu/projects/1030987979/ by @ChromeCat"
