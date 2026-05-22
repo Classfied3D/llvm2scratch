@@ -1100,6 +1100,7 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
   parts = []
   groups = getKnownBitGroups(known, width)
   i = 0
+  reg_len = None
   while current_bit_idx < width:
     bit, length = groups[i]
     # X & 0 = 0
@@ -1127,9 +1128,6 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
       j += 1
       if j >= len(groups): break
 
-    last_region_index = j - 1
-    last_region_cut_off_by = reg_len - (current_reg_bit_idx - region_end)
-
     # Calculate the cost of extracting the values in each region
     extract_region = lambda idx, r_len: extractBits(unknown, width, idx, r_len, in_place=True)[0]
     extracted_regions: list[sb3.Value] = []
@@ -1152,6 +1150,12 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
       use_lut_method = opt.getValueCost(lookup_table_method, perf) < opt.getValueCost(extract_region_method, perf)
 
     if use_lut_method:
+      # This should not occur as reg_len is always int if len(next_regions) == 0
+      assert reg_len is not None
+
+      last_region_index = j - 1
+      last_region_cut_off_by = reg_len - (current_reg_bit_idx - region_end)
+
       needs_lut = True
 
       assert lookup_table_method is not None
