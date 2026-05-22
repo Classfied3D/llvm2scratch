@@ -854,8 +854,6 @@ def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value
 
 def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: IdxbleValue, width: int, ctx: Context) \
     -> IdxbleValueAndBlocks:
-  op_literal: Literal["add", "sub"] = op # well done python type checker
-
   steps = len(left.vals)
   assert steps == len(right.vals)
   assert steps == math.ceil(width / VARIABLE_MAX_BITS)
@@ -889,7 +887,7 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
         modulus = 2 ** (VARIABLE_MAX_BITS if i != steps - 1 else width % VARIABLE_MAX_BITS)
 
         if i == 0:
-          raw = sb3.Op(op_literal, left.vals[0], right.vals[0])
+          raw = sb3.Op(op, left.vals[0], right.vals[0])
           cost += opt.getValueCost(raw, ctx.cfg.opt_target.perf)
         else:
           earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
@@ -1051,9 +1049,6 @@ def binOpWithKnownViaLookupTable(
   responsible for ensuring the respective lookup table is created.
   """
 
-  # Type checker moment
-  op_literal: Literal["and", "or", "xor"] = op
-
   i = 0
   final_offset = 0
   parts = []
@@ -1072,7 +1067,7 @@ def binOpWithKnownViaLookupTable(
       if i >= width: break
 
     bits = min(BINOP_LOOKUP_BITS, width - i)
-    parts.append(binOpPartViaLookupTable(op_literal, unknown, sb3.Known(known), width, i, ctx, bits))
+    parts.append(binOpPartViaLookupTable(op, unknown, sb3.Known(known), width, i, ctx, bits))
     i += BINOP_LOOKUP_BITS
 
   if final_offset > 0: parts.append(sb3.Known(final_offset))
