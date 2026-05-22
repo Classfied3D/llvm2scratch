@@ -15,66 +15,65 @@ max-branch-recursion = 2000
 preferred-branch-recursion = 2000
 
 [perf]
-source = "My (@Classfied3D's) recordings"
-scale = "Time (s) per 5,000,000 iterations (JIT + Warp Timer disabled) in Firefox"
+source = "https://github.com/Classfied3D/turbowarp-perf"
+scale = "Time (ms) per 100,000,000 runs (Firefox, JIT disabled)"
 
 # Looks
-cost-num = 0.807
-cost-name = 3.007
+cost-num = 2133
+cost-name = 14398
 
 # Control
-counter = 0.544
-# incr-counter = 2.020 # Unused
+counter = 1745
 
 # Sensing
-answer = 0.426
+answer = 1717
 
 # Operators
-add = 0.002
-sub = 0.002
-mul = 0.002
-div = 0.002
-rand = 3.599
-gt = 0.418
-lt = 0.419
-eq = 0.419
-and = 0.002
-or = 0.002
-not = 0.002
-join = 0.006
-letter-of = 0.679
-length-of-str = 0.136
-contains-str = 3.853 # Does vary with length but only slightly
-mod = 6.531 # 3.654 when modulus is known with my PR (which unfortunately can't be merged due to fp imprecision)
-round = 0.583
+add = 46.4
+sub = 46.9
+mul = 55.4
+div = 45.8
+rand = 11726
+# The more expensive versions of these functions can sometimes be called with .toLowerCase
+# The cheaper cost is 1498.7
+# TODO: use cheaper cost when applicable
+gt = 17112
+lt = 17112
+eq = 1130.5
+and = 52.5
+or = 54.1
+not = 54.2
+join = 103.6
+letter-of = 3201.4
+length-of-str = 1388.2
+contains-str = 8334 # Does vary with length but only slightly
+mod = 9620
+round = 3067
 # f(x) of ...
-abs = 0.847
-floor = 0.843
-ceil = 0.844
-sqrt = 4.589
-sin = 7.505
-cos = 7.527
-tan = 11.125
-asin = 5.656
-acos = 5.779
-atan = 2.513
-ln = 4.981
-log = 5.694
-exp = 1.803
-pow10 = 0.028
+abs = 2952
+floor = 3019
+ceil = 3053
+sqrt = 3005
+sin = 12476
+cos = 11718
+tan = 25207
+asin = 6132
+acos = 6050
+atan = 5976
+ln = 3872
+log = 5515
+exp = 4605
+pow10 = 610
 
 # Variables
-get-var = 0.495 # interesting a lot higher when modifing the same value at 4.203
-set-var = 1.307
-# change-var = 5.719 # Unused
+get-var = 942.1
+set-var = 5905.7
 
 # Lists
-# Varies with size - test size was 26
-get-list = 31.636
-at-index = 4.388
-# Varies with size - test size was 26
-index-of = 35.467
-length-of-list = 0.610
+get-list = 1203300
+at-index = 2683
+index-of = 3557000
+length-of-list = 1799
 
 # Procedures
-param = 3.796
+param = 942.1 # Same as get var
