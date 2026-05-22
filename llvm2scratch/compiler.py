@@ -1131,7 +1131,7 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
     last_region_cut_off_by = reg_len - (current_reg_bit_idx - region_end)
 
     # Calculate the cost of extracting the values in each region
-    extract_region = lambda idx, reg_len: extractBits(unknown, width, idx, reg_len, in_place=True)[0]
+    extract_region = lambda idx, r_len: extractBits(unknown, width, idx, r_len, in_place=True)[0]
     extracted_regions: list[sb3.Value] = []
     for reg_start, reg_len, _ in next_regions:
       extracted_regions.append(extract_region(reg_start, reg_len))
@@ -2932,7 +2932,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       ]))
 
     case ir.Intrinsic.MemCpy:
-      dest, src, length, volatile = values
+      dest, src, length, _volatile = values
 
       # If the length is unknown and large, we'll use a loop like when it is known
       known_length = isinstance(length, sb3.Known) and \
@@ -3351,8 +3351,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
     is_first_block = True
     total_fn_allocated = 0
     for block in func.blocks.values():
-      call_id = 0
-
       if is_first_block:
         proc_name = fn_name
         localized_params = info.params
@@ -3549,7 +3547,7 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   total_size = sum(sizes)
 
   # Memory layout
-  null = 0
+  null = 0 # type: ignore
   starting_global_addr = 1                               # Global memory is at the start of memory*
   starting_heap_ptr = starting_global_addr + total_size  # Heap starts after global memory
   starting_stack_ptr = ctx.cfg.memory_size               # Stack pointer will first point to the end of memory and grows backward

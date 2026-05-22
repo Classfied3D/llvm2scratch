@@ -167,7 +167,8 @@ class ScratchContext:
     if len(blocks.blocks) == 0: return None
 
     last_id = parent
-    first_id = curr_id = self.genId()
+    curr_id = self.genId()
+    first_id = curr_id
     next_id = self.genId()
     for_each_var_set = False
     end = False
@@ -176,8 +177,6 @@ class ScratchContext:
     while i < len(blocks.blocks):
       block = blocks.blocks[i]
       if i == len(blocks.blocks) - 1: next_id = None
-
-      is_start = last_id is None
 
       assert curr_id is not None
 
@@ -440,11 +439,9 @@ class Known(Value):
   """Something that can be typed in a block input e.g. x in Say(x)"""
   known: str | float | bool
 
-  def __init__(self, val: str | float | bool | int):
-    if not isinstance(val, int):
-      self.known = val
-    else:
-      self.known = float(val)
+  def __post_init__(self):
+    if isinstance(self.known, int):
+      self.known = float(self.known)
 
   def __repr__(self) -> str:
     return self.known.__repr__()
@@ -489,8 +486,8 @@ class Known(Value):
 
 @dataclass
 class KnownBool(Known, BooleanValue):
-  def __init__(self, known: bool):
-    self.known = known
+  def __post_init__(self):
+    assert isinstance(self.known, bool)
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     return Known(int(self.known)).getRawValue(parent, ctx, cast)

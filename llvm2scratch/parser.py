@@ -278,8 +278,6 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
               kw = kw.split(")", 1)[-1]
             has_keyword = True
 
-      is_inbounds = "inbounds" in keywords
-
       ptr_type, _ = parseTypeTokens(parseUntilComma(rest), structs)
 
       return GetElementPtr(

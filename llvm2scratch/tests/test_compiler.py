@@ -66,4 +66,4 @@ class TestBinOp(unittest.TestCase):
           self.assertEqual(float(expected), got.known, f"Op: {op}, Lft: {unknown:032b}, Known: {known:032b}")
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()

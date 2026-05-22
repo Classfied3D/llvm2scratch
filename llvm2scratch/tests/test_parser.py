@@ -34,8 +34,8 @@ class TokenParse(unittest.TestCase):
       (False, ["[ { } ]", "hi", '""', "hello"], '[ { } ]hi ""hello', "", ""))
 
   def testUnmatchingBracketToken(self):
-    with self.assertRaises(ValueError) as context:
-      parseUntil("[ { }} ] hi hello", lambda _: False)
+    with self.assertRaises(ValueError) as _:
+      _ = parseUntil("[ { }} ] hi hello", lambda _: False)
 
   def testInterruptedNormalToken(self):
     self.assertEqual(parseUntilEnd("hi(lol())"), ["hi", "(lol())"])
@@ -50,7 +50,7 @@ class TypeParse(unittest.TestCase):
 
   def testIntFail(self):
     with self.assertRaises(ValueError) as context:
-      parseTypeToken("i3.14", {})
+      _ = parseTypeToken("i3.14", {})
     self.assertIn("unsupported type", str(context.exception).lower())
 
   def testFloat(self):
@@ -123,8 +123,8 @@ class ConstantParse(unittest.TestCase):
     self.assertEqual(parseConstantToken(ty, "s0x01", {}, []), KnownIntVal(ty, 255, 8)) # 255 is equivelent to -1
 
   def testTooLargeInt(self):
-    with self.assertRaises(AssertionError) as context:
-      parseConstantToken(IntegerTy(8), "u0x100", {}, [])
+    with self.assertRaises(AssertionError) as _:
+      _ = parseConstantToken(IntegerTy(8), "u0x100", {}, [])
 
   def testFloat(self):
     parsed = parseConstantToken(DoubleTy(), "-3.1415", {}, [])
@@ -231,4 +231,4 @@ class ConstantParse(unittest.TestCase):
 
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()
