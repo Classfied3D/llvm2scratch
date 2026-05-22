@@ -1,5 +1,5 @@
 from llvm2scratch.scratch import *
-from llvm2scratch.optimizer import optimize
+import llvm2scratch as l2s
 import os
 
 def main():
@@ -82,7 +82,7 @@ def main():
     Say(GetVar("c")),
   ]))
 
-  proj = optimize(proj)
+  proj = l2s.optimizer.optimize(proj, l2s.getTarget("scratch3"))
   proj.export("output/out.sprite3", Format.Sprite3)
 
 if __name__ == "__main__":

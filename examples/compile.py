@@ -1,4 +1,4 @@
-import llvm2scratch
+import llvm2scratch as l2s
 import subprocess
 import os
 
@@ -17,8 +17,8 @@ def main():
                  cwd=os.path.join(script_dir, "input"))
 
   with open("input/demo.ll", "r") as file:
-    proj, _ = llvm2scratch.compile(file.read(), llvm2scratch.Config(compiler_opt=True, gen_lut_runtime=True))
-    proj.export("output/out.sb3", llvm2scratch.Format.Project3)
+    proj, _ = l2s.compile(file.read(), l2s.Config(compiler_opt=True, gen_lut_runtime=True))
+    proj.export("output/out.sb3", l2s.Format.Project3)
 
 if __name__ == "__main__":
   main()
