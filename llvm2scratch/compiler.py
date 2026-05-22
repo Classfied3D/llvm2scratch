@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, field, fields
-from typing import Literal, Callable, cast
 from collections import defaultdict
 from ordered_set import OrderedSet
+from typing import Literal, cast
 from copy import deepcopy
 
 import warnings

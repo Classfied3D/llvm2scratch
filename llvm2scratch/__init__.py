@@ -1,8 +1,6 @@
 from . import optimizer
 from . import compiler
 from . import scratch
-from . import parser
-from . import target
 
 from .optimizer import Optimization, ALL_OPTIMIZATIONS
 from .compiler import Config, DebugInfo, compile
