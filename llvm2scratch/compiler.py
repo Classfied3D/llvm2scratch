@@ -421,7 +421,7 @@ def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tu
       # the intermediate range
       if cuml_max_val + this_max_val >= max_intermediate:
         final_val = sb3.Op("mod", final_val, sb3.Known(2**PTR_WIDTH_BITS))
-        max_val = 2**PTR_WIDTH_BITS
+        this_max_val = 2**PTR_WIDTH_BITS
 
       cuml_max_val += this_max_val
       final_val = sb3.Op("add", final_val, multiply_offset(index_val, multiplier))
