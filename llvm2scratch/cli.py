@@ -164,6 +164,7 @@ def main():
   assert isinstance(opt_target_id, str)
   opt_target = target.getTarget(opt_target_id)
 
+  extension = None
   format_inferred = args.format == "infer"
   if format_inferred:
     extension = str(args.output).rsplit(".")[-1]
@@ -179,6 +180,7 @@ def main():
       msg = f"Target (-T/--targets) {t.id} does not support format (-f/--format) {format.value}, only supports formats "
       msg += " ".join(t.info.formats)
       if format_inferred:
+        assert extension is not None
         msg += f" (hint: format inferred from file extension .{extension}, disable by setting manually with -f)"
       raise ValueError(msg)
 

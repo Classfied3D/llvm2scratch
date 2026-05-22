@@ -333,11 +333,13 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
 
       # Skip over fast math flags
       cond_found = False
+      cond = None
       while not cond_found:
         cond_str, rest = rest.split(" ", 1)
         if cond_str in FCmpCond:
           cond_found = True
           cond = FCmpCond(cond_str)
+      assert cond is not None
 
       return FCmp(result, cond, decodeValue(left, mod, structs, func_names), decodeValue(right, mod, structs, func_names))
 

@@ -586,6 +586,7 @@ def getBlockListVarUse(blocklist: sb3.BlockList, func_info: dict[str, BlockListI
   return info
 
 def getValueCost(value: sb3.Value, perf: target.TargetPerf) -> float:
+  cost = None
   match value:
     case sb3.Known():
       cost = 0 # Included in the cost of the block that uses it
@@ -621,6 +622,8 @@ def getValueCost(value: sb3.Value, perf: target.TargetPerf) -> float:
     case sb3.GetParam():               cost = perf.param
     case _:
       raise OptimizerException(f"Unknown value, {type(value)}")
+
+  assert cost is not None
 
   match value:
     case sb3.Op() | sb3.BoolOp():

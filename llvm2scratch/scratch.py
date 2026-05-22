@@ -296,10 +296,12 @@ class ScratchContext:
       return random.randbytes(16).hex()
     else:
       invalid = True
+      id = None
       while invalid:
         id = self.numericToStrUID(self.generated_ids)
         invalid = id in PALETTE_UIDS
         self.generated_ids += 1
+      assert id is not None
       return id
 
 class ScratchCast(Enum):
@@ -1040,6 +1042,7 @@ class BoolOp(BooleanValue):
       assert self.right is not None
       raw_right, ctx = self.right.getRawValue(id, ctx, ScratchCast.TO_STR)
 
+    rgt_param = None
     match self.op:
       case "not":
         lft_param = "OPERAND"
@@ -1052,7 +1055,9 @@ class BoolOp(BooleanValue):
 
     inputs = {}
     if raw_left is not None: inputs.update({lft_param: raw_left})
-    if raw_right is not None: inputs.update({rgt_param: raw_right})
+    if raw_right is not None:
+      assert rgt_param is not None
+      inputs.update({rgt_param: raw_right})
 
     ctx.addBlock(id, RawBlock({
       "opcode": SHORT_OP_TO_OPCODE[self.op],
