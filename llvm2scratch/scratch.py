@@ -632,7 +632,7 @@ class Broadcast(Block):
       inner = self.value.stringify(sb, dropdown=True)
     else:
       inner = self.value.stringify(sb)
-    return f"broadcast {self.value.stringify(sb)}" + (" and wait" if self.wait else "")
+    return f"broadcast {inner}" + (" and wait" if self.wait else "")
 
 @dataclass
 class OnBroadcast(StartBlock):
