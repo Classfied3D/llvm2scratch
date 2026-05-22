@@ -37,6 +37,7 @@ class CustomFormatter(argparse.HelpFormatter):
     for name, desc in [
         ("all, none", "Self-explanatory"),
         ("general", "Optimize project.json's size by simplifing uids, removing falsy fields, etc"),
+        ("compiler", "Optimize code for size in the compiler e.g. sub 1 instead of add 2^N - 1"),
         ("break-glow", "Removing the parent key when minifing prevents blocks in the same sprite from "
                        "glowing correctly due to a js error - minify futher and allow this error to occur"),
         ("gen-lut-runtime", "Generate AND/OR/XOR tables at runtime rather than adding pregenerated ones to "
@@ -99,7 +100,7 @@ def main():
   parser.add_argument(
     "-M",
     metavar="MINIFY_OPTIONS",
-    choices=["all", "none", "general", "break-glow", "gen-lut-runtime"],
+    choices=["all", "none", "general", "compiler", "break-glow", "gen-lut-runtime"],
     nargs="*",
     dest="minify",
     default=None,
@@ -207,9 +208,10 @@ def main():
 
   minify_opts = args.minify or ["general"]
   if "all" in minify_opts or "none" in minify_opts:
-    minify = minify_break_glow = gen_lut_runtime = "all" in minify_opts
+    minify = compiler_minify = minify_break_glow = gen_lut_runtime = "all" in minify_opts
   else:
     minify = "general" in minify_opts
+    compiler_minify = "compiler" in minify_opts
     minify_break_glow = "break-glow" in minify_opts
     gen_lut_runtime = "gen-lut-runtime" in minify_opts
 
@@ -222,6 +224,7 @@ def main():
 
   cfg = compiler.Config(
     compiler_opt=compiler_opt,
+    compiler_minify=compiler_minify,
     opt_passes=passes,
     opt_target=opt_target,
     memory_size=args.memory_size,

@@ -40,7 +40,8 @@ class Config:
   """Config options to pass to the compiler"""
   targets: list[target.Target] = field(default_factory=lambda: [target.getTarget(t) for t in target.DEFAULT_TARGETS])
 
-  compiler_opt: bool = True # If optimisations for scratch should be applied
+  compiler_opt: bool = True # If compiler should be applied
+  compiler_minify: bool = True # If the compiler should minify expressions (e.g. sub 1 instead of adding 2^N-1)
   opt_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
   opt_target: target.Target = field(default_factory=lambda: target.getTarget(target.DEFAULT_OPT_TARGET))
 
@@ -649,6 +650,9 @@ def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAn
     tmp = genTempVar(ctx)
     return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
   return ValueAndBlocks(val)
+
+def chooseFastestValue(vals: list[sb3.Value], ctx: Context) -> sb3.Value:
+  return min(vals, key=lambda val: opt.getValueCost(val, ctx.cfg.opt_target.perf))
 
 def scratchRuntimeError(message: str) -> sb3.BlockList:
   # TODO: this would be logged to stdout
@@ -1824,13 +1828,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       blocks.add(res_var.setValue(sb3.Op("sub", sb3.Known(0), operand)))
 
     case ir.BinaryOp(): # Do a calculation with two values
-      left = transValue(instr.left, ctx, bctx)
-      blocks.add(left.blocks)
-      left = left.value
+      lft = transValue(instr.left, ctx, bctx)
+      blocks.add(lft.blocks)
+      lft = lft.value
 
-      right = transValue(instr.right, ctx, bctx)
-      blocks.add(right.blocks)
-      right = right.value
+      rgt = transValue(instr.right, ctx, bctx)
+      blocks.add(rgt.blocks)
+      rgt = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -1840,13 +1844,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub | ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor:
           pass
         case _:
-          if isinstance(left, IdxbleValue) or \
-             isinstance(right, IdxbleValue):
+          if isinstance(lft, IdxbleValue) or \
+             isinstance(rgt, IdxbleValue):
             raise CompException(f"Indexable value not supported in binop {instr}")
 
       match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
-          str_opcode = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+          op = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
 
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add/sub only supports "
@@ -1855,40 +1859,120 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           width = instr.left.type.width
 
           if width > VARIABLE_MAX_BITS:
-            assert isinstance(left, IdxbleValue) and isinstance(right, IdxbleValue)
+            assert isinstance(lft, IdxbleValue) and isinstance(rgt, IdxbleValue)
 
-            sum = calculateSumDiff(str_opcode, left, right, width, ctx)
+            sum = calculateSumDiff(op, lft, rgt, width, ctx)
             blocks.add(sum.blocks)
             blocks.add(res_var.setAllValues(sum.value))
 
             res_val = False
 
           else:
-            assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+            # 1 variable wide addition/subtraction
+            assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
 
-            if instr.is_nsw and instr.is_nuw and ctx.cfg.compiler_opt:
-              # If no wrapping behaviour is required then under/overflowing is ub so can be ignored
-              res_val = sb3.Op(str_opcode, left, right)
+            if instr.is_nuw:
+              # Cannot overflow - result is guaranteed range [0, 256) for 8 bit
+              res_val = sb3.Op(op, lft, rgt)
             else:
-              res_val = sb3.Op("mod", sb3.Op(str_opcode, left, right),
-                              sb3.Known(2 ** width))
+              known, unknown, lft_is_known = (lft, rgt, True) if isinstance(lft, sb3.Known) else (rgt, lft, False)
+              has_known = isinstance(known, sb3.Known)
+
+              perf = ctx.cfg.opt_target.perf
+              val_reference_cost = opt.getValueCost(lft, perf) + opt.getValueCost(rgt, perf)
+              # res mod 2^N
+              mod_cost = perf.mod
+              # res +/- N(res </> N)
+              alt_cost = perf.add + perf.mul + perf.gt + perf.add * int(not has_known) + val_reference_cost
+              mod_is_faster = mod_cost < alt_cost
+              mod_base: int = 2 ** width
+
+              # Not compatible with nuw
+              # e.g. 1 + -128 -> 1 + 128 (twos comp) -> 129 (twos comp) => no mod step needed
+              #                  1 - 128 (twos comp) -> -127 (intemediate) -> 129 (mod 256) => mod step needed
+              if ctx.cfg.compiler_minify and has_known:
+                assert isinstance(known, sb3.Known)
+                known_val = int(known.known)
+
+                # a + b mod N = a + (b - N) mod N = a - (N - b) mod N
+                # a - b mod N = a - (b - N) mod N = a + (N - b) mod N
+                # b - a mod N = (b - N) - a mod N
+                # so if b is known N - b is smaller then use it and swap operation
+                # the 3rd equality is not available when mod_faster is False
+                # because the min value is lower (0 - N) - N = -2N < -N
+                alt_op = op
+                alt_known = known_val
+                if op == "add": # x + c
+                  alt_op = "sub"
+                  alt_known = mod_base - known_val
+
+                elif not lft_is_known: # x - c
+                  alt_op = "add"
+                  alt_known = mod_base - known_val
+
+                elif mod_is_faster is True: # c - x
+                  alt_known -= mod_base
+
+                # Choose the value that takes up less space in project.json
+                if len(str(alt_known)) < len(str(known_val)):
+                  known = sb3.Known(alt_known)
+                  op = alt_op
+                  if lft_is_known: lft = known
+                  else:            rgt = known
+
+              unwrapped = sb3.Op(op, lft, rgt)
+              if mod_is_faster:
+                res_val = sb3.Op("mod", unwrapped, sb3.Known(mod_base))
+              else:
+                # The highest magnitude adjustment we can make is N, so we never need to adjust more than once, so we can
+                # replace mod with this if it is faster to do so
+                comp_op, k_comp_val, adjustment = (">", mod_base - 1, -mod_base) if op == "add" else ("<", 0, mod_base)
+
+                if not has_known:
+                  if op == "add":
+                    lft_comp_val = unwrapped
+                    rgt_comp_val = sb3.Known(k_comp_val)
+                  else:
+                    # l - r < 0 -> l < r
+                    assert comp_op == "<"
+                    lft_comp_val = lft
+                    rgt_comp_val = rgt
+                else:
+                  assert isinstance(known, sb3.Known)
+                  known_val = int(known.known)
+                  if op == "add" or (op == "sub" and not lft_is_known):
+                    # x + c > N
+                    # x > N - c
+                    k_comp_val -= (-1) ** int(op == "sub") * known_val
+                  else:
+                    # c - x < N
+                    # -x < N - c
+                    # x > c - N
+                    assert comp_op == "<"
+                    k_comp_val = known - k_comp_val
+                    comp_op = ">"
+                  lft_comp_val = unknown
+                  rgt_comp_val = sb3.Known(k_comp_val)
+
+                res_val = sb3.Op("add", unwrapped,
+                  sb3.Op("mul", sb3.BoolOp(comp_op, lft_comp_val, rgt_comp_val), sb3.Known(adjustment)))
 
         case ir.BinaryOpcode.Mul: # Multiply two values
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
           width = instr.left.type.width
 
           if instr.is_nsw and instr.is_nuw and ctx.cfg.compiler_opt:
-            res_val = multiplyNoWrap(width, left, right)
+            res_val = multiplyNoWrap(width, lft, rgt)
           else:
-            blocks_and_value = multiplyWrap(width, left, right, ctx)
+            blocks_and_value = multiplyWrap(width, lft, rgt, ctx)
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
 
         case ir.BinaryOpcode.UDiv: # Divide one value by another (unsigned)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           # TODO OPTI: optimise for known values
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -1902,12 +1986,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           # Division by zero is UB
           if not instr.is_exact:
-            res_val = sb3.Op("floor", sb3.Op("div", left, right))
+            res_val = sb3.Op("floor", sb3.Op("div", lft, rgt))
           else:
-            res_val = sb3.Op("div", left, right) # Value is poison if one is not a multiple of another
+            res_val = sb3.Op("div", lft, rgt) # Value is poison if one is not a multiple of another
 
         case ir.BinaryOpcode.SDiv: # Divide one value by another (signed)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1918,13 +2002,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             raise CompException(f"Instruction {instr} currently supports integers with <= {VARIABLE_MAX_BITS} bits")
 
           if instr.is_exact:
-            signed_left = undoTwosComplement(left, width)
-            signed_right = undoTwosComplement(right, width)
+            signed_lft = undoTwosComplement(lft, width)
+            signed_rgt = undoTwosComplement(rgt, width)
 
-            res_val = twosComplement(sb3.Op("div", signed_left, signed_right), width)
+            res_val = twosComplement(sb3.Op("div", signed_lft, signed_rgt), width)
           else:
-            left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
-            right, rblocks = flatAsTuple(optimizeValueUse(right, 2, ctx))
+            lft, lblocks = flatAsTuple(optimizeValueUse(lft, 2, ctx))
+            rgt, rblocks = flatAsTuple(optimizeValueUse(rgt, 2, ctx))
             blocks.add(lblocks)
             blocks.add(rblocks)
 
@@ -1935,41 +2019,41 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
             # Undo two's complement, divide, round towards zero using floor or ceiling and calculate two's complement
             blocks.add([
-              sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", lft, sb3.Known(point_of_neg)), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", rgt, sb3.Known(point_of_neg)), sb3.BlockList([
                   # If left + right are pos
-                  res_var.setValue(sb3.Op("floor", sb3.Op("div", left, right))),
+                  res_var.setValue(sb3.Op("floor", sb3.Op("div", lft, rgt))),
                 ]), sb3.BlockList([
                   # If left is pos and right is neg
                   res_var.setValue(sb3.Op("add",
                                           sb3.Op("ceiling",
                                             sb3.Op("div",
-                                              left,
-                                              sb3.Op("sub", right, sb3.Known(change)))),
+                                              lft,
+                                              sb3.Op("sub", rgt, sb3.Known(change)))),
                                           sb3.Known(change))),
                 ]))
               ]), sb3.BlockList([
-                sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+                sb3.ControlFlow("if_else", sb3.BoolOp("<", rgt, sb3.Known(point_of_neg)), sb3.BlockList([
                   # If left is neg and right is pos
                   res_var.setValue(sb3.Op("add",
                                           sb3.Op("ceiling",
                                             sb3.Op("div",
-                                              sb3.Op("sub", left, sb3.Known(change)),
-                                              right)),
+                                              sb3.Op("sub", lft, sb3.Known(change)),
+                                              rgt)),
                                           sb3.Known(change))),
                 ]), sb3.BlockList([
                   # If left + right are neg
                   res_var.setValue(sb3.Op("floor",
                                           sb3.Op("div",
-                                            sb3.Op("sub", left, sb3.Known(change)),
-                                            sb3.Op("sub", right, sb3.Known(change))))),
+                                            sb3.Op("sub", lft, sb3.Known(change)),
+                                            sb3.Op("sub", rgt, sb3.Known(change))))),
                 ]))
               ]))
             ])
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.URem: # Calculate remainder (unsigned)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -1981,10 +2065,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           # mod 0 is UB, can ignore
-          res_val = sb3.Op("mod", left, right)
+          res_val = sb3.Op("mod", lft, rgt)
 
         case ir.BinaryOpcode.SRem: # Calculate remainder (signed)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           # TODO OPTI: optimise for known values
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
@@ -1997,9 +2081,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           # TODO: Reuse if statement to work out if a / b > 0
-          left, lblocks = flatAsTuple(optimizeValueUse(left, 2, ctx))
-          right_is_temp = shouldOptimiseValueUse(right, 3, ctx)
-          right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
+          left, lblocks = flatAsTuple(optimizeValueUse(lft, 2, ctx))
+          right_is_temp = shouldOptimiseValueUse(rgt, 3, ctx)
+          right, rblocks = flatAsTuple(optimizeValueUse(rgt, 3, ctx))
           if right_is_temp:
             assert isinstance(right, sb3.GetVar)
           blocks.add(lblocks)
@@ -2065,7 +2149,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           res_val = False # We set res_var ourselves
 
         case ir.BinaryOpcode.Shl: # Calculate left shift
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -2077,10 +2161,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not (instr.is_nsw and instr.is_nuw)
-          res_val, ctx = bitShift("left", width, left, right, ctx, can_shift_out)
+          res_val, ctx = bitShift("left", width, lft, rgt, ctx, can_shift_out)
 
         case ir.BinaryOpcode.LShr: # Calculate right shift (unsigned)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -2092,10 +2176,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not instr.is_exact
-          res_val, ctx = bitShift("right", width, left, right, ctx, can_shift_out)
+          res_val, ctx = bitShift("right", width, lft, rgt, ctx, can_shift_out)
 
         case ir.BinaryOpcode.AShr: # Calculate right shift (signed)
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
@@ -2109,18 +2193,18 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           point_of_neg = int(((2 ** width) / 2)) # Point at which a two's compilment number is negative
           change = 2 ** width
 
-          right_mul, ctx = intPow2(right, ctx)
+          right_mul, ctx = intPow2(rgt, ctx)
 
-          unwrapped_pos = sb3.Op("div", left, right_mul)
+          unwrapped_pos = sb3.Op("div", lft, right_mul)
           val_pos = unwrapped_pos if instr.is_exact else sb3.Op("floor", unwrapped_pos)
 
-          unwrapped_neg = sb3.Op("div", sb3.Op("sub", left, sb3.Known(change)), right_mul)
+          unwrapped_neg = sb3.Op("div", sb3.Op("sub", lft, sb3.Known(change)), right_mul)
           val_neg = sb3.Op("add",
                       unwrapped_neg if instr.is_exact else sb3.Op("ceiling", unwrapped_neg),
                       sb3.Known(change))
 
           blocks.add([
-            sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
+            sb3.ControlFlow("if_else", sb3.BoolOp("<", lft, sb3.Known(point_of_neg)), sb3.BlockList([
               res_var.setValue(val_pos),
             ]), sb3.BlockList([
               res_var.setValue(val_neg),
@@ -2142,23 +2226,23 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             case ir.BinaryOpcode.Xor: op = "xor"
 
           if width > VARIABLE_MAX_BITS:
-            assert isinstance(left, IdxbleValue) and isinstance(right, IdxbleValue)
+            assert isinstance(lft, IdxbleValue) and isinstance(rgt, IdxbleValue)
 
             res_vals = IdxbleValue()
-            for i in range(len(left.vals)):
-              val, ctx = binOp(op, left.vals[i], right.vals[i], width, ctx, instr.is_disjoint)
+            for i in range(len(lft.vals)):
+              val, ctx = binOp(op, lft.vals[i], rgt.vals[i], width, ctx, instr.is_disjoint)
               res_vals.vals.append(val)
 
             blocks.add(res_var.setAllValues(res_vals))
             res_val = False
 
           else:
-            assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
-            res_val, ctx = binOp(op, left, right, width, ctx, instr.is_disjoint)
+            assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
+            res_val, ctx = binOp(op, lft, rgt, width, ctx, instr.is_disjoint)
 
         case ir.BinaryOpcode.FAdd | ir.BinaryOpcode.FSub | \
              ir.BinaryOpcode.FMul | ir.BinaryOpcode.FDiv: # Basic float operations
-           assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
 
            op_lookup: dict[ir.BinaryOpcode, Literal["add", "sub", "mul", "div"]] = {
             ir.BinaryOpcode.FAdd: "add", ir.BinaryOpcode.FSub: "sub",
@@ -2169,19 +2253,19 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
              raise CompException(f"Instruction {instr} with opcode add only supports "
                                  f"floats, got type {type(instr.left.type)}")
 
-           res_val = sb3.Op(op_lookup[instr.opcode], left, right)
+           res_val = sb3.Op(op_lookup[instr.opcode], lft, rgt)
 
         case ir.BinaryOpcode.FRem: # Float remainder
-          assert not (isinstance(left, IdxbleValue) or isinstance(right, IdxbleValue))
+          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.FloatingPointTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"floats, got type {type(instr.left.type)}")
 
-          if not (isinstance(left, sb3.Known) or isinstance(right, sb3.Known)):
+          if not (isinstance(lft, sb3.Known) or isinstance(rgt, sb3.Known)):
             # Result is negative if left/right have different signs
-            cond = sb3.BoolOp("<", sb3.Op("mul", left, right), sb3.Known(0))
+            cond = sb3.BoolOp("<", sb3.Op("mul", lft, rgt), sb3.Known(0))
           else:
-            known, unknown = (left, right) if isinstance(left, sb3.Known) else (right, left)
+            known, unknown = (lft, rgt) if isinstance(lft, sb3.Known) else (rgt, lft)
             assert isinstance(known, sb3.Known)
 
             if sb3.scratchCastToNum(known) > 0:
@@ -2192,8 +2276,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
               cond = sb3.BoolOp(">", unknown, sb3.Known(0))
 
           res_val = sb3.Op("sub",
-            sb3.Op("mod", left, right),
-            sb3.Op("mul", right, cond))
+            sb3.Op("mod", lft, rgt),
+            sb3.Op("mul", rgt, cond))
 
         case _:
           raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")
@@ -2317,13 +2401,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       blocks.add(res_var.setValue(res_val))
 
     case ir.ICmp(): # Compare two values
-      left = transValue(instr.left, ctx, bctx)
-      blocks.add(left.blocks)
-      left = left.value
+      lft = transValue(instr.left, ctx, bctx)
+      blocks.add(lft.blocks)
+      lft = lft.value
 
-      right = transValue(instr.right, ctx, bctx)
-      blocks.add(right.blocks)
-      right = right.value
+      rgt = transValue(instr.right, ctx, bctx)
+      blocks.add(rgt.blocks)
+      rgt = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2338,9 +2422,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
 
-      result = intCompare(left, right, width, instr.cond, ctx.cfg)
+      result = intCompare(lft, rgt, width, instr.cond, ctx.cfg)
 
       # Bool to float will cast to an int if needed (so the bool is treated as 1 instead of 'true')
       casted_result = sb3.Op("bool_to_float", result)
@@ -2348,13 +2432,13 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       blocks.add(res_var.setValue(casted_result))
 
     case ir.FCmp(): # Compare two float values
-      left = transValue(instr.left, ctx, bctx)
-      blocks.add(left.blocks)
-      left = left.value
+      lft = transValue(instr.left, ctx, bctx)
+      blocks.add(lft.blocks)
+      lft = lft.value
 
-      right = transValue(instr.right, ctx, bctx)
-      blocks.add(right.blocks)
-      right = right.value
+      rgt = transValue(instr.right, ctx, bctx)
+      blocks.add(rgt.blocks)
+      right = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2362,7 +2446,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if not isinstance(instr.left.type, ir.FloatingPointTy):
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"floats, got type {type(instr.left.type)}")
-      assert isinstance(left, sb3.Value) and isinstance(right, sb3.Value)
+      assert isinstance(lft, sb3.Value) and isinstance(right, sb3.Value)
 
       # NaN > Infinity in scratch
       is_nan = lambda val: sb3.BoolOp(">", val, sb3.Known(float("inf")))
@@ -2375,7 +2459,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
         case ir.FCmpCond.Oeq:
           # Anything = NaN is false in scratch apart from NaN = NaN - only need to check one side
-          res_val = sb3.BoolOp("and", is_not_nan(right), sb3.BoolOp("=", left, right))
+          res_val = sb3.BoolOp("and", is_not_nan(right), sb3.BoolOp("=", lft, right))
 
         case ir.FCmpCond.One | ir.FCmpCond.Ogt | ir.FCmpCond.Oge | ir.FCmpCond.Olt | ir.FCmpCond.Ole:
           op = "=" if instr.cond is ir.FCmpCond.One else \
@@ -2384,11 +2468,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
 
           res_val = sb3.BoolOp("and",
-            sb3.BoolOp("and", is_not_nan(left), is_not_nan(right)),
-            invert_val_if_necessary(sb3.BoolOp(op, left, right)))
+            sb3.BoolOp("and", is_not_nan(lft), is_not_nan(right)),
+            invert_val_if_necessary(sb3.BoolOp(op, lft, right)))
 
         case ir.FCmpCond.Uno:
-          res_val = sb3.BoolOp("and", is_not_nan(left), is_not_nan(right))
+          res_val = sb3.BoolOp("and", is_not_nan(lft), is_not_nan(right))
 
         case ir.FCmpCond.Ueq | ir.FCmpCond.Une | ir.FCmpCond.Ugt | ir.FCmpCond.Uge | ir.FCmpCond.Ult | ir.FCmpCond.Ule:
           op = "=" if instr.cond in {ir.FCmpCond.Ueq, ir.FCmpCond.Une} else \
@@ -2397,11 +2481,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
 
           res_val = sb3.BoolOp("or",
-            sb3.BoolOp("or", is_nan(left), is_nan(right)),
-            invert_val_if_necessary(sb3.BoolOp(op, left, right)))
+            sb3.BoolOp("or", is_nan(lft), is_nan(right)),
+            invert_val_if_necessary(sb3.BoolOp(op, lft, right)))
 
         case ir.FCmpCond.Ord:
-          res_val = sb3.BoolOp("or", is_nan(left), is_nan(right))
+          res_val = sb3.BoolOp("or", is_nan(lft), is_nan(right))
 
         case _:
           raise CompException(f"fcmp does not support comparsion mode {instr.cond}")
