@@ -13,12 +13,15 @@ def main():
   if not os.path.exists("./output"):
     os.mkdir("output")
 
-  subprocess.run([cc, "-S", "-m32", "-Oz", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "demo.ll"],
+  subprocess.run([cc, "-S", "-m32", "-O1", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", "demo.c", "-o", "demo.ll"],
                  cwd=os.path.join(script_dir, "input"))
 
   with open("input/demo.ll", "r") as file:
     proj, _ = l2s.compile(file.read(), l2s.Config(compiler_opt=True, gen_lut_runtime=True))
-    proj.export("output/out.sb3", l2s.Format.Project3)
+
+  with open("output/blocks.txt", "w") as file:
+    file.write(proj.stringify(scratchblocks=True))
+  proj.export("output/out.sb3", l2s.Format.Project3)
 
 if __name__ == "__main__":
   main()

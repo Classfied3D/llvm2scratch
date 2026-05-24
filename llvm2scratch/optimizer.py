@@ -907,6 +907,7 @@ def optimize(proj: sb3.Project,
   the function lead to no overall change (e.g. current stack size).
   """
   if all_opti is None: all_opti = ALL_OPTIMIZATIONS
+  if len(all_opti) == 0: return proj
 
   times_optimized = 0
   opti_to_perform = deepcopy(all_opti)

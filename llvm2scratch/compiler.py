@@ -47,6 +47,7 @@ class Config:
 
   memory_size: int = 4096 # Number of 'bytes' on 'memory' list; max value is 200,000
   local_stack_size: int = 512 # Number of 'bytes' on local stack list for storing registers when recursing; max value is 200,000
+  use_branch_jump_table: bool = False # If branching should be done via jump tables in each function
   max_branch_recursion: int = 2000 # Maximum depth of scratch's call stack before resetting it
   # If extra padding bytes should be added to each value in memory so that it takes up the
   # space it would normally in bytes. This allows byte indexing to be more accurate at the
@@ -62,24 +63,25 @@ class Config:
   # This defaults to a few clib funcs with this property to avoid warnings
   no_warn_missing_fn_sig: set[str] = field(default_factory=lambda: {"exit", "__call_exitprocs"})
 
-  return_var = "!return value" # Name of the variable for returing values
-  mem_var = "!mem" # Name of the list for the memory list
-  init_mem_var = "!mem init" # Name of the list for the initialize memory list
-  stack_pointer_var = "!stack pointer" # Name of the variable for the stack pointer
-  heap_pointer_var = "!heap pointer" # Name of the variable for the heap pointer
-  local_stack_var = "!local stack" # Name of the list to store variables that will be used recursively
-  local_stack_size_var = "!local stack size" # Name of the variable to store the label stack's size
-  jump_table_id_var = "!call stack reset id" # Name of the variable to store the ID of the current branch on a stack reset
-  debug_branch_log_var = "!!debug_branch_log" # Name of the list to store debug info (using underscores
+  return_var = "!return value" # Variable for returing values
+  mem_var = "!mem" # List for memory
+  init_mem_var = "!mem init" # List to store initial memory
+  stack_pointer_var = "!stack pointer" # Variable for the stack pointer
+  heap_pointer_var = "!heap pointer" # Variable for the heap pointer
+  local_stack_var = "!local stack" # List to store locals to for later (i.e. when recursing)
+  local_stack_size_var = "!local stack size" # Variable to store the label stack's size
+  jump_table_id_var = "!call stack reset id" # Variable to store the ID of the current branch on a stack reset
+  debug_branch_log_var = "!!debug_branch_log" # list to store debug info (using underscores
                                               # to avoid spaces in exported filename for convenience)
 
   ascii_lookup_var = "!ASCII lookup"
   pow2_lookup_var = "!POW2 lookup"
   lowercase_var = "!lowercase"
 
-  return_address_local = "return address" # Name of the local variable or parameter to the id of func the return to
-  previous_stack_size_local = "prev stack size" # Name of the local variable to store the previous stack size
-  special_locals = {return_address_local, previous_stack_size_local} # All special local vars
+  return_address_local = "return address" # local variable or parameter to the id of func the return to
+  previous_stack_size_local = "prev stack size" # Local variable to store the previous stack size
+  branch_jump_table_addr_local = "branch jump table addr" # Local variable to store current branch jump table location to
+  special_locals = {return_address_local, previous_stack_size_local, branch_jump_table_addr_local} # All special local vars
 
   func_ptr_parameter = "func ptr addr" # Name of the parameter to pass func ptr addr to
 
@@ -161,7 +163,6 @@ class BlockInfo:
   fn: FuncInfo
   available_params: list[Variable] # All params that can be accessed from the function
   available_param_sizes: list[int] # All sizes of above params
-  first_block: bool = False # Is this is the first block of the function
   code: sb3.BlockList = field(default_factory=sb3.BlockList) # The current code instructions are being added to
   label: str | None = None # Name/Label of the block
   allocated: int = 0 # Out of the amount allocated for the branch beforehand, how much has been translated into addresses
@@ -805,6 +806,8 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) ->
   else:
     raise CompException(f"Multipling {width} bits is not supported")
 
+# TODO: use a linear search if it is faster (or maybe even use a linear search in a binary search)
+# this is due to TW perf
 def binarySearch(value: sb3.Value,
                  branches: dict[int, sb3.BlockList],
                  default_branch: sb3.BlockList | None = None,
@@ -1397,9 +1400,15 @@ def loadFromStack(stack_var: str, stack_size_var: str, offset: int, size: int) -
   if size == 1: return res[0]
   return IdxbleValue(res)
 
-def assignParameters(params: list[Variable], param_sizes: list[int], next_var_use_depends: set[str]) -> sb3.BlockList:
+def assignParameters(params: list[Variable], param_sizes: list[int], next_var_use_depends: set[str], ctx: Context) -> sb3.BlockList:
   assert len(params) == len(param_sizes)
+
   blocks = sb3.BlockList()
+  # We never need to assign parameters as everything is in one function when using
+  # the branch jump table method
+  if ctx.cfg.use_branch_jump_table:
+    return blocks
+
   for param, size in zip(params, param_sizes):
     var = deepcopy(param)
     var.var_type = "var"
@@ -1553,7 +1562,7 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
     sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), sb3.BlockList([
       # This should never be called as it is not possible to branch to the first branch, but will be kept
       # in case parameters are used between blocks in future
-      *assignParameters(params, param_sizes, next_var_use_depends).blocks,
+      *assignParameters(params, param_sizes, next_var_use_depends, ctx).blocks,
 
       sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(reset_id)),
       sb3.StopScript("stopthis")
@@ -1611,8 +1620,14 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     must_store_sizes: list[int] = []
     # Include the return value in variables which aren't depended on
     for var in next_var_use.depends:
+      # We don't need to store parameters for later in a branch table
+      # because parameters are tied to scope and therefore always available
+      if ctx.cfg.use_branch_jump_table and var in bctx.available_params:
+        continue
+
       decoded_var = transVar(var, bctx)
       assert decoded_var is not None
+
       must_store.append(decoded_var)
 
     # Sort the parameters in numeric then alphabetical order for better readability
@@ -1621,12 +1636,16 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     # Work out sizes of must stores
     must_store_sizes = [next_var_use.depends_var_sizes[var.var_name] for var in must_store]
 
+    must_store_special = []
     if caller.total_alloca_size is None and not caller.skip_stack_size_change:
-      must_store.append(localizeVar(ctx.cfg.previous_stack_size_local, False, bctx))
-      must_store_sizes.append(1)
-
+      must_store_special.append(ctx.cfg.previous_stack_size_local)
     if caller.takes_return_address:
-      must_store.append(localizeVar(ctx.cfg.return_address_local, False, bctx))
+      must_store_special.append(ctx.cfg.return_address_local)
+    if ctx.cfg.use_branch_jump_table:
+      must_store_special.append(ctx.cfg.branch_jump_table_addr_local)
+
+    for n in must_store_special:
+      must_store.append(localizeVar(n, False, bctx))
       must_store_sizes.append(1)
 
     # If we don't need to store any parameters for later we don't need to do anything special when we recurse
@@ -1646,7 +1665,8 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       # Make sure parameters can be accessed later
       bctx.code.add(assignParameters(
         bctx.available_params, bctx.available_param_sizes,
-        next_var_use.depends | ctx.cfg.special_locals
+        next_var_use.depends | ctx.cfg.special_locals,
+        ctx
       ))
 
     call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
@@ -1656,9 +1676,12 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     if not callee.returns_to_address:
       bctx.code.add(assign_blocks)
     else:
+      # If the function we called returns to an address, it will call our function
+      # back when it is done
+      assert not ctx.cfg.use_branch_jump_table
+
       # Start new block list
       ctx.proj.code.append(bctx.code)
-      bctx.first_block = False
       bctx.available_params = []
       bctx.available_param_sizes = []
 
@@ -1667,7 +1690,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
   else:
-    if not callee.returns_to_address:
+    if not callee.returns_to_address and not ctx.cfg.use_branch_jump_table:
       # Use the parameters for procedures to use scratch's stack to store any variables needed later
       recurse_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name, True)
       bctx.code.add(sb3.ProcedureCall(recurse_proc_name, [var.getValue() for var in must_store]))
@@ -1676,7 +1699,6 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         must_store[i].var_type = "param"
 
       # Start new block list
-      bctx.first_block = False
       ctx.proj.code.append(bctx.code)
       # Make sure that these parameters are assigned back to variables if needed later
       bctx.available_params = must_store
@@ -1689,6 +1711,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       bctx.code.add(call_blocks)
       bctx.code.add(assign_blocks)
     else:
+      # Store variables that will be needed later on the local var stack
+      # We cannot save these as parameters because the stack might reset,
+      # or this is a jump table and everything must be able to be put
+      # into the same function
       total_size = sum(must_store_sizes)
 
       bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(total_size)))
@@ -1701,20 +1727,23 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         must_store[i].var_type = "var"
 
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
-      arguments.append(sb3.Known(return_addr_id))
+      if callee.returns_to_address:
+        arguments.append(sb3.Known(return_addr_id))
 
       call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
 
-      ctx.proj.code.append(bctx.code)
-      bctx.first_block = False
-      bctx.available_params = []
-      bctx.available_param_sizes = []
+      # Only create a return address target if it should be created
+      if callee.returns_to_address:
+        ctx.proj.code.append(bctx.code)
+        bctx.available_params = []
+        bctx.available_param_sizes = []
 
-      # Add code for callback
-      bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], [], caller, ctx,
-                                                  is_counted=callee.returns_to_address)
+        # Add code for callback
+        bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], [], caller, ctx,
+                                                    is_counted=callee.returns_to_address)
+
       bctx.code.add(assign_blocks)
 
       offset = 0
@@ -2878,7 +2907,8 @@ def transTerminatorInstr(instr: ir.Instr,
           blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, localizeVar(ctx.cfg.previous_stack_size_local,
                                                                             False, bctx).getValue()))
 
-      if bctx.fn.name == ctx.cfg.entrypoint:
+      # Branch jump table does not use a global jump table
+      if bctx.fn.name == ctx.cfg.entrypoint and not ctx.cfg.use_branch_jump_table:
         # Exit the program
         blocks.add(sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(EXIT_CALL_ID)))
 
@@ -2891,11 +2921,15 @@ def transTerminatorInstr(instr: ir.Instr,
         return_addr = localizeVar(ctx.cfg.return_address_local, False, bctx)
         blocks.add(transReturnAddr(return_addr.getValue(), bctx.fn, ctx))
 
+      # Need to escape the forever loop
+      if ctx.cfg.use_branch_jump_table:
+        blocks.add(sb3.StopScript("stopthis"))
+
       blocks.end = True
 
     case ir.UncondBr():
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends, ctx))
 
       # Assign phi nodes
       blocks.add(assignPhiNodes(phi_info[instr.branch.label], ctx, bctx))
@@ -2906,7 +2940,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case ir.CondBr(): # Jump to a label, either known or dependent on a condition
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends, ctx))
 
       cond = transValue(instr.cond, ctx, bctx)
       if isinstance(cond.value, IdxbleValue):
@@ -2926,7 +2960,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
     case ir.Switch(): # Jump to many labels depending on a value
       # Allow the parameters to be accessed later
-      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends))
+      blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends, ctx))
 
       assert isinstance(instr.cond.type, ir.IntegerTy)
       width = instr.cond.type.width
@@ -3255,15 +3289,17 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       # Find what each block in the function could branch to
       branches[block.label] = list(getTerminatorInstrLabels(block.instrs[-1]))
 
-    fn_check_locations = sorted(util.selectCycleChecks(branches))
-    could_recurse = len(fn_check_locations) > 0
-    # If the branches could create a loop, we must place stack checks, so we should return to an
-    # address. Furthermore, a binary search and a call is usually faster than potentially
-    # hundreds of recursions backward.
-    returns_to_address[fn.name] = could_recurse
-    check_locations[fn.name] = fn_check_locations
-    for branch in fn_check_locations:
-      ctx.all_check_locations.append((fn.name, branch))
+    # Branch jump tables never reset the stack
+    if not ctx.cfg.use_branch_jump_table:
+      fn_check_locations = sorted(util.selectCycleChecks(branches))
+      could_recurse = len(fn_check_locations) > 0
+      # If the branches could create a loop, we must place stack checks, so we should return to an
+      # address. Furthermore, a binary search and a call is usually faster than potentially
+      # hundreds of recursions backward.
+      returns_to_address[fn.name] = could_recurse
+      check_locations[fn.name] = fn_check_locations
+      for branch in fn_check_locations:
+        ctx.all_check_locations.append((fn.name, branch))
 
     # Any branch that may be called more than once
     repeating_branches: set[str] = util.findNodesWithCycle(branches)
@@ -3436,6 +3472,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
     fn_name = func.name
     info = ctx.fn_info[fn_name]
 
+    assert not (info.returns_to_address and ctx.cfg.use_branch_jump_table)
+
     is_first_block = True
     total_fn_allocated = 0
     for block in func.blocks.values():
@@ -3477,7 +3515,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         # Work out what variables might be depended on in future
         poss_depends = info.block_var_use[block.label].depends
         poss_depends |= ctx.cfg.special_locals
-        starting_fn_code.add(assignParameters(info.params, info.param_sizes, poss_depends))
+        starting_fn_code.add(assignParameters(info.params, info.param_sizes, poss_depends, ctx))
 
         first_block_proc_name = localizeLabel(block.label, info.name)
 
@@ -3512,8 +3550,14 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-to_allocate)))
 
       # After the first block we can no longer access the parameters in the function
-      available_params, av_param_sizes = (info.params, info.param_sizes) if is_first_block else ([], [])
-      bctx = BlockInfo(info, available_params, av_param_sizes, first_block=is_first_block,
+      available_params, av_param_sizes = [], []
+
+      # In the jump table method, every parameter is accessible from the first function
+      # As every parameter is in the first function
+      if is_first_block or ctx.cfg.use_branch_jump_table:
+        available_params, av_param_sizes = info.params, info.param_sizes
+
+      bctx = BlockInfo(info, available_params, av_param_sizes,
                        code=starting_fn_code, label=block.label,
                        allocated=total_fn_allocated)
 
@@ -3596,6 +3640,9 @@ def transEntrypointCall(ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   # We need to make a jump table for everywhere the stack might need to reset
   else:
+    # Stack cannot reset with branching jump table
+    assert not ctx.cfg.use_branch_jump_table
+
     jump_table: dict[int, sb3.BlockList] = {
       EXIT_CALL_ID: sb3.BlockList([sb3.StopScript("stopthis")]),
       ENTRY_CALL_ID: sb3.BlockList([entrypoint_call]),
@@ -3902,6 +3949,107 @@ def getDontElide(ctx: Context) -> set[str]:
     res |= {Variable(ctx.cfg.return_var, "special_var", None).getRawVarName(i) for i in range(ctx.highest_return_size)}
   return res
 
+def optimize(ctx: Context) -> Context:
+  ctx.proj = opt.optimize(ctx.proj,
+    perf = ctx.cfg.opt_target.perf,
+    all_opti = ctx.cfg.opt_passes,
+    dont_remove = getDontElide(ctx),
+    ignore_external_change = {ctx.cfg.stack_pointer_var},
+    lookup_func = lambda n, i: tableLookup(n, i, ctx))
+
+  return ctx
+
+def replaceCalls(bl: sb3.Blocklist, replacements: dict[str, sb3.Block]) -> sb3.Blocklist:
+  for i, b in enumerate(bl.blocks):
+    match b:
+      case sb3.ProcedureCall() if b.proc_name in replacements:
+        # Should only be inling branches here
+        assert len(b.arguments) == 0
+        bl.blocks[i] = replacements[b.proc_name]
+      case sb3.ControlFlow():
+        b.blocks = replaceCalls(b.blocks, replacements)
+        if b.else_blocks is not None:
+          b.else_blocks = replaceCalls(b.else_blocks, replacements)
+        bl.blocks[i] = b
+  return bl
+
+def postOptTransform(mod: ir.Module, ctx: Context) -> tuple[Context, bool]:
+  if not ctx.cfg.use_branch_jump_table: return ctx, False
+
+  # Transform the function calls into a jump table. This is done
+  # after optimization because otherwise the optimizer would not
+  # know which branch leads where (and means it can use the same
+  # code when optimizing for functions)
+
+  to_remove: list[int] = []
+
+  # Func name vs index
+  procs: dict[str, int] = {}
+  for i, bl in enumerate(ctx.proj.code):
+    assert len(bl) > 0
+    if isinstance(bl.blocks[0], sb3.ProcedureDef):
+      procs[bl.blocks[0].proc_name] = i
+
+  for fn in mod.functions.values():
+    # Ignore externally defined funcs
+    if len(fn.blocks) == 0: continue
+
+    # The start of the procedure should not have been inlined
+    assert fn.name in procs
+
+    needs_call_replacement: list[str] = []
+    for i, block in enumerate(fn.blocks.values()):
+      if i == 0: continue
+      b_name = localizeLabel(block.label, fn.name)
+      needs_call_replacement.append(b_name)
+
+    # If the function doesn't make any branches we should
+    # remove the 'stop this script' and not replace anything
+    if len(needs_call_replacement) == 0:
+      last = ctx.proj.code[procs[fn.name]].blocks.pop()
+      assert isinstance(last, sb3.StopScript) and last.op == "stopthis"
+      continue
+
+    branch_id_var = Variable(ctx.cfg.branch_jump_table_addr_local, "var", fn.name)
+
+    replacements: dict[str, sb3.Block] = {}
+    for i, name in enumerate(needs_call_replacement):
+      # TODO: add to must_store
+      replacements[name] = branch_id_var.setValue(sb3.Known(i))
+
+    for name in [fn.name, *needs_call_replacement]:
+      i = procs[name]
+      ctx.proj.code[i] = replaceCalls(ctx.proj.code[i], replacements)
+
+    i = procs[fn.name]
+    ctx.proj.code[i].end = False
+    assert not ctx.proj.code[i].blocks[-1].isEnd()
+
+    get_branch_id = branch_id_var.getValue()
+    # TODO: this will be implemented automatically later
+    if ctx.cfg.opt_target.exec.compiler_type_hints:
+      get_branch_id = sb3.Op("str_to_float", get_branch_id)
+
+    ctx.proj.code[i].add(
+      sb3.ControlFlow("forever", None,
+        binarySearch(
+          get_branch_id,
+          {
+            i: sb3.BlockList(ctx.proj.code[procs[n]].blocks[1:])
+            for i, n in enumerate(needs_call_replacement)
+          }
+        )
+      )
+    )
+
+    to_remove.extend(procs[n] for n in needs_call_replacement)
+
+  # Delete in reverse order to not affect other blocklist indices
+  for i in sorted(to_remove, reverse=True):
+    del ctx.proj.code[i]
+
+  return ctx, True
+
 def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context) -> Context:
   localized_params = [Variable(param, "param", name) for param in params]
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
@@ -4172,7 +4320,7 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   init_blocks.add(init_mem)
   init_blocks.add(initLocalStack(ctx))
 
-  # Reset debug info on initialisation
+  # Reset debug info on initialization
   if cfg.do_debug_branch_log:
     init_blocks.add(sb3.EditList("deleteall", cfg.debug_branch_log_var, None, None))
 
@@ -4198,14 +4346,12 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   # Add init code
   ctx.proj.code.append(init_blocks)
 
-  # Optimise scratch project
-  if cfg.compiler_opt:
-    ctx.proj = opt.optimize(ctx.proj,
-                            perf = ctx.cfg.opt_target.perf,
-                            all_opti = cfg.opt_passes,
-                            dont_remove = getDontElide(ctx),
-                            ignore_external_change = {ctx.cfg.stack_pointer_var},
-                            lookup_func = lambda n, i: tableLookup(n, i, ctx))
+  # Optimize project
+  ctx = optimize(ctx)
+
+  # Apply any post optimization transformations
+  ctx, did_transform = postOptTransform(mod, ctx)
+  if did_transform: ctx = optimize(ctx)
 
   # Export debug info
   if cfg.do_debug_branch_log:

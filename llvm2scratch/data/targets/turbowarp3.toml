@@ -9,6 +9,11 @@ behaviours, namely a limited max recursion depth.\
 formats = ["project3", "sprite3"]
 
 [exec]
+# Using a jump table improves performance significantly on TW (by 800% on firefox, 30% on chrome)
+preferred-branch-method = "jump-table"
+# TW can benefit from hinting types using extra blocks. For example, (var + 0) > 3
+# is faster than var > 3 because types can be checked at runtime, not compile time
+compiler-type-hints = true
 # Lowest crash so far had counter ~2200
 # Reduce this if crashes occur
 max-branch-recursion = 2000

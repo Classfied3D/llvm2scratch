@@ -1,15 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from copy import deepcopy
 from typing import Any
+from enum import Enum
 
 from importlib.resources.abc import Traversable
 from importlib.resources import files
-from copy import deepcopy
 import tomllib
 import dacite
 
 DEFAULT_TARGETS = ["scratch3", "turbowarp3"]
-DEFAULT_OPT_TARGET = "scratch3"
+# TW optimizations improve TW perf significantly more than it does scratch perf
+DEFAULT_OPT_TARGET = "turbowarp3"
 ESCAPE_KEYWORDS = ["and", "or", "not"]
 
 def getPackageData() -> Traversable:
@@ -55,7 +57,7 @@ def getTarget(name: str) -> Target:
   data: dict[str, Any] = dashToUnderscore(tomllib.loads(raw))
   data["id"] = name
 
-  res = dacite.from_dict(Target, data)
+  res = dacite.from_dict(Target, data, config=dacite.Config(type_hooks={BranchMethod: BranchMethod}))
   _target_cache[name] = res
   return res
 
@@ -76,8 +78,14 @@ class TargetInfo:
   desc: str
   formats: list[str]
 
+class BranchMethod(Enum):
+  ProcCall = "proc-call"
+  JumpTable = "jump-table"
+
 @dataclass(frozen=True)
 class TargetExec:
+  preferred_branch_method: BranchMethod
+  compiler_type_hints: bool
   max_branch_recursion: int
   preferred_branch_recursion: int
 

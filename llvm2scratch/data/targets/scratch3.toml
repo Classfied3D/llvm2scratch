@@ -5,6 +5,8 @@ desc = "The third and current major version of Scratch. Interprets scratch code 
 formats = ["project3", "sprite3"]
 
 [exec]
+preferred-branch-method = "proc-call"
+compiler-type-hints = false # N/A - Not compiled
 max-branch-recursion = 3_000_000
 # See https://www.desmos.com/calculator/raio3grkld
 preferred-branch-recursion = 300_000

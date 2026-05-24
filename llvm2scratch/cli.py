@@ -229,6 +229,8 @@ def main():
     opt_target=opt_target,
     memory_size=args.memory_size,
     local_stack_size=args.local_stack_size,
+    # TODO: add a compiler flag to override this behaviour
+    use_branch_jump_table=opt_target.exec.preferred_branch_method == target.BranchMethod.JumpTable,
     max_branch_recursion=max_branch_recursion,
     accurate_byte_spacing=not args.no_accurate_byte_spacing,
     entrypoint=args.entrypoint,
