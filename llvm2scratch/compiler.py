@@ -3774,9 +3774,13 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 def initLocalStack(ctx: Context) -> sb3.BlockList:
   return sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.local_stack_size_var, sb3.Known(0)),
-    sb3.EditList("deleteall", ctx.cfg.local_stack_var, None, None),
-    sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.local_stack_size), sb3.BlockList([
-      sb3.EditList("addto", ctx.cfg.local_stack_var, None, sb3.Known(0)),
+    sb3.ControlFlow("if", sb3.BoolOp("not", sb3.BoolOp("=",
+          sb3.GetListLength(ctx.cfg.local_stack_var),
+          sb3.Known(ctx.cfg.local_stack_size))), sb3.BlockList([
+      sb3.EditList("deleteall", ctx.cfg.local_stack_var, None, None),
+      sb3.ControlFlow("reptimes", sb3.Known(ctx.cfg.local_stack_size), sb3.BlockList([
+        sb3.EditList("addto", ctx.cfg.local_stack_var, None, sb3.Known(0)),
+      ]))
     ]))
   ])
 
