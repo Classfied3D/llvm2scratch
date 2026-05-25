@@ -3198,6 +3198,9 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     call_graph[fn.name] = (set(), True)
 
   for fn in defined_funcs:
+    if fn.name in ctx.fn_info:
+      raise CompException(f"Function {fn.name} defined twice! You might be defining a function already defined in scratch code!")
+
     calls: set[str] = set() # What the function calls
     for block in fn.blocks.values():
       # Find every function the function could call
