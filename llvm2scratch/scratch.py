@@ -104,6 +104,12 @@ class ScratchConfig():
                                    # and 'while'. See https://en.scratch-wiki.info/wiki/Hidden_Blocks. This may lead
                                    # to a performance reduction
 
+  use_hex_if_smaller: bool = False # Use 0xabc if it takes up less space than it's decimal counterpart in knowns. This
+                                   # has a negligable impact on 32-bit values as the decimal value for 2^32 is smaller.
+                                   # This could be considered a project JSON hack as this is not usually possible in
+                                   # the editor. Hexadecimal has a negligable effect on scratch performance (it needs
+                                   # to convert from hex string to int at runtime) and no effect on turbowarp perf.
+
 @dataclass
 class Project:
   cfg: ScratchConfig
@@ -307,7 +313,7 @@ class ScratchContext:
 class ScratchCast(Enum):
   """How the block will cast a value. Affects number coercion and boolean casting"""
   TO_STR = 1
-  TO_INT = 2
+  TO_NUM = 2
 
 @dataclass
 class Block():
@@ -450,6 +456,12 @@ class Known(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     raw = self.getRawVarInit(preserve_booleans=False)
+    if ctx.cfg.use_hex_if_smaller and cast == ScratchCast.TO_NUM and isinstance(raw, int) and raw > 0:
+      base10_digits = math.ceil(math.log10(raw + 1))
+      # Including 0x prefix
+      hex_digits = 2 + math.ceil(math.log2(raw + 1) / 4)
+      if hex_digits < base10_digits:
+        raw = str(hex(raw))
 
     val = [(10 if isinstance(self.known, str) else 4), raw]
 
@@ -726,7 +738,7 @@ class ControlFlow(Block):
       assert isinstance(val, BooleanValue)
       raw_val, ctx = val.getRawBoolValue(my_id, ctx)
     else:
-      raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_INT)
+      raw_val, ctx = val.getRawValue(my_id, ctx, ScratchCast.TO_NUM)
 
     match op:
       case "reptimes": input_name = "TIMES"
@@ -858,7 +870,7 @@ class Wait(Block):
   duration: Value
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raw_dur, ctx = self.duration.getRawValue(my_id, ctx, ScratchCast.TO_INT)
+    raw_dur, ctx = self.duration.getRawValue(my_id, ctx, ScratchCast.TO_NUM)
     return {
       "opcode": "control_wait",
       "inputs": {
@@ -935,7 +947,7 @@ class Op(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     # We don't need to round the number if it gets casted to int anyway
-    if self.op in {"bool_to_float", "str_to_float"} and cast == ScratchCast.TO_INT:
+    if self.op in {"bool_to_float", "str_to_float"} and cast == ScratchCast.TO_NUM:
       return self.left.getRawValue(parent, ctx, cast)
 
     id = ctx.genId()
@@ -964,7 +976,7 @@ class Op(Value):
 
     opcode = SHORT_OP_TO_OPCODE.setdefault(self.op, "operator_mathop")
 
-    casts_left_input_to = ScratchCast.TO_INT
+    casts_left_input_to = ScratchCast.TO_NUM
     if self.op in ["join", "length_of"]:
       casts_left_input_to = ScratchCast.TO_STR
 
@@ -1067,7 +1079,7 @@ class BoolOp(BooleanValue):
     return [2, id], ctx
 
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
-    return self.getRawValue(parent, ctx, ScratchCast.TO_INT)
+    return self.getRawValue(parent, ctx, ScratchCast.TO_NUM)
 
   def stringify(self, sb: bool=False) -> str:
     if self.right is None:
@@ -1104,7 +1116,7 @@ class EditVar(Block):
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
     # NOTE: technically set variable doesn't cast but we need to assume the worst scenario
-    raw_val, ctx = self.value.getRawValue(my_id, ctx, (ScratchCast.TO_STR if self.op == "set" else ScratchCast.TO_INT))
+    raw_val, ctx = self.value.getRawValue(my_id, ctx, (ScratchCast.TO_STR if self.op == "set" else ScratchCast.TO_NUM))
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": {"VALUE": raw_val},
@@ -1150,7 +1162,7 @@ class GetOfList(Value):
     id = ctx.genId()
     list_id = ctx.addOrGetList(self.list_name)
 
-    raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_INT if self.op == "atindex" else ScratchCast.TO_STR))
+    raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_NUM if self.op == "atindex" else ScratchCast.TO_STR))
 
     input_name = "INDEX" if self.op == "atindex" else "ITEM"
 
@@ -1208,7 +1220,7 @@ class EditList(Block):
     if self.index is not None:
       if self.op in ["addto", "deleteall"]:
         raise ScratchCompException(f"{self.op} does not support an index value")
-      raw_index, ctx = self.index.getRawValue(my_id, ctx, ScratchCast.TO_INT)
+      raw_index, ctx = self.index.getRawValue(my_id, ctx, ScratchCast.TO_NUM)
       inputs.update({"INDEX": raw_index})
 
     if self.item is not None:
