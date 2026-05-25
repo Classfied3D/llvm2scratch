@@ -2545,8 +2545,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         assert len(true_val.blocks) == 0 and len(false_val.blocks) == 0
 
         # Result = false_value + (true_value - false_value) * cond
-        diff = sb3.Known(true_val.value.known - false_val.value.known)
-        blocks.add(res_var.setValue(sb3.Op("add", false_val.value, sb3.Op("mul", cond.value, diff))))
+        diff = true_val.value.known - false_val.value.known
+        offset = cond.value if diff == 1 else sb3.Op("mul", cond.value, sb3.Known(diff))
+        blocks.add(res_var.setValue(sb3.Op("add", false_val.value, offset)))
       else:
         true_blocks = true_val.blocks
         false_blocks = false_val.blocks
