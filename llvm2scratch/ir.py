@@ -122,6 +122,7 @@ class VoidTy(Type):
 class FuncTy(Type):
   return_type: Type
   params: list[Type]
+  variadic: bool
 
 @dataclass
 class IntegerTy(VecTargetTy, AggTargetTy):
@@ -390,6 +391,7 @@ class Call(Instr, MaybeHasResult):
   func: Value
   return_type: Type
   args: list[Value]
+  variadic: bool
   tail_kind: CallTailKind
   intrinsic: Intrinsic | None
 
@@ -407,6 +409,7 @@ class Function():
   name: str
   return_type: Type
   params: list[ArgumentVal]
+  variadic: bool
   intrinsic: Intrinsic | None
   blocks: dict[str, Block]
 

@@ -194,6 +194,8 @@ def parseUntilComma(rest: str) -> list[str]:
   return tokens
 
 def parseCommaSeperated(rest: str) -> list[list[str]]:
+  if rest.strip() == "": return []
+
   tokens_list: list[list[str]] = []
   found = True
 
@@ -313,17 +315,19 @@ def parseTypeTokens(tokens: list[str], structs: dict[str, StructTy]) -> tuple[Ty
         assert current_type is not None
 
         args: list[Type] = []
+        variadic = False
         tokens_list = parseCommaSeperated(token[1:-1])
         for i, tokens in enumerate(tokens_list):
           if "..." in tokens:
             assert len(tokens) == 1
             assert i == len(tokens_list) - 1
-            raise ValueError("Varadic args not supported yet")
+            variadic = True
+            continue
           parsed, rest = parseTypeTokens(tokens, structs)
           assert len(rest) == 0
           args.append(parsed)
 
-        current_type = FuncTy(current_type, args)
+        current_type = FuncTy(current_type, args, variadic)
 
     elif token == "type":
       assert is_addrspace is False

@@ -2807,7 +2807,7 @@ def getFuncPtrRefs(mod: ir.Module) -> list[tuple[ir.FuncTy, list[str]]]:
   func_ptrs: list[tuple[ir.FuncTy, list[str]]] = []
   for fn_name in sorted_refs:
     fn = mod.functions[fn_name]
-    signature = ir.FuncTy(fn.return_type, [arg.type for arg in fn.params])
+    signature = ir.FuncTy(fn.return_type, [arg.type for arg in fn.params], fn.variadic)
     found = -1
     for index, (signature_other, _) in enumerate(func_ptrs):
       if signature == signature_other:
@@ -3228,7 +3228,8 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
               # Function Pointer
               # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
               # the call instruction's vararg support
-              signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
+              assert instr.variadic is False # TODO: arg.type is not accurate as it also consideres variadic args
+              signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args], variadic=instr.variadic)
               sig_info = getFuncPtrSignatureInfo(signature, fn.name, ctx)
               is_direct_call = False
 
@@ -3583,6 +3584,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           if instr.tail_kind == ir.CallTailKind.MustTail:
             raise CompException("Tail calls not supported")
 
+          assert not instr.variadic # TODO: handle variadic functions correctly
+
           callee_info = None
           args = instr.args
           result = None if instr.result is None else transVar(instr.result, bctx)
@@ -3592,7 +3595,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           if not isinstance(instr.func, ir.FunctionVal):
             # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
             # the call instruction's vararg support
-            signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args])
+            assert not instr.variadic # TODO: this is incorrect as it variadic arguments for param types
+            signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args], variadic=instr.variadic)
             # Don't warn again - we did this earlier in getFnInfo
             sig_info = getFuncPtrSignatureInfo(signature, bctx.fn.name, ctx, warn_no_matching=False)
 
