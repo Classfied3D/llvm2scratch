@@ -61,7 +61,6 @@ def findNodesWithCycle(graph: dict[str, list[str]]) -> set[str]:
   g.add_edges(edges)
 
   sccs = g.components(mode="STRONG")
-  print(list(list(a) for a in sccs))
   result = {
     nodes[v]
     for scc in sccs
