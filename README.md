@@ -4,16 +4,16 @@ An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a 
 
 ## Progress
 
-- 🆕 Stack + Heap Allocation, Deallocation, Loading + Storing
-- 🔢 Integer (Up to 48 bits) and Float Operations
-- 🔃 Functions + Return Values + Recursion + Function Pointers
-- 🔀 Branch + Switch Instructions
-- 🔁 Loops (Which unwind scratch's call stack when necessary)
-- ⏺ Arrays and Structs (getelementptr support)
-- 🔡 Static Variables
-- 📚 [Partial libc support](https://github.com/Classfied3D/newlib-scratch)
-- ⚡ Optimizations (Known Value Propagation, Assignment Elision)
-- 📝 .sb3 + .sprite3 + scratchblocks file output
+- Stack + Heap Allocation, Deallocation, Loading + Storing
+- Integer (Up to 48 bits) and Float Operations
+- Functions + Return Values + Recursion + Function Pointers
+- Branch + Switch Instructions
+- Loops (Which unwind scratch's call stack when necessary)
+- Arrays and Structs (getelementptr support)
+- Static Variables
+- [Partial libc support](https://github.com/Classfied3D/newlib-scratch)
+- Optimizations (Known Value Propagation, Assignment Elision)
+- .sb3 + .sprite3 + scratchblocks file output
 
 ## Project Showcase
 
