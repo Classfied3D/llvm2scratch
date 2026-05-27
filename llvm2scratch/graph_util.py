@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import cast
 
 from scipy.sparse import csc_array
 import igraph as ig
@@ -60,11 +61,12 @@ def findNodesWithCycle(graph: dict[str, list[str]]) -> set[str]:
   g.add_edges(edges)
 
   sccs = g.components(mode="STRONG")
+  print(list(list(a) for a in sccs))
   result = {
     nodes[v]
-    for comp in sccs
-    if len(comp) > 1
-    for v in comp
+    for scc in sccs
+    if len(scc) > 1
+    for v in cast(list[int], scc)
   }
 
   self_loops = {nodes[e.tuple[0]] for e in g.es if e.tuple[0] == e.tuple[1]}

@@ -461,7 +461,7 @@ class Known(Value):
       # Including 0x prefix
       hex_digits = 2 + math.ceil(math.log2(raw + 1) / 4)
       if hex_digits < base10_digits:
-        raw = str(hex(raw))
+        raw = hex(raw)
 
     val = [(10 if isinstance(self.known, str) else 4), raw]
 
@@ -956,6 +956,7 @@ class Op(Value):
 
     takes_one_op = right is None
 
+    rgt_param = None
     match self.op:
       case "rand":
         lft_param = "FROM"
@@ -983,6 +984,8 @@ class Op(Value):
     raw_left, ctx = self.left.getRawValue(id, ctx, casts_left_input_to)
     inputs = {lft_param: raw_left}
     if right is not None:
+      assert rgt_param is not None
+
       casts_right_input_to = casts_left_input_to
       if self.op == "letter_of":
         casts_right_input_to = ScratchCast.TO_STR

@@ -186,7 +186,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
       left, right, *_ = instr.operands
 
       flags = {"nuw": False, "nsw": False, "exact": False, "disjoint": False}
-      flags_string = str(raw_instr_no_res).split(opcode.value + " ", 1)[1]
+      flags_string = raw_instr_no_res.split(opcode.value + " ", 1)[1]
 
       while True:
         for flag in flags:
@@ -302,7 +302,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
 
       flags = {"nuw": False, "nsw": False}
       if instr.opcode == "trunc":
-        flags_string = str(raw_instr_no_res).split(opcode.value + " ", 1)[1]
+        flags_string = raw_instr_no_res.split(opcode.value + " ", 1)[1]
 
         while True:
           for flag in flags:
@@ -318,7 +318,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
     case "icmp":
       assert result is not None
       left, right, *_ = instr.operands
-      rest = str(raw_instr_no_res).split("icmp ", 1)[-1].strip()
+      rest = raw_instr_no_res.split("icmp ", 1)[-1].strip()
 
       samesign = rest.startswith("samesign ")
       rest = rest.removeprefix("samesign ")
@@ -329,7 +329,7 @@ def decodeInstr(instr: llvm.ValueRef, mod: llvm.ModuleRef, structs: dict[str, St
     case "fcmp":
       assert result is not None
       left, right, *_ = instr.operands
-      rest = str(raw_instr_no_res).split("fcmp ", 1)[-1].strip()
+      rest = raw_instr_no_res.split("fcmp ", 1)[-1].strip()
 
       # Skip over fast math flags
       cond_found = False

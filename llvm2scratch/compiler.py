@@ -541,7 +541,7 @@ def transValue(val: ir.Value,
         case ir.GetElementPtr():
           assert isinstance(expr.base_ptr, ir.GlobalPtrVal)
 
-          indices = []
+          indices: list[tuple[sb3.Value, int]] = []
           for index_val in expr.indices:
             assert isinstance(index_val, ir.KnownIntVal)
             indices.append((sb3.Known(index_val.value), index_val.width))
@@ -1233,7 +1233,7 @@ def xorWithKnownMask(unknown: sb3.Value, known: int, width: int, ctx: Context) -
   # Multiply each coefficient by 2 if there is already a multiplication for each part
   # otherwise, multiply the sum by two
   use_parts = True
-  a_and_b_times_2_parts = []
+  a_and_b_times_2_parts: list[sb3.Value] = []
   for part in a_and_b_parts:
     if isinstance(part, sb3.Op) and part == "mul" and \
        isinstance(part.right, sb3.Known) and isinstance(part.right.known, float):
@@ -1614,10 +1614,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
   next_var_use = getBlockVarUse(following_instrs, bctx.fn.phi_info[bctx.label], caller.block_var_use, starting_var_use)
 
   poss_recursive = caller.name in callee.can_call
+  # Get all variables which are used later after the recursion
+  must_store: list[Variable] = []
+  must_store_sizes: list[int] = []
   if poss_recursive:
-    # Get all variables which are used later after the recursion
-    must_store: list[Variable] = []
-    must_store_sizes: list[int] = []
     # Include the return value in variables which aren't depended on
     for var in next_var_use.depends:
       # We don't need to store parameters for later in a branch table
@@ -1651,6 +1651,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     # If we don't need to store any parameters for later we don't need to do anything special when we recurse
     poss_recursive = len(must_store) > 0
 
+  return_addr_id = return_proc_name = None
   if callee.returns_to_address:
     return_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name)
     return_addr_id = callee.return_addresses.index(return_proc_name)
@@ -1660,6 +1661,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
 
     if callee.returns_to_address:
       if callee.takes_return_address:
+        assert return_addr_id is not None
         # Pass return address into function
         arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
@@ -1686,10 +1688,12 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       bctx.available_param_sizes = []
 
       # Add code for callback
+      assert return_proc_name is not None
       bctx.code, ctx = getUncheckedProcedureStart(return_proc_name, [], [], caller, ctx,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
   else:
+    assert return_proc_name is not None
     if not callee.returns_to_address and not ctx.cfg.use_branch_jump_table:
       # Use the parameters for procedures to use scratch's stack to store any variables needed later
       recurse_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name, True)
@@ -1726,6 +1730,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         offset += size
         must_store[i].var_type = "var"
 
+      assert return_addr_id is not None
       arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
       if callee.returns_to_address:
         arguments.append(sb3.Known(return_addr_id))
@@ -1978,7 +1983,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                     # -x < N - c
                     # x > c - N
                     assert comp_op == "<"
-                    k_comp_val = known - k_comp_val
+                    k_comp_val = known_val - k_comp_val
                     comp_op = ">"
                   lft_comp_val = unknown
                   rgt_comp_val = sb3.Known(k_comp_val)
@@ -2370,6 +2375,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             assert isinstance(instr.res_type, ir.PointerTy)
           # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
           # representation in bits
+
+        case _: pass
 
       res_val = None
 
@@ -3024,6 +3031,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
          ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
       return blocks
 
+    case _: pass
+
   metadata: list[ir.MetadataVal] = []
   values: list[sb3.Value] = []
   for arg in args:
@@ -3417,6 +3426,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
       sb3.ProcedureDef(sig_name, params),
     ])
 
+    return_addr = None
     if info.returns_to_address:
       blocks.add(sb3.EditCounter("incr"))
       new_return_addr = Variable(ctx.cfg.return_address_local, "var", sig_name)
@@ -3458,6 +3468,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
         return_addr_val = loadFromStack(ctx.cfg.local_stack_var, ctx.cfg.local_stack_size_var, 1, 1)
         assert isinstance(return_addr_val, sb3.Value)
       else:
+        assert return_addr is not None
         return_addr_val = return_addr.getValue()
 
       blocks.add(transReturnAddr(return_addr_val, info, ctx))
@@ -3967,7 +3978,7 @@ def optimize(ctx: Context) -> Context:
 
   return ctx
 
-def replaceCalls(bl: sb3.Blocklist, replacements: dict[str, sb3.Block]) -> sb3.Blocklist:
+def replaceCalls(bl: sb3.BlockList, replacements: dict[str, sb3.Block]) -> sb3.BlockList:
   for i, b in enumerate(bl.blocks):
     match b:
       case sb3.ProcedureCall() if b.proc_name in replacements:

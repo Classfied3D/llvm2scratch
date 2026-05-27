@@ -219,6 +219,8 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
 
       if isinstance(value.left, sb3.Known) and (isinstance(value.right, sb3.Known) or value.right is None):
         left = sb3.scratchCastToNum(value.left)
+        # Avoid assertions
+        right = 0
         if value.right is not None: right = sb3.scratchCastToNum(value.right)
         did_opti_total = True
         match value.op:
@@ -246,10 +248,9 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
       elif isinstance(value.left, sb3.Known) and isinstance(value.right, sb3.Known) and value.right is not None:
         left = sb3.scratchCastToNum(value.left)
         right = sb3.scratchCastToNum(value.right)
-        match value.op:
-          case "mul":
-            if left == 0 or right == 0: value = sb3.Known(0)
-            did_opti_total = True
+        if value.op == "mul":
+          if left == 0 or right == 0: value = sb3.Known(0)
+          did_opti_total = True
 
       if not did_opti_total:
         assert isinstance(value, sb3.Op)
@@ -258,38 +259,37 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
           known, unknown, left_is_known = known_and_unknown
           known = sb3.scratchCastToNum(known)
 
-          match value.op:
-            case "add" | "sub":
-              if known == 0 and not (value.op == "sub" and left_is_known):
-                value = unknown
-                did_opti_total = True
-              elif isinstance(unknown, sb3.Op) and unknown.op in ["add", "sub"] and \
-                   getKnownAndUnknown(unknown) is not None:
+          if value.op in {"add", "sub"}:
+            if known == 0 and not (value.op == "sub" and left_is_known):
+              value = unknown
+              did_opti_total = True
+            elif isinstance(unknown, sb3.Op) and unknown.op in ["add", "sub"] and \
+                  getKnownAndUnknown(unknown) is not None:
 
-                # Combine known terms into one operation
-                inner_known_and_unknown = getKnownAndUnknown(unknown)
-                assert inner_known_and_unknown is not None
-                inner_known, inner_unknown, inner_left_is_known = inner_known_and_unknown
-                inner_known = sb3.scratchCastToNum(inner_known)
+              # Combine known terms into one operation
+              inner_known_and_unknown = getKnownAndUnknown(unknown)
+              assert inner_known_and_unknown is not None
+              inner_known, inner_unknown, inner_left_is_known = inner_known_and_unknown
+              inner_known = sb3.scratchCastToNum(inner_known)
 
-                # e.g. 1 - (a + 3) should be simplified to -2 - a
-                sub_inner_value = (value.op == "sub" and left_is_known) ^ (unknown.op == "sub" and inner_left_is_known)
+              # e.g. 1 - (a + 3) should be simplified to -2 - a
+              sub_inner_value = (value.op == "sub" and left_is_known) ^ (unknown.op == "sub" and inner_left_is_known)
 
-                combined_known =  known * (-1 if value.op == "sub" and not left_is_known else 1)
-                combined_known += inner_known * (-1 if unknown.op == "sub" and not inner_left_is_known else 1) * \
-                  (-1 if value.op == "sub" and left_is_known else 1)
+              combined_known =  known * (-1 if value.op == "sub" and not left_is_known else 1)
+              combined_known += inner_known * (-1 if unknown.op == "sub" and not inner_left_is_known else 1) * \
+                (-1 if value.op == "sub" and left_is_known else 1)
 
-                if not sub_inner_value:
-                  if combined_known == 0:
-                    value = unknown
-                  elif combined_known > 0:
-                    value = sb3.Op("add", inner_unknown, sb3.Known(combined_known))
-                  else:
-                    value = sb3.Op("sub", inner_unknown, sb3.Known(-combined_known))
+              if not sub_inner_value:
+                if combined_known == 0:
+                  value = unknown
+                elif combined_known > 0:
+                  value = sb3.Op("add", inner_unknown, sb3.Known(combined_known))
                 else:
-                  value = sb3.Op("sub", sb3.Known(combined_known), inner_unknown)
+                  value = sb3.Op("sub", inner_unknown, sb3.Known(-combined_known))
+              else:
+                value = sb3.Op("sub", sb3.Known(combined_known), inner_unknown)
 
-                did_opti_total = True
+              did_opti_total = True
 
     case sb3.GetOfList():
       value.value, did_opti = partialSimplifyValue(value.value, lookup_func)
@@ -368,6 +368,8 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList, lookup_func: LookupFunc
                 break
               else:
                 add_block = False
+
+            case _: pass
         elif isinstance(block.value, sb3.BoolOp) and block.value.op == "not":
           match block.op:
             case "if_else":
@@ -383,6 +385,7 @@ def knownValuePropagationBlock(blocklist: sb3.BlockList, lookup_func: LookupFunc
               did_opti = True
               block.op = "until" if block.op == "while" else "while"
               block.value = block.value.left
+            case _: pass
 
     did_opti_total |= did_opti
 
@@ -741,10 +744,10 @@ def assignmentElision(proj: sb3.Project,
   cert_callers = defaultdict(set)
   poss_callers = defaultdict(set)
   for caller, callees in fn_info.items():
-    for callee in callees.might_call:
-      poss_callers[callee].add(caller)
-    for callee in callees.always_call:
+    for callee, _ in callees.always_call:
       cert_callers[callee].add(caller)
+    for callee, _ in callees.might_call:
+      poss_callers[callee].add(caller)
 
   worklist = deque(fn_info.keys())
   recu_fn_info: dict[str, BlockListInfo] = deepcopy(fn_info)
