@@ -478,7 +478,7 @@ class Known(Value):
 
     raw = self.known
     if not isinstance(self.known, str):
-      if int(raw) == float(raw):
+      if math.isfinite(float(raw)) and int(raw) == float(raw):
         raw = int(raw)
       else:
         raw = float(raw)
@@ -1457,7 +1457,7 @@ def knownToScratchBlocks(val: str | float | bool | int, dropdown: bool=False) ->
       return "<" + ("true" if val else "false") + "::extension>"
 
     case int() | float():
-      if int(val) == float(val):
+      if math.isfinite(val) and int(val) == float(val):
         val = int(val)
 
       if val == float("+inf"):
