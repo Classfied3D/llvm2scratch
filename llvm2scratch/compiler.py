@@ -1107,7 +1107,6 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
   parts = []
   groups = getKnownBitGroups(known, width)
   i = 0
-  reg_len = None
   while current_bit_idx < width:
     bit, length = groups[i]
     # X & 0 = 0
@@ -1122,6 +1121,7 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
     current_reg_bit_idx = current_bit_idx
 
     # While the current bit is within the region and we're not out of range
+    reg_len = None
     region_end = min(current_bit_idx + BINOP_LOOKUP_BITS, width)
     while current_reg_bit_idx < region_end:
       reg_bit, reg_len = groups[j]
@@ -1135,18 +1135,19 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
       j += 1
       if j >= len(groups): break
 
-    # Calculate the cost of extracting the values in each region
-    extract_region = lambda idx, r_len: extractBits(unknown, width, idx, r_len, in_place=True)[0]
-    extracted_regions: list[sb3.Value] = []
-    for reg_start, reg_len, _ in next_regions:
-      extracted_regions.append(extract_region(reg_start, reg_len))
-    extract_region_method = sumValueParts(extracted_regions, default=0)
-
     lookup_table_method = None
-    if len(next_regions) == 0:
-      # There is no advantage to using a lookup table because the region is too large (or zero)
+    extract_region = lambda idx, r_len: extractBits(unknown, width, idx, r_len, in_place=True)[0]
+
+    # There is no advantage to using a lookup table because the region is too large (or zero)
+    if reg_len is None or len(next_regions) == 0:
       use_lut_method = False
     else:
+      # Calculate the cost of extracting the values in each region
+      extracted_regions: list[sb3.Value] = []
+      for reg_start, r_len, _ in next_regions:
+        extracted_regions.append(extract_region(reg_start, r_len))
+      extract_region_method = sumValueParts(extracted_regions, default=0)
+
       # Don't AND more bits than exist
       bits = min(BINOP_LOOKUP_BITS, width - current_bit_idx)
       # Create a new region for the binop lookup table equal to the size of regions it skips over
@@ -1162,7 +1163,7 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
 
       last_region_index = j - 1
       last_region_cut_off_by = reg_len - (current_reg_bit_idx - region_end)
-
+      assert last_region_cut_off_by >= 0
       needs_lut = True
 
       assert lookup_table_method is not None
