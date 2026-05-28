@@ -92,13 +92,13 @@ class TypeParse(unittest.TestCase):
 
   def testFuncPtr(self):
     self.assertEqual(
-      parseTypeTokens(["ptr", "addrspace", '("G")', "(i32, i64)"], {}),
-      (FuncTy(return_type=PointerTy("G"), params=[IntegerTy(width=32), IntegerTy(width=64)]), []))
+      parseTypeTokens(["ptr", "addrspace", '("G")', "(i32, i64, ...)"], {}),
+      (FuncTy(return_type=PointerTy("G"), params=[IntegerTy(width=32), IntegerTy(width=64)], variadic=True), []))
 
   def testNestedFuncPtr(self):
     self.assertEqual(
       parseTypeTokens(["ptr", "(i32, i64)", "(i32, i64)"], {}),
-        (FuncTy(return_type=FuncTy(return_type=PointerTy(0), params=[IntegerTy(width=32), IntegerTy(width=64)]), params=[IntegerTy(width=32), IntegerTy(width=64)]), []))
+        (FuncTy(return_type=FuncTy(return_type=PointerTy(0), params=[IntegerTy(width=32), IntegerTy(width=64)], variadic=False), params=[IntegerTy(width=32), IntegerTy(width=64)], variadic=False), []))
 
 
 class ConstantParse(unittest.TestCase):
