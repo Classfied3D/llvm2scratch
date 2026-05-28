@@ -391,6 +391,7 @@ class Call(Instr, MaybeHasResult):
   func: Value
   return_type: Type
   args: list[Value]
+  params: list[Type]
   variadic: bool
   tail_kind: CallTailKind
   intrinsic: Intrinsic | None

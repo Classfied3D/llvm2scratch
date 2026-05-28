@@ -381,12 +381,14 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
       fn_type, _ = parseTypeTokens(tokens[i:], structs)
       if isinstance(fn_type, FuncTy):
         return_type = fn_type.return_type
+        params = fn_type.params
         variadic = fn_type.variadic
       else:
         return_type = fn_type
+        params = [val.type for val in arg_vals]
         variadic = False
 
-      return Call(result, func_val, return_type, arg_vals, variadic, tail_kind, intrinsic)
+      return Call(result, func_val, return_type, arg_vals, params, variadic, tail_kind, intrinsic)
 
     case "freeze":
       assert result is not None

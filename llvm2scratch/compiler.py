@@ -79,9 +79,10 @@ class Config:
   lowercase_var = "!lowercase"
 
   return_address_local = "return address" # local variable or parameter to the id of func the return to
+  vararg_ptr_local = "vararg ptr" # local variable or parameter to the pointer to varargs
   previous_stack_size_local = "prev stack size" # Local variable to store the previous stack size
   branch_jump_table_addr_local = "branch jump table addr" # Local variable to store current branch jump table location to
-  special_locals = {return_address_local, previous_stack_size_local, branch_jump_table_addr_local} # All special local vars
+  special_locals = {return_address_local, vararg_ptr_local, previous_stack_size_local, branch_jump_table_addr_local} # All special local vars
 
   func_ptr_parameter = "func ptr addr" # Name of the parameter to pass func ptr addr to
 
@@ -118,6 +119,8 @@ class FuncPtrSigInfo:
   signature_id: int
   # Descriptions for following are in FuncInfo
   can_call: set[str]
+  param_count: int
+  is_variadic: bool
   return_addresses: list[str]
   returns_to_address: bool
   takes_return_address: bool
@@ -132,6 +135,8 @@ class FuncInfo:
   params: list[Variable]
   # The types of the parameters
   param_sizes: list[int]
+  # If the function is variadic
+  is_variadic: bool = False
   # Everything the function might call (may include itself)
   can_call: set[str] = field(default_factory=set)
   # Any functions that call this function
@@ -1387,6 +1392,16 @@ def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
     ptr = sb3.Op("sub", ptr, sb3.Known(-offset))
   return ptr
 
+def transStore(value: sb3.Value | IdxbleValue, address: sb3.Value, ctx: Context) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+  if isinstance(value, sb3.Value):
+    blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, address, value))
+  else:
+    for offset, val in enumerate(value.vals):
+      offset_val = sb3.Known(offset)
+      blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val))
+  return blocks
+
 def storeOnStack(stack_var: str, stack_size_var: str, offset: int, size: int, value: sb3.Value | IdxbleValue) -> sb3.BlockList:
   blocks = sb3.BlockList()
   if isinstance(value, sb3.Value):
@@ -1512,7 +1527,11 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
 
   return blocks
 
-def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tuple[list[sb3.Value], sb3.BlockList]:
+def getCallArguments(
+    args: list[ir.Value], vararg_ptr: sb3.Value | None,
+    ret_addr: int | None, ctx: Context, bctx: BlockInfo
+  ) -> tuple[list[sb3.Value], sb3.BlockList]:
+
   arguments: list[sb3.Value] = []
   blocks = sb3.BlockList()
   for arg in args:
@@ -1522,6 +1541,10 @@ def getCallArguments(args: list[ir.Value], ctx: Context, bctx: BlockInfo) -> tup
       arguments.append(value.value)
     else:
       for val in value.value.vals: arguments.append(val)
+
+  if vararg_ptr is not None: arguments.append(vararg_ptr)
+  if ret_addr is not None:   arguments.append(sb3.Known(ret_addr))
+
   return arguments, blocks
 
 def getUncheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes: list[int], fn: FuncInfo,
@@ -1606,6 +1629,30 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
 
   assert bctx.label is not None
 
+  # The add one at the end is to account of the function pointer address
+  param_count = len(callee.params) if isinstance(callee, FuncInfo) else callee.param_count + 1
+  assert callee.is_variadic or param_count == len(args)
+  args, varargs = args[:param_count], args[param_count:]
+
+  total_alloc_size = 0
+  vararg_ptr = None
+  if callee.is_variadic:
+    # Allocate vararg memory
+    total_alloc_size = sum(getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing) for arg in varargs)
+    if total_alloc_size != 0:
+      vararg_ptr = sb3.GetVar(ctx.cfg.stack_pointer_var)
+      bctx.code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-total_alloc_size)))
+    else:
+      vararg_ptr = sb3.Known(0)
+
+    # Store varargs
+    offset = 0
+    for arg in varargs:
+      arg_val, arg_blocks = flatAsTuple(transValue(arg, ctx, bctx))
+      bctx.code.add(arg_blocks)
+      bctx.code.add(transStore(arg_val, sb3.Op("add", vararg_ptr, sb3.Known(offset)), ctx))
+      offset += getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing)
+
   # If a function pointer, call the 'signature' corresponding to how we called the function
   callee_name = callee.name if isinstance(callee, FuncInfo) else localizeFuncPtrSig(callee.signature_id)
 
@@ -1642,6 +1689,8 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       must_store_special.append(ctx.cfg.previous_stack_size_local)
     if caller.takes_return_address:
       must_store_special.append(ctx.cfg.return_address_local)
+    if caller.is_variadic:
+      must_store_special.append(ctx.cfg.vararg_ptr_local)
     if ctx.cfg.use_branch_jump_table:
       must_store_special.append(ctx.cfg.branch_jump_table_addr_local)
 
@@ -1655,16 +1704,14 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
   return_addr_id = return_proc_name = None
   if callee.returns_to_address:
     return_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name)
+  if callee.takes_return_address:
+    assert return_proc_name is not None
     return_addr_id = callee.return_addresses.index(return_proc_name)
 
   if not poss_recursive: # TODO OPTI: this can also be used if possibly recusive but we don't depend on anything after
-    arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
+    arguments, arg_value_blocks = getCallArguments(args, vararg_ptr, return_addr_id, ctx, bctx)
 
     if callee.returns_to_address:
-      if callee.takes_return_address:
-        assert return_addr_id is not None
-        # Pass return address into function
-        arguments.append(sb3.Known(return_addr_id))
       # Make sure parameters can be accessed later
       bctx.code.add(assignParameters(
         bctx.available_params, bctx.available_param_sizes,
@@ -1710,7 +1757,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       bctx.available_param_sizes = must_store_sizes
       bctx.code = sb3.BlockList([sb3.ProcedureDef(recurse_proc_name, [var.getRawVarName() for var in must_store])])
 
-      arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
+      arguments, arg_value_blocks = getCallArguments(args, vararg_ptr, return_addr_id, ctx, bctx)
       call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
       bctx.code.add(call_blocks)
@@ -1732,9 +1779,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         must_store[i].var_type = "var"
 
       assert return_addr_id is not None
-      arguments, arg_value_blocks = getCallArguments(args, ctx, bctx)
-      if callee.returns_to_address:
-        arguments.append(sb3.Known(return_addr_id))
+      arguments, arg_value_blocks = getCallArguments(args, vararg_ptr, return_addr_id, ctx, bctx)
 
       call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
       bctx.code.add(arg_value_blocks)
@@ -1762,6 +1807,10 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         offset += size
 
       bctx.code.add(sb3.EditVar("change", ctx.cfg.local_stack_size_var, sb3.Known(-total_size)))
+
+  # Deallocate vararg memory
+  if callee.is_variadic and total_alloc_size != 0:
+    bctx.code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(total_alloc_size)))
 
   bctx.next_call_id += 1
 
@@ -1839,12 +1888,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         if ctx.cfg.accurate_byte_spacing and isinstance(instr.value.type, (ir.ArrayTy, ir.StructTy)):
           raise CompException(f"Storing aggregates with accurate padding not supported yet: {instr}")
 
-        if isinstance(value, sb3.Value):
-          blocks.add(sb3.BlockList([sb3.EditList("replaceat", ctx.cfg.mem_var, address, value)]))
-        else:
-          for offset, val in enumerate(value.vals):
-            offset_val = sb3.Known(offset)
-            blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.Op("add", address, offset_val), val))
+        blocks.add(transStore(value, address, ctx))
 
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
@@ -2804,7 +2848,6 @@ def getFuncPtrRefs(mod: ir.Module) -> list[tuple[ir.FuncTy, list[str]]]:
   # Sort alphabetically to get a consistent compiled result
   sorted_refs = sorted(list(all_refs))
 
-  # TODO: vararg support
   func_ptrs: list[tuple[ir.FuncTy, list[str]]] = []
   for fn_name in sorted_refs:
     fn = mod.functions[fn_name]
@@ -3199,6 +3242,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: list())))
   fn_ptr_sig_called_by: list[set[str]] = [set() for _ in range(len(ctx.fn_ptr_sigs))]
   fn_ptr_sig_return_addrs: list[list[str]] = [[] for _ in range(len(ctx.fn_ptr_sigs))]
+  makes_variadic_alloc: defaultdict[str, bool] = defaultdict(bool)
 
   defined_funcs: list[ir.Function] = list(filter(lambda fn: len(fn.blocks) > 0, mod.functions.values()))
   defined_func_names: list[str] = [fn.name for fn in defined_funcs]
@@ -3221,16 +3265,15 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
           case ir.Call():
             localized_call_id = localizeCallId(call_id, block.label, fn.name)
 
+            makes_variadic_alloc[fn.name] |= instr.variadic
+
             if isinstance(instr.func, ir.FunctionVal):
               # Direct function call
               could_call = [instr.func.name]
               is_direct_call = True
             else:
               # Function Pointer
-              # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
-              # the call instruction's vararg support
-              assert instr.variadic is False # TODO: arg.type is not accurate as it also consideres variadic args
-              signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args], variadic=instr.variadic)
+              signature = ir.FuncTy(return_type=instr.return_type, params=instr.params, variadic=instr.variadic)
               sig_info = getFuncPtrSignatureInfo(signature, fn.name, ctx)
               is_direct_call = False
 
@@ -3340,11 +3383,13 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       fn_branches_to_first = any([first_block_label in branch_to for branch_to in branches.values()])
     branches_to_first[fn.name] = fn_branches_to_first
 
+  # Propagate downstream
   for fn_name in returns_to_address:
-    # If the function returns to an address, then callers must also return to an address
     returns_to_address[fn_name] |= any(returns_to_address[call] for call in call_graph[fn_name][0])
+  for fn in defined_funcs:
+    makes_variadic_alloc[fn.name] |= any(makes_variadic_alloc[call] for call in call_graph[fn.name][0])
 
-  for signature_id, (_, could_call) in enumerate(ctx.fn_ptr_sigs):
+  for signature_id, (sig, could_call) in enumerate(ctx.fn_ptr_sigs):
     # If the function pointer signature calls any function that returns to an address,
     # it must return to an address also. All functions that can call a function signature
     # have already been accounted for because they were treated as calling all function
@@ -3365,14 +3410,15 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     sig_could_recurse = len(sig_could_call_total & sig_called_by) > 0
 
     ctx.fn_ptr_sig_info.append(FuncPtrSigInfo(
-      signature_id, sig_could_call_total, sig_return_addrs,
+      signature_id, sig_could_call_total, len(sig.params), sig.variadic, sig_return_addrs,
       sig_returns_to_address, sig_takes_ret_addr, sig_could_recurse))
 
   for fn in defined_funcs:
     # If we know the total size a function allocates and that it doesn't call any functions
     # that rely on the stack size, we don't need to increase the stack size
     skip_stack_size_change = total_alloca_size[fn.name] is not None and \
-      all(total_alloca_size[call] == 0 for call in call_graph[fn.name][0])
+      all(total_alloca_size[call] == 0 for call in call_graph[fn.name][0]) and \
+      not makes_variadic_alloc[fn.name]
 
     fn_ret_addresses = return_addresses.get(fn.name, list())
     fn_returns_to_address = returns_to_address[fn.name]
@@ -3386,14 +3432,17 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       param_names.append(arg.name)
       param_sizes.append(getByteSize(arg.type))
 
+    if fn.variadic:
+      param_names.append(ctx.cfg.vararg_ptr_local)
+      param_sizes.append(1)
     if fn_takes_ret_addr:
       param_names.append(ctx.cfg.return_address_local)
       param_sizes.append(1)
     params = [Variable(name, "param", fn.name) for name in param_names]
 
-    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, call_graph[fn.name][0],
-                                    fn_ret_addresses, fn_returns_to_address, fn_takes_ret_addr,
-                                    check_locations.get(fn.name, list()),
+    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, fn.variadic,
+                                    call_graph[fn.name][0], fn_ret_addresses, fn_returns_to_address,
+                                    fn_takes_ret_addr, check_locations.get(fn.name, list()),
                                     branch_alloca_size[fn.name], total_alloca_size.get(fn.name, None),
                                     skip_stack_size_change, block_var_use[fn.name],
                                     branches_to_first.get(fn.name, False), phi_assignments[fn.name])
@@ -3419,10 +3468,12 @@ def transFuncPtrSigs(ctx: Context) -> Context:
     arguments = [f"%{n}" for n in range(arg_count)]
 
     return_address = Variable(ctx.cfg.return_address_local, "param", sig_name)
+    vararg_ptr = Variable(ctx.cfg.vararg_ptr_local, "param", sig_name)
     func_ptr_addr = Variable(ctx.cfg.func_ptr_parameter, "param", sig_name)
     params = [func_ptr_addr.getUnidxedRawVarName(), *deepcopy(arguments)]
-    if info.takes_return_address:
-      params.append(return_address.getUnidxedRawVarName())
+
+    if info.is_variadic:          params.append(vararg_ptr.getUnidxedRawVarName())
+    if info.takes_return_address: params.append(return_address.getUnidxedRawVarName())
 
     blocks = sb3.BlockList([
       sb3.ProcedureDef(sig_name, params),
@@ -3446,9 +3497,12 @@ def transFuncPtrSigs(ctx: Context) -> Context:
     branches = dict()
     for name in could_call:
       callee_info = ctx.fn_info[name]
+      assert info.is_variadic == callee_info.is_variadic
 
       branch = sb3.BlockList()
       args: list[sb3.Value] = [sb3.GetParam(arg) for arg in arguments]
+      if info.is_variadic:
+        args.append(vararg_ptr.getValue())
       if callee_info.takes_return_address:
         callee_return_addr = callee_info.return_addresses.index(callback)
         args.append(sb3.Known(callee_return_addr))
@@ -3591,8 +3645,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           if instr.tail_kind == ir.CallTailKind.MustTail:
             raise CompException("Tail calls not supported")
 
-          assert not instr.variadic # TODO: handle variadic functions correctly
-
           callee_info = None
           args = instr.args
           result = None if instr.result is None else transVar(instr.result, bctx)
@@ -3600,10 +3652,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           following_instrs = block.instrs[instr_index + 1:]
 
           if not isinstance(instr.func, ir.FunctionVal):
-            # TODO - vararg support - use the Call instructions' parameter values for parameters and pass
-            # the call instruction's vararg support
-            assert not instr.variadic # TODO: this is incorrect as it variadic arguments for param types
-            signature = ir.FuncTy(return_type=instr.return_type, params=[arg.type for arg in instr.args], variadic=instr.variadic)
+            signature = ir.FuncTy(return_type=instr.return_type, params=instr.params, variadic=instr.variadic)
             # Don't warn again - we did this earlier in getFnInfo
             sig_info = getFuncPtrSignatureInfo(signature, bctx.fn.name, ctx, warn_no_matching=False)
 
