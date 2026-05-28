@@ -3445,8 +3445,14 @@ def transFuncPtrSigs(ctx: Context) -> Context:
 
     branches = dict()
     for name in could_call:
+      callee_info = ctx.fn_info[name]
+
       branch = sb3.BlockList()
-      branch.add(sb3.ProcedureCall(name, [sb3.GetParam(arg) for arg in arguments]))
+      args: list[sb3.Value] = [sb3.GetParam(arg) for arg in arguments]
+      if callee_info.takes_return_address:
+        callee_return_addr = callee_info.return_addresses.index(callback)
+        args.append(sb3.Known(callee_return_addr))
+      branch.add(sb3.ProcedureCall(name, args))
 
       # If we return to an address and the callee doesn't then jump to our callback ourselves
       if info.returns_to_address and not ctx.fn_info[name].returns_to_address:
