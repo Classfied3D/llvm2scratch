@@ -91,7 +91,9 @@ class Format(Enum):
 
 @dataclass
 class ScratchConfig():
-  minify: bool = True              # Optimize project.json's size by simplifing uids, removing falsy fields, etc
+  minify: bool = True              # Optimize project.json's size by simplifing uids, removing falsy fields, etc.
+                                   # Omits variable names from get var, set var and list blocks if unneeded,
+                                   # thanks @nembence on scratch for suggesting this!
 
   minify_break_glow: bool = False  # Removing the parent key when minifing prevents blocks in the same
                                    # sprite from glowing correctly due to a js error - minify futher and
@@ -759,7 +761,8 @@ class ControlFlow(Block):
     if op == "for_each":
       assert self.var is not None
       id = ctx.addOrGetVar(self.var)
-      res["fields"] = {"VARIABLE": [self.var, id]}
+      name = self.var * (not ctx.cfg.minify)
+      res["fields"] = {"VARIABLE": [name, id]}
 
     return res, ctx
 
@@ -1097,7 +1100,8 @@ class GetVar(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetVar(self.var_name)
-    return [3, [12, self.var_name, id]], ctx
+    name = self.var_name * (not ctx.cfg.minify)
+    return [3, [12, name, id]], ctx
 
   def stringify(self, sb: bool=False) -> str:
     if not sb: return f"({self.var_name})"
@@ -1120,10 +1124,11 @@ class EditVar(Block):
     id = ctx.addOrGetVar(self.var_name)
     # NOTE: technically set variable doesn't cast but we need to assume the worst scenario
     raw_val, ctx = self.value.getRawValue(my_id, ctx, (ScratchCast.TO_STR if self.op == "set" else ScratchCast.TO_NUM))
+    name = self.var_name * (not ctx.cfg.minify)
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": {"VALUE": raw_val},
-      "fields": {"VARIABLE": [self.var_name, id]}
+      "fields": {"VARIABLE": [name, id]}
     }, ctx
 
   def stringify(self, sb: bool=False) -> str:
@@ -1146,7 +1151,8 @@ class GetList(Value):
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.addOrGetList(self.list_name)
-    return [3, [13, self.list_name, id]], ctx
+    name = self.list_name * (not ctx.cfg.minify)
+    return [3, [13, name, id]], ctx
 
   def stringify(self, sb: bool=False) -> str:
     if not sb:
@@ -1165,6 +1171,8 @@ class GetOfList(Value):
     id = ctx.genId()
     list_id = ctx.addOrGetList(self.list_name)
 
+    name = self.list_name * (not ctx.cfg.minify)
+
     raw_value, ctx = self.value.getRawValue(parent, ctx, (ScratchCast.TO_NUM if self.op == "atindex" else ScratchCast.TO_STR))
 
     input_name = "INDEX" if self.op == "atindex" else "ITEM"
@@ -1172,7 +1180,7 @@ class GetOfList(Value):
     ctx.addBlock(id, RawBlock({
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": {input_name: raw_value},
-      "fields": {"LIST": [self.list_name, list_id]},
+      "fields": {"LIST": [name, list_id]},
     }), BlockMeta(parent))
 
     return [3, id], ctx
@@ -1195,10 +1203,11 @@ class GetListLength(Value):
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.genId()
     list_id = ctx.addOrGetList(self.list_name)
+    name = self.list_name * (not ctx.cfg.minify)
 
     ctx.addBlock(id, RawBlock({
       "opcode": "data_lengthoflist",
-      "fields": {"LIST": [self.list_name, list_id]},
+      "fields": {"LIST": [name, list_id]},
     }), BlockMeta(parent))
 
     return [3, id], ctx
@@ -1218,6 +1227,7 @@ class EditList(Block):
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     list_id = ctx.addOrGetList(self.list_name)
+    name = self.list_name * (not ctx.cfg.minify)
     inputs = {}
 
     if self.index is not None:
@@ -1235,7 +1245,7 @@ class EditList(Block):
     return {
       "opcode": SHORT_OP_TO_OPCODE[self.op],
       "inputs": inputs,
-      "fields": {"LIST": [self.list_name, list_id]},
+      "fields": {"LIST": [name, list_id]},
     }, ctx
 
   def stringify(self, sb: bool=False) -> str:

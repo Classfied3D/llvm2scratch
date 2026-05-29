@@ -36,7 +36,9 @@ class CustomFormatter(argparse.HelpFormatter):
     self.start_section("minify options")
     for name, desc in [
         ("all, none", "Self-explanatory"),
-        ("general", "Optimize project.json's size by simplifing uids, removing falsy fields, etc"),
+        ("general", "Optimize project.json's size by simplifing uids, removing falsy fields, etc. "
+                    "Omits variable names from get var, set var and list blocks if unneeded, "
+                    "thanks @nembence on scratch for suggesting this!"),
         ("compiler", "Optimize code for size in the compiler e.g. sub 1 instead of add 2^N - 1"),
         ("break-glow", "Removing the parent key when minifing prevents blocks in the same sprite from "
                        "glowing correctly due to a js error - minify futher and allow this error to occur"),

@@ -128,7 +128,8 @@ optimization options:
 minify options:
   all, none             Self-explanatory
   general               Optimize project.json's size by simplifing uids, removing falsy
-                        fields, etc
+                        fields, etc. Omits variable names from get var, set var and list
+                        blocks if unneeded, thanks @nembence on scratch for suggesting this!
   break-glow            Removing the parent key when minifing prevents blocks in the same
                         sprite from glowing correctly due to a js error - minify futher and
                         allow this error to occur
