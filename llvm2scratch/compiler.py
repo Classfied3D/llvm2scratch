@@ -119,7 +119,7 @@ class FuncPtrSigInfo:
   signature_id: int
   # Descriptions for following are in FuncInfo
   can_call: set[str]
-  param_count: int
+  value_param_count: int
   is_variadic: bool
   return_addresses: list[str]
   returns_to_address: bool
@@ -135,6 +135,9 @@ class FuncInfo:
   params: list[Variable]
   # The types of the parameters
   param_sizes: list[int]
+  # The amount of parameters which are ir values the function accepts (i.e. excluding
+  # return address and vararg pointer)
+  value_param_count: int
   # If the function is variadic
   is_variadic: bool = False
   # Everything the function might call (may include itself)
@@ -1629,8 +1632,11 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
 
   assert bctx.label is not None
 
-  # The add one at the end is to account of the function pointer address
-  param_count = len(callee.params) if isinstance(callee, FuncInfo) else callee.param_count + 1
+  param_count = callee.value_param_count
+  if isinstance(callee, FuncPtrSigInfo):
+    # Account for the function pointer address
+    param_count += 1
+
   assert callee.is_variadic or param_count == len(args)
   args, varargs = args[:param_count], args[param_count:]
 
@@ -1652,6 +1658,8 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
       bctx.code.add(arg_blocks)
       bctx.code.add(transStore(arg_val, sb3.Op("add", vararg_ptr, sb3.Known(offset)), ctx))
       offset += getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing)
+  else:
+    assert len(varargs) == 0
 
   # If a function pointer, call the 'signature' corresponding to how we called the function
   callee_name = callee.name if isinstance(callee, FuncInfo) else localizeFuncPtrSig(callee.signature_id)
@@ -3440,7 +3448,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
       param_sizes.append(1)
     params = [Variable(name, "param", fn.name) for name in param_names]
 
-    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, fn.variadic,
+    ctx.fn_info[fn.name] = FuncInfo(fn.name, ctx.next_fn_id, params, param_sizes, len(fn.params), fn.variadic,
                                     call_graph[fn.name][0], fn_ret_addresses, fn_returns_to_address,
                                     fn_takes_ret_addr, check_locations.get(fn.name, list()),
                                     branch_alloca_size[fn.name], total_alloca_size.get(fn.name, None),
@@ -4134,7 +4142,7 @@ def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context)
   blocks = sb3.BlockList([sb3.ProcedureDef(name, [param.getRawVarName() for param in localized_params])])
   blocks.add(contents)
   ctx.proj.code.append(blocks)
-  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, [1]*len(params))
+  ctx.fn_info[name] = FuncInfo(name, ctx.next_fn_id, localized_params, [1]*len(params), len(params))
   ctx.next_fn_id += 1
   return ctx
 
