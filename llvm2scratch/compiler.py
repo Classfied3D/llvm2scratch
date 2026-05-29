@@ -1395,7 +1395,31 @@ def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
     ptr = sb3.Op("sub", ptr, sb3.Known(-offset))
   return ptr
 
-def transStore(value: sb3.Value | IdxbleValue, address: sb3.Value, ctx: Context) -> sb3.BlockList:
+def transLoad(result: Variable, address: sb3.Value, loaded_type: ir.Type, ctx: Context) -> sb3.BlockList:
+  blocks = sb3.BlockList()
+
+  # TODO FIX: properly skip over padding bytes
+  if ctx.cfg.accurate_byte_spacing and isinstance(loaded_type, (ir.ArrayTy, ir.StructTy)):
+    raise CompException(f"Loading aggregates with accurate padding not supported yet")
+
+  # Don't include padding - we don't care about loading padded bytes, they only exist to offset pointers,
+  # not variables
+  var_size = getByteSize(loaded_type, include_padding=False)
+
+  if var_size == 1:
+    blocks.add(result.setValue(sb3.GetOfList("atindex", ctx.cfg.mem_var, address)))
+  else:
+    blocks.add(result.setAllValues(IdxbleValue([
+      sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.Op("add", address, sb3.Known(i))) for i in range(var_size)
+    ])))
+
+  return blocks
+
+def transStore(value: sb3.Value | IdxbleValue, address: sb3.Value, stored_type: ir.Type, ctx: Context) -> sb3.BlockList:
+  # TODO FIX: properly skip over padding bytes when storing
+  if ctx.cfg.accurate_byte_spacing and isinstance(stored_type, (ir.ArrayTy, ir.StructTy)):
+    raise CompException(f"Storing aggregates with accurate padding not supported yet")
+
   blocks = sb3.BlockList()
   if isinstance(value, sb3.Value):
     blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, address, value))
@@ -1656,7 +1680,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     for arg in varargs:
       arg_val, arg_blocks = flatAsTuple(transValue(arg, ctx, bctx))
       bctx.code.add(arg_blocks)
-      bctx.code.add(transStore(arg_val, sb3.Op("add", vararg_ptr, sb3.Known(offset)), ctx))
+      bctx.code.add(transStore(arg_val, sb3.Op("add", vararg_ptr, sb3.Known(offset)), arg.type, ctx))
       offset += getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing)
   else:
     assert len(varargs) == 0
@@ -1860,23 +1884,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       address = transValue(instr.address, ctx, bctx)
       blocks.add(address.blocks)
 
-      if isinstance(address.value, IdxbleValue):
+      var = transVar(instr.result, bctx)
+
+      if isinstance(address, IdxbleValueAndBlocks):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
-      # TODO FIX: properly skip over padding bytes
-      if ctx.cfg.accurate_byte_spacing and isinstance(instr.loaded_type, (ir.ArrayTy, ir.StructTy)):
-        raise CompException(f"Loading aggregates with accurate padding not supported yet: {instr}")
-
-      # Don't include padding - we don't care about loading padded bytes, they only exist to offset pointers
-      byte_size = getByteSize(instr.loaded_type, include_padding=False)
-
-      var = transVar(instr.result, bctx)
-      if byte_size == 1:
-        blocks.add(var.setValue(sb3.GetOfList("atindex", ctx.cfg.mem_var, address.value)))
-      else:
-        blocks.add(var.setAllValues(IdxbleValue([
-          sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.Op("add", address.value, sb3.Known(i))) for i in range(byte_size)
-        ])))
+      blocks.add(transLoad(var, address.value, instr.loaded_type, ctx))
 
     case ir.Store(): # Copy a value to an address on the stack
       address = transValue(instr.address, ctx, bctx)
@@ -1892,11 +1905,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         if isinstance(address, IdxbleValue):
           raise CompException(f"Address to store cannot be an indexable value in {instr}")
 
-        # TODO FIX: properly skip over padding bytes when storing
-        if ctx.cfg.accurate_byte_spacing and isinstance(instr.value.type, (ir.ArrayTy, ir.StructTy)):
-          raise CompException(f"Storing aggregates with accurate padding not supported yet: {instr}")
-
-        blocks.add(transStore(value, address, ctx))
+        blocks.add(transStore(value, address, instr.value.type, ctx))
 
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
@@ -2647,9 +2656,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert res_var.var_type != "param"
       blocks.add(res_var.setValue(offset_ptr))
 
-    case ir.Call(): # Call a function
-      pass # Calls are handled in transFuncs
-
     case ir.Freeze(): # Freeze a value to replace poison/undef with a valid value
       # Essentially a no-op, but for some types (e.g. integers)
       # poison can exist in invalid states e.g. -3 or 1.2 or NaN
@@ -2679,6 +2685,27 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                               f"integers and floats, got type {type(instr.value.type)}")
 
       blocks.add(res_val)
+
+    case ir.Call(): # Call a function
+      pass # Calls are handled in transFuncs
+
+    case ir.VaArg(): # Load an argument in a va_list and point the va_list to the next argument
+      arglist = transValue(instr.arglist, ctx, bctx)
+      blocks.add(arglist.blocks)
+      arglist = arglist.value
+
+      res_var = transVar(instr.result, bctx)
+
+      assert isinstance(instr.arglist.type, ir.PointerTy)
+      assert isinstance(arglist, sb3.Value)
+
+      arg_ptr = sb3.GetOfList("atindex", ctx.cfg.mem_var, arglist)
+      arg_ptr, opt_blocks = flatAsTuple(optimizeValueUse(arg_ptr, 2, ctx))
+      arg_size = sb3.Known(getByteSize(instr.argty, include_padding=ctx.cfg.accurate_byte_spacing))
+
+      blocks.add(opt_blocks)
+      blocks.add(transLoad(res_var, arg_ptr, instr.argty, ctx))
+      blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, arglist, sb3.Op("add", arg_ptr, arg_size)))
 
     case _:
       raise CompException(f"Unsupported instruction opcode {instr} (type {type(instr)})")
@@ -2734,6 +2761,8 @@ def getInstrValues(instr: ir.Instr, include_called_funcs: bool=True) -> list[ir.
       return [instr.agg, *instr.indices]
     case ir.InsertValue():
       return [instr.agg, instr.element, *instr.indices]
+    case ir.VaArg():
+      return [instr.arglist]
     case _:
       raise CompException(f"Unknown instruction {instr} (type {type(instr)})")
 

@@ -387,6 +387,10 @@ class Select(Instr, HasResult):
   false_value: Value
 
 @dataclass
+class Freeze(Instr, HasResult):
+  value: Value
+
+@dataclass
 class Call(Instr, MaybeHasResult):
   func: Value
   return_type: Type
@@ -397,8 +401,9 @@ class Call(Instr, MaybeHasResult):
   intrinsic: Intrinsic | None
 
 @dataclass
-class Freeze(Instr, HasResult):
-  value: Value
+class VaArg(Instr, HasResult):
+  arglist: Value
+  argty: Type
 
 @dataclass
 class Block():

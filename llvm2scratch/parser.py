@@ -5,8 +5,8 @@ from typing import cast
 from .parser_util import *
 from .ir import *
 
-def getResultLocalVar(instr: llvm.ValueRef) -> ResultLocalVar | None:
-  stringified = str(instr).strip()
+def getResultLocalVar(instr_str: str) -> ResultLocalVar | None:
+  stringified = instr_str.strip()
   if stringified.startswith("%"):
     return ResultLocalVar(stringified.split("=")[0][1:].strip())
   return None
@@ -74,7 +74,7 @@ def decodeValue(value: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
 
     case llvm.ValueKind.instruction:
       # An instruction of which the SSA value is set from
-      res = getResultLocalVar(value)
+      res = getResultLocalVar(str(value))
       assert res is not None
       return LocalVarVal(type, res.name)
 
@@ -141,9 +141,8 @@ def decodeIntrinsic(name: str) -> Intrinsic | None:
   return max(matches, key=lambda x: len(x.value))
 
 def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: list[str]) -> Instr:
-
-  result = getResultLocalVar(instr)
   raw_instr_no_res = str(instr).strip()
+  result = getResultLocalVar(raw_instr_no_res)
   if result is not None:
     raw_instr_no_res = raw_instr_no_res.split("=", 1)[1].strip()
 
@@ -357,6 +356,11 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
       cond, true_val, false_val, *_ = instr.operands
       return Select(result, decodeValue(cond, structs, func_names), decodeValue(true_val, structs, func_names), decodeValue(false_val, structs, func_names))
 
+    case "freeze":
+      assert result is not None
+      value, *_ = instr.operands
+      return Freeze(result, decodeValue(value, structs, func_names))
+
     case "call":
       *args, callee = instr.operands
       func_val = decodeValue(callee, structs, func_names)
@@ -390,10 +394,16 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
 
       return Call(result, func_val, return_type, arg_vals, params, variadic, tail_kind, intrinsic)
 
-    case "freeze":
+    case "va_arg":
       assert result is not None
-      value, *_ = instr.operands
-      return Freeze(result, decodeValue(value, structs, func_names))
+
+      arglist, *_ = instr.operands
+      arglist_val = decodeValue(arglist, structs, func_names)
+
+      parts = parseCommaSeperated(raw_instr_no_res)
+      argty, _ = parseTypeTokens(parts[1], structs)
+
+      return VaArg(result, arglist_val, argty)
 
     case _:
       raise ValueError(f"Opcode {instr.opcode} not implemented")
