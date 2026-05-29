@@ -3079,8 +3079,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
 
   # For some intrinsics, they are no-op, etc and we don't need to translate args
   match intrinsic:
-    case ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl | ir.Intrinsic.Expect | \
-         ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
+    case ir.Intrinsic.VaEnd | ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl | \
+         ir.Intrinsic.Expect | ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
       return blocks
 
     case _: pass
@@ -3097,6 +3097,25 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       metadata.append(arg)
 
   match intrinsic:
+    case ir.Intrinsic.VaStart:
+      # arglist_ptr is a va_list*, so it points to a va_list. For our target, va_list
+      # is just a pointer so it is a pointer to a pointer
+      arglist_ptr, = values
+      assert isinstance(arglist_ptr, sb3.Value)
+
+      # Store vararg_ptr at arglist_ptr
+      vararg_ptr = localizeVar(ctx.cfg.vararg_ptr_local, False, bctx)
+      blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, arglist_ptr, vararg_ptr.getValue()))
+
+    # Note: VaEnd is a no-op on our target
+
+    case ir.Intrinsic.VaCopy:
+      # Copy one vararg pointer to another
+      dest, src = values
+      assert isinstance(dest, sb3.Value) and isinstance(src, sb3.Value)
+      src_vararg_ptr = sb3.GetOfList("atindex", ctx.cfg.mem_var, src)
+      blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, dest, src_vararg_ptr))
+
     case ir.Intrinsic.UMin | ir.Intrinsic.UMax | ir.Intrinsic.SMin | ir.Intrinsic.SMax:
       match intrinsic:
         case ir.Intrinsic.UMin: mode = ir.ICmpCond.Ult

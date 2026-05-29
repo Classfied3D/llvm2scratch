@@ -4,7 +4,7 @@ import os
 
 INPUT = "demo.c"
 OUTPUT_IR = "output/out.ll"
-OUTPUT_PROJ = "output/blocks.txt"
+OUTPUT_PROJ = "output/out.sb3"
 OUTPUT_SCRATCHBLOCKS = "output/blocks.txt"
 
 def main():
