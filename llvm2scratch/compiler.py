@@ -1774,7 +1774,6 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
                                                   is_counted=callee.returns_to_address)
       bctx.code.add(assign_blocks)
   else:
-    assert return_proc_name is not None
     if not callee.returns_to_address and not ctx.cfg.use_branch_jump_table:
       # Use the parameters for procedures to use scratch's stack to store any variables needed later
       recurse_proc_name = localizeCallId(bctx.next_call_id, bctx.label, caller.name, True)
@@ -1811,7 +1810,6 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
         offset += size
         must_store[i].var_type = "var"
 
-      assert return_addr_id is not None
       arguments, arg_value_blocks = getCallArguments(args, vararg_ptr, return_addr_id, ctx, bctx)
 
       call_blocks, assign_blocks = transSimpleCall(callee_name, arguments, result, result_size, ctx)
@@ -1820,6 +1818,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
 
       # Only create a return address target if it should be created
       if callee.returns_to_address:
+        assert return_proc_name is not None
         ctx.proj.code.append(bctx.code)
         bctx.available_params = []
         bctx.available_param_sizes = []
