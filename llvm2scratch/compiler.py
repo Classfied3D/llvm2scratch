@@ -3103,14 +3103,14 @@ def transTerminatorInstr(instr: ir.Instr,
   return blocks, ctx
 
 def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variable | None, \
-                   ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
+                   ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context]:
   blocks = sb3.BlockList()
 
   # For some intrinsics, they are no-op, etc and we don't need to translate args
   match intrinsic:
     case ir.Intrinsic.VaEnd | ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl | \
          ir.Intrinsic.Expect | ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
-      return blocks
+      return blocks, ctx
 
     case _: pass
 
@@ -3293,7 +3293,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
     case _:
       raise CompException(f"Unsupported intrinsic {intrinsic}")
 
-  return blocks
+  return blocks, ctx
 
 def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
   """Get info about a function needed to translate it's instructions"""
@@ -3745,7 +3745,8 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
             callee_info = ctx.fn_info[instr.func.name] if instr.intrinsic is None else None
 
           if instr.intrinsic is not None:
-            bctx.code.add(transIntrinsic(instr.intrinsic, args, result, ctx, bctx))
+            intrinsic, ctx = transIntrinsic(instr.intrinsic, args, result, ctx, bctx)
+            bctx.code.add(intrinsic)
             bctx.next_call_id += 1
 
           else:
