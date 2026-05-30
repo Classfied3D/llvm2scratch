@@ -1183,8 +1183,9 @@ def andWithKnownMaskParts(unknown: sb3.Value, known: int, width: int, ctx: Conte
       old_region = groups[last_region_index]
       groups[last_region_index] = (old_region[0], old_region[1] - last_region_cut_off_by)
 
-      old_region_before = groups[last_region_index - 1]
-      groups[last_region_index - 1] = (old_region_before[0], old_region_before[1] + last_region_cut_off_by)
+      if last_region_index > 0:
+        old_region_before = groups[last_region_index - 1]
+        groups[last_region_index - 1] = (old_region_before[0], old_region_before[1] + last_region_cut_off_by)
 
       # Set the index to the index after the final region
       reg_start, _, reg_i = next_regions[-1]
