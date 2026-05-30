@@ -3279,6 +3279,17 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
                 pow2_shift_plus_offset_rgt
         )))))
 
+    case ir.Intrinsic.PtrMask:
+      ptr, mask = values
+      assert isinstance(ptr, sb3.Value) and isinstance(mask, sb3.Value)
+      assert isinstance(args[0].type, ir.PointerTy)
+      # TODO support different width masks
+      assert isinstance(args[1].type, ir.IntegerTy) and args[1].type.width == PTR_WIDTH_BITS
+      assert result is not None
+
+      res_val, ctx = binOp("and", ptr, mask, PTR_WIDTH_BITS, ctx)
+      blocks.add(result.setValue(res_val))
+
     case _:
       raise CompException(f"Unsupported intrinsic {intrinsic}")
 
