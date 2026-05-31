@@ -3215,6 +3215,13 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
           ]))
         ]))
 
+    case ir.Intrinsic.FAbs:
+      val, = values
+      assert isinstance(val, sb3.Value)
+      assert isinstance(args[0].type, ir.FloatingPointTy)
+      assert result is not None
+      blocks.add(result.setValue(sb3.Op("abs", val)))
+
     case ir.Intrinsic.FShl | ir.Intrinsic.FShr:
       lft, rgt, shift = values
       assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value) and isinstance(shift, sb3.Value)
