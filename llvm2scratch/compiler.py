@@ -1964,62 +1964,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
 def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.BlockList, Context, BlockInfo]:
   blocks = sb3.BlockList()
   match instr:
-    case ir.Alloca(): # Allocate space on the stack and return ptr
-      assert isinstance(instr.num_elements, ir.KnownIntVal)
-      assert instr.num_elements.value == 1
-
-      var = transVar(instr.result, bctx)
-      assert var is None or var.var_type != "param"
-
-      blocks = sb3.BlockList()
-      # Include padding in allocation space to prevent bytes being overriden (i.e. with memcpy)
-      size = getByteSize(instr.allocated_type, include_padding=ctx.cfg.accurate_byte_spacing)
-
-      assert bctx.label is not None
-      if bctx.fn.skip_stack_size_change:
-        # If we skip increasing the stack pointer, don't subtract to componsate for the extra memory
-        offset = 0
-      elif bctx.fn.total_alloca_size is None:
-        # Go back to the offset before adding the total size
-        offset = -bctx.fn.block_alloca_size[bctx.label]
-      else:
-        offset = -bctx.fn.total_alloca_size
-      offset += bctx.allocated + size - 1 # Add size so that there is enough space. For example if stack pointer is 100
-                                          # and we want to allocate 10 bytes, then change stack pointer to 90 to reserve
-                                          # bytes 91, 92, ..., 100. Subtract one to allow some allocations to be set to
-                                          # the stack pointer to skip an add as well as include the inital stack pointer
-      bctx.allocated += size
-
-      # Negate offset as the stack grows backward
-      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_pointer_var, -offset)))
-
-    case ir.Load(): # Load a value from an address on the stack
-      address = transValue(instr.address, ctx, bctx)
-      blocks.add(address.blocks)
-
-      var = transVar(instr.result, bctx)
-
-      if isinstance(address, IdxbleValueAndBlocks):
-        raise CompException(f"Address to load cannot be an indexable value in {instr}")
-
-      blocks.add(transLoad(var, address.value, instr.loaded_type, ctx))
-
-    case ir.Store(): # Copy a value to an address on the stack
-      address = transValue(instr.address, ctx, bctx)
-      blocks.add(address.blocks)
-      address = address.value
-
-      # TODO: technically the store should still happen if volatile
-      if not isinstance(instr.value, ir.UndefVal):
-        value = transValue(instr.value, ctx, bctx)
-        blocks.add(value.blocks)
-        value = value.value
-
-        if isinstance(address, IdxbleValue):
-          raise CompException(f"Address to store cannot be an indexable value in {instr}")
-
-        blocks.add(transStore(value, address, instr.value.type, ctx))
-
+    # Unary Operations
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
       blocks.add(operand.blocks)
@@ -2036,6 +1981,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       blocks.add(res_var.setValue(sb3.Op("sub", sb3.Known(0), operand)))
 
+    # Binary Operations
     case ir.BinaryOp(): # Do a calculation with two values
       lft = transValue(instr.left, ctx, bctx)
       blocks.add(lft.blocks)
@@ -2257,6 +2203,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           res_val = False # We set res_var ourselves
 
+        # Bitwise Binary Operations
         case ir.BinaryOpcode.Shl: # Calculate left shift
           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
@@ -2394,6 +2341,85 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if res_val is not False: # If the binop doesn't set res_var itself
         blocks.add(res_var.setInferredValue(res_val))
 
+    # Memory Access and Addressing Operations
+    case ir.Alloca(): # Allocate space on the stack and return ptr
+      assert isinstance(instr.num_elements, ir.KnownIntVal)
+      assert instr.num_elements.value == 1
+
+      var = transVar(instr.result, bctx)
+      assert var is None or var.var_type != "param"
+
+      blocks = sb3.BlockList()
+      # Include padding in allocation space to prevent bytes being overriden (i.e. with memcpy)
+      size = getByteSize(instr.allocated_type, include_padding=ctx.cfg.accurate_byte_spacing)
+
+      assert bctx.label is not None
+      if bctx.fn.skip_stack_size_change:
+        # If we skip increasing the stack pointer, don't subtract to componsate for the extra memory
+        offset = 0
+      elif bctx.fn.total_alloca_size is None:
+        # Go back to the offset before adding the total size
+        offset = -bctx.fn.block_alloca_size[bctx.label]
+      else:
+        offset = -bctx.fn.total_alloca_size
+      offset += bctx.allocated + size - 1 # Add size so that there is enough space. For example if stack pointer is 100
+                                          # and we want to allocate 10 bytes, then change stack pointer to 90 to reserve
+                                          # bytes 91, 92, ..., 100. Subtract one to allow some allocations to be set to
+                                          # the stack pointer to skip an add as well as include the inital stack pointer
+      bctx.allocated += size
+
+      # Negate offset as the stack grows backward
+      blocks.add(var.setValue(offsetStackSize(ctx.cfg.stack_pointer_var, -offset)))
+
+    case ir.Load(): # Load a value from an address on the stack
+      address = transValue(instr.address, ctx, bctx)
+      blocks.add(address.blocks)
+
+      var = transVar(instr.result, bctx)
+
+      if isinstance(address, IdxbleValueAndBlocks):
+        raise CompException(f"Address to load cannot be an indexable value in {instr}")
+
+      blocks.add(transLoad(var, address.value, instr.loaded_type, ctx))
+
+    case ir.Store(): # Copy a value to an address on the stack
+      address = transValue(instr.address, ctx, bctx)
+      blocks.add(address.blocks)
+      address = address.value
+
+      # TODO: technically the store should still happen if volatile
+      if not isinstance(instr.value, ir.UndefVal):
+        value = transValue(instr.value, ctx, bctx)
+        blocks.add(value.blocks)
+        value = value.value
+
+        if isinstance(address, IdxbleValue):
+          raise CompException(f"Address to store cannot be an indexable value in {instr}")
+
+        blocks.add(transStore(value, address, instr.value.type, ctx))
+
+    case ir.GetElementPtr(): # Offset a pointer to get an address in an array/struct
+      base_ptr = transValue(instr.base_ptr, ctx, bctx)
+      assert isinstance(base_ptr, ValueAndBlocks)
+      blocks.add(base_ptr.blocks)
+
+      indices: list[tuple[sb3.Value, int]] = []
+      for index_val in instr.indices:
+        assert isinstance(index_val.type, ir.IntegerTy)
+        index = transValue(index_val, ctx, bctx)
+        assert isinstance(index, ValueAndBlocks)
+        blocks.add(index.blocks)
+        indices.append((index.value, index_val.type.width))
+
+      known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
+
+      offset_ptr = applyGepOffsets(base_ptr.value, known_offset, unknown_offsets, instr.is_nuw, ctx)
+
+      res_var = transVar(instr.result, bctx)
+      assert res_var.var_type != "param"
+      blocks.add(res_var.setValue(offset_ptr))
+
+    # Conversion Operations
     case ir.Conversion(): # Convert a value from one type to another
       value = transValue(instr.value, ctx, bctx)
       blocks.add(value.blocks)
@@ -2511,6 +2537,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert res_val is not None
       blocks.add(res_var.setValue(res_val))
 
+    # Other Operations
     case ir.ICmp(): # Compare two values
       lft = transValue(instr.left, ctx, bctx)
       blocks.add(lft.blocks)
@@ -2641,27 +2668,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
     case ir.Phi(): # Choose a value based on which block control came from
       pass # Phi assignments are dealt with in the brancher function
-
-    case ir.GetElementPtr(): # Offset a pointer to get an address in an array/struct
-      base_ptr = transValue(instr.base_ptr, ctx, bctx)
-      assert isinstance(base_ptr, ValueAndBlocks)
-      blocks.add(base_ptr.blocks)
-
-      indices: list[tuple[sb3.Value, int]] = []
-      for index_val in instr.indices:
-        assert isinstance(index_val.type, ir.IntegerTy)
-        index = transValue(index_val, ctx, bctx)
-        assert isinstance(index, ValueAndBlocks)
-        blocks.add(index.blocks)
-        indices.append((index.value, index_val.type.width))
-
-      known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
-
-      offset_ptr = applyGepOffsets(base_ptr.value, known_offset, unknown_offsets, instr.is_nuw, ctx)
-
-      res_var = transVar(instr.result, bctx)
-      assert res_var.var_type != "param"
-      blocks.add(res_var.setValue(offset_ptr))
 
     case ir.Freeze(): # Freeze a value to replace poison/undef with a valid value
       # Essentially a no-op, but for some types (e.g. integers)
