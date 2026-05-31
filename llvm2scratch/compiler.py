@@ -253,6 +253,14 @@ class Variable:
       blocks.add(self.setValue(val, index=i))
     return blocks
 
+  def setInferredValue(self, value: sb3.Value | IdxbleValue) -> sb3.BlockList:
+    """
+    Uses setValue if type of value is sb3.Value, otherwise setAllValues
+    """
+    if isinstance(value, IdxbleValue):
+      return self.setAllValues(value)
+    return sb3.BlockList(self.setValue(value))
+
 class CompException(Exception):
   """Exception in the compiler"""
   pass
@@ -851,34 +859,43 @@ def binarySearch(value: sb3.Value,
                         binarySearch(value, branches, default_branch, min_poss_value, mid_val, True,
                                      _lo=_lo,     _hi=mid))])
 
-def paritialSumDiff(op: Literal["add", "sub"], left: sb3.Value, right: sb3.Value, prev_sum: sb3.Value, ctx: Context) -> sb3.Value:
+def shouldCarry(op: Literal["add", "sub"], prev_sum: sb3.Value, width: int) -> sb3.BooleanValue:
+  if op == "add":
+    return sb3.BoolOp(">", prev_sum, sb3.Known((2 ** width) - 1))
+  else:
+    return sb3.BoolOp("<", prev_sum, sb3.Known(0))
+
+def paritialSumDiff(op: Literal["add", "sub"], lft: sb3.Value, rgt: sb3.Value, prev_sum: sb3.Value, ctx: Context) -> sb3.Value:
   # Binary subtraction is exactly the same as addition but using subtraction to apply the carry/borrow bit and subtraction
   # checks for negative instead. The modulus used with add also functions as a "borrow"
-  raw_sum = sb3.Op(op, left, right)
-
-  if op == "add":
-    carry = sb3.BoolOp(">", prev_sum, sb3.Known((2 ** VARIABLE_MAX_BITS) - 1))
-  else:
-    carry = sb3.BoolOp("<", prev_sum, sb3.Known(0))
-
+  raw_sum = sb3.Op(op, lft, rgt)
+  carry = shouldCarry(op, prev_sum, VARIABLE_MAX_BITS)
   carried_sum = sb3.Op(op, raw_sum, carry)
   # When using known values, the optimizer can subtract values from both sides
   if ctx.cfg.compiler_opt: carried_sum = opt.simplifyValue(carried_sum)
 
   return carried_sum
 
-def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: IdxbleValue, width: int, ctx: Context) \
-    -> IdxbleValueAndBlocks:
-  steps = len(left.vals)
-  assert steps == len(right.vals)
+def calculateWideSumDiff(
+    op: Literal["add", "sub"], lft: IdxbleValue, rgt: IdxbleValue,
+    width: int, ctx: Context, unsigned_overflow_flag: bool=False
+  ) -> IdxbleValueAndBlocks:
+  """
+  Calcuates the result of adding/subtracting two values with integer overflow
+  unsigned_overflow_flag - return an extra value for if the operation had unsigned overflow
+  """
+  steps = len(lft.vals)
+  assert steps == len(rgt.vals)
   assert steps == math.ceil(width / VARIABLE_MAX_BITS)
   if steps == 0:
-    return IdxbleValueAndBlocks()
+    return IdxbleValueAndBlocks(IdxbleValue([sb3.Known(0)]*unsigned_overflow_flag))
+
+  if unsigned_overflow_flag: steps += 1
 
   if ctx.cfg.compiler_opt:
     # Optimize the values beforehand - helps with finding optimial calculation after optimizations
-    left = IdxbleValue([opt.simplifyValue(l) for l in left.vals])
-    right = IdxbleValue([opt.simplifyValue(r) for r in right.vals])
+    lft = IdxbleValue([opt.simplifyValue(l) for l in lft.vals])
+    rgt = IdxbleValue([opt.simplifyValue(r) for r in rgt.vals])
 
   best_cost = float("inf")
   best_blocks = sb3.BlockList()
@@ -899,10 +916,11 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
       stored_temp_names: dict[int, str] = {}
 
       for i in range(steps):
-        modulus = 2 ** (VARIABLE_MAX_BITS if i != steps - 1 else width % VARIABLE_MAX_BITS)
+        is_last_step = (i == steps - 1) or (unsigned_overflow_flag and i == steps - 2)
+        modulus = 2 ** (VARIABLE_MAX_BITS if not is_last_step else width % VARIABLE_MAX_BITS)
 
         if i == 0:
-          raw = sb3.Op(op, left.vals[0], right.vals[0])
+          raw = sb3.Op(op, lft.vals[0], rgt.vals[0])
           cost += opt.getValueCost(raw, ctx.cfg.opt_target.perf)
         else:
           earlier_stored = [idx for idx in stored_temp_names.keys() if idx < i]
@@ -910,31 +928,38 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
 
           if prev_stored is None:
             start = 1
-            prev = sb3.Op(op, left.vals[0], right.vals[0])
+            prev = sb3.Op(op, lft.vals[0], rgt.vals[0])
           else:
             start = prev_stored + 1
             prev = sb3.GetVar(stored_temp_names[prev_stored])
 
-          for j in range(start, i + 1):
-            prev = paritialSumDiff(op, left.vals[j], right.vals[j], prev, ctx)
+          # Min here is to ensure raw is set to the previous value
+          # if unsigned_overflow_flag is true and on the last step
+          for j in range(start, min(i + 1, len(lft.vals))):
+            prev = paritialSumDiff(op, lft.vals[j], rgt.vals[j], prev, ctx)
 
           raw = prev
 
-        if (i in checkpoint_indices) and (i >= start_index):
-          temp_name = genTempVar(ctx)
-          stored_temp_names[i] = temp_name
-          blocks.add(sb3.EditVar("set", temp_name, raw))
-          cost += ctx.cfg.opt_target.perf.set_var + opt.getValueCost(raw, ctx.cfg.opt_target.perf)
-
-        if i in stored_temp_names:
-          expr_for_mod = sb3.GetVar(stored_temp_names[i])
+        if i == steps - 1 and unsigned_overflow_flag:
+          # Add a carry flag to the end
+          res_node = opt.simplifyValue(
+            sb3.Op("bool_to_float", shouldCarry(op, raw, width % VARIABLE_MAX_BITS)))
         else:
-          expr_for_mod = raw
+          if (i in checkpoint_indices) and (i >= start_index):
+            temp_name = genTempVar(ctx)
+            stored_temp_names[i] = temp_name
+            blocks.add(sb3.EditVar("set", temp_name, raw))
+            cost += ctx.cfg.opt_target.perf.set_var + opt.getValueCost(raw, ctx.cfg.opt_target.perf)
 
-        mod_node = sb3.Op("mod", expr_for_mod, sb3.Known(modulus))
-        cost += opt.getValueCost(mod_node, ctx.cfg.opt_target.perf)
+          if i in stored_temp_names:
+            expr_for_mod = sb3.GetVar(stored_temp_names[i])
+          else:
+            expr_for_mod = raw
 
-        sum_nodes.append(mod_node)
+          res_node = sb3.Op("mod", expr_for_mod, sb3.Known(modulus))
+
+        cost += opt.getValueCost(res_node, ctx.cfg.opt_target.perf)
+        sum_nodes.append(res_node)
 
       if cost < best_cost:
         best_cost = cost
@@ -942,6 +967,94 @@ def calculateSumDiff(op: Literal["add", "sub"], left: IdxbleValue, right: Idxble
         best_sum_nodes = sum_nodes
 
   return IdxbleValueAndBlocks(IdxbleValue(best_sum_nodes), best_blocks)
+
+def calculateSumDiff(
+    op: Literal["add", "sub"], lft: sb3.Value | IdxbleValue, rgt: sb3.Value | IdxbleValue,
+    width: int, ctx: Context, is_nuw: bool=False, unsigned_overflow_flag: bool=False
+  ) -> ValueAndBlocks | IdxbleValueAndBlocks:
+  """
+  Calculate the result of adding of subtracting two values with integer overflow.
+  unsigned_overflow_flag - If true then return an extra value for if the operation
+  had unsigned overflow
+  """
+
+  if width > VARIABLE_MAX_BITS:
+    assert isinstance(lft, IdxbleValue) and isinstance(rgt, IdxbleValue)
+    return calculateWideSumDiff(op, lft, rgt, width, ctx, unsigned_overflow_flag)
+
+  # 1 variable wide addition/subtraction
+  assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
+
+  # Cannot overflow - result is guaranteed range [0, 256) for 8 bit
+  if is_nuw:
+    res_val = sb3.Op(op, lft, rgt)
+    if not unsigned_overflow_flag: return ValueAndBlocks(res_val)
+    # Cannot overflow, flag is always zero
+    return IdxbleValueAndBlocks(IdxbleValue([res_val, sb3.Known(0)]))
+
+  known, unknown, lft_is_known = (lft, rgt, True) if isinstance(lft, sb3.Known) else (rgt, lft, False)
+  has_known = isinstance(known, sb3.Known)
+
+  perf = ctx.cfg.opt_target.perf
+  val_reference_cost = opt.getValueCost(lft, perf) + opt.getValueCost(rgt, perf)
+  # res mod 2^N
+  mod_cost = perf.mod
+  # res +/- N(res </> N)
+  alt_cost = perf.add + perf.mul + perf.gt + perf.add * int(not has_known) + val_reference_cost
+  mod_is_faster = mod_cost < alt_cost
+  mod_base: int = 2 ** width
+
+  # Not compatible with nuw
+  # e.g. 1 + -128 -> 1 + 128 (twos comp) -> 129 (twos comp) => no mod step needed
+  #                  1 - 128 (twos comp) -> -127 (intemediate) -> 129 (mod 256) => mod step needed
+  if ctx.cfg.compiler_minify and has_known:
+    assert isinstance(known, sb3.Known)
+    known_val = int(known.known)
+
+    # a + b mod N = a + (b - N) mod N = a - (N - b) mod N
+    # a - b mod N = a - (b - N) mod N = a + (N - b) mod N
+    # b - a mod N = (b - N) - a mod N
+    # so if b is known N - b is smaller then use it and swap operation
+    # the 3rd equality is not available when mod_faster is False
+    # because the min value is lower (0 - N) - N = -2N < -N
+    alt_op = op
+    alt_known = known_val
+    if op == "add": # x + c
+      alt_op = "sub"
+      alt_known = mod_base - known_val
+
+    elif not lft_is_known: # x - c
+      alt_op = "add"
+      alt_known = mod_base - known_val
+
+    elif mod_is_faster is True: # c - x
+      alt_known -= mod_base
+
+    # Choose the value that takes up less space in project.json
+    if len(str(alt_known)) < len(str(known_val)):
+      known = sb3.Known(alt_known)
+      op = alt_op
+      if lft_is_known: lft = known
+      else:            rgt = known
+
+  unwrapped = sb3.Op(op, lft, rgt)
+
+  # TODO: use shouldCarry here, allow shouldCarry to accept a width. Also, shouldCarry will need to use a
+  # different width for the carry flag in, to do this, make sure to use last width for modulo
+
+  # The highest magnitude adjustment we can make is N, so we never need to adjust more than once, so we can
+  # replace mod with this if it is faster to do so
+  comp_op, k_comp_val, adjustment = (">", mod_base - 1, -mod_base) if op == "add" else ("<", 0, mod_base)
+  did_overflow = sb3.BoolOp(comp_op, unwrapped, sb3.Known(k_comp_val))
+
+  res_val: sb3.Value
+  if mod_is_faster:
+    res_val = sb3.Op("mod", unwrapped, sb3.Known(mod_base))
+  else:
+    res_val = sb3.Op("add", unwrapped, sb3.Op("mul", did_overflow, sb3.Known(adjustment)))
+
+  if not unsigned_overflow_flag: return ValueAndBlocks(res_val)
+  return IdxbleValueAndBlocks(IdxbleValue([res_val, did_overflow]))
 
 def sumValueParts(parts: list[sb3.Value], default: int | None=None) -> sb3.Value:
   if len(parts) == 0:
@@ -1947,111 +2060,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
           op = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
+          assert isinstance(instr.left.type, ir.IntegerTy)
 
-          if not isinstance(instr.left.type, ir.IntegerTy):
-            raise CompException(f"Instruction {instr} with opcode add/sub only supports "
-                                f"integers, got type {type(instr.left.type)}")
-
-          width = instr.left.type.width
-
-          if width > VARIABLE_MAX_BITS:
-            assert isinstance(lft, IdxbleValue) and isinstance(rgt, IdxbleValue)
-
-            sum = calculateSumDiff(op, lft, rgt, width, ctx)
-            blocks.add(sum.blocks)
-            blocks.add(res_var.setAllValues(sum.value))
-
-            res_val = False
-
-          else:
-            # 1 variable wide addition/subtraction
-            assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
-
-            if instr.is_nuw:
-              # Cannot overflow - result is guaranteed range [0, 256) for 8 bit
-              res_val = sb3.Op(op, lft, rgt)
-            else:
-              known, unknown, lft_is_known = (lft, rgt, True) if isinstance(lft, sb3.Known) else (rgt, lft, False)
-              has_known = isinstance(known, sb3.Known)
-
-              perf = ctx.cfg.opt_target.perf
-              val_reference_cost = opt.getValueCost(lft, perf) + opt.getValueCost(rgt, perf)
-              # res mod 2^N
-              mod_cost = perf.mod
-              # res +/- N(res </> N)
-              alt_cost = perf.add + perf.mul + perf.gt + perf.add * int(not has_known) + val_reference_cost
-              mod_is_faster = mod_cost < alt_cost
-              mod_base: int = 2 ** width
-
-              # Not compatible with nuw
-              # e.g. 1 + -128 -> 1 + 128 (twos comp) -> 129 (twos comp) => no mod step needed
-              #                  1 - 128 (twos comp) -> -127 (intemediate) -> 129 (mod 256) => mod step needed
-              if ctx.cfg.compiler_minify and has_known:
-                assert isinstance(known, sb3.Known)
-                known_val = int(known.known)
-
-                # a + b mod N = a + (b - N) mod N = a - (N - b) mod N
-                # a - b mod N = a - (b - N) mod N = a + (N - b) mod N
-                # b - a mod N = (b - N) - a mod N
-                # so if b is known N - b is smaller then use it and swap operation
-                # the 3rd equality is not available when mod_faster is False
-                # because the min value is lower (0 - N) - N = -2N < -N
-                alt_op = op
-                alt_known = known_val
-                if op == "add": # x + c
-                  alt_op = "sub"
-                  alt_known = mod_base - known_val
-
-                elif not lft_is_known: # x - c
-                  alt_op = "add"
-                  alt_known = mod_base - known_val
-
-                elif mod_is_faster is True: # c - x
-                  alt_known -= mod_base
-
-                # Choose the value that takes up less space in project.json
-                if len(str(alt_known)) < len(str(known_val)):
-                  known = sb3.Known(alt_known)
-                  op = alt_op
-                  if lft_is_known: lft = known
-                  else:            rgt = known
-
-              unwrapped = sb3.Op(op, lft, rgt)
-              if mod_is_faster:
-                res_val = sb3.Op("mod", unwrapped, sb3.Known(mod_base))
-              else:
-                # The highest magnitude adjustment we can make is N, so we never need to adjust more than once, so we can
-                # replace mod with this if it is faster to do so
-                comp_op, k_comp_val, adjustment = (">", mod_base - 1, -mod_base) if op == "add" else ("<", 0, mod_base)
-
-                if not has_known:
-                  if op == "add":
-                    lft_comp_val = unwrapped
-                    rgt_comp_val = sb3.Known(k_comp_val)
-                  else:
-                    # l - r < 0 -> l < r
-                    assert comp_op == "<"
-                    lft_comp_val = lft
-                    rgt_comp_val = rgt
-                else:
-                  assert isinstance(known, sb3.Known)
-                  known_val = int(known.known)
-                  if op == "add" or (op == "sub" and not lft_is_known):
-                    # x + c > N
-                    # x > N - c
-                    k_comp_val -= (-1) ** int(op == "sub") * known_val
-                  else:
-                    # c - x < N
-                    # -x < N - c
-                    # x > c - N
-                    assert comp_op == "<"
-                    k_comp_val = known_val - k_comp_val
-                    comp_op = ">"
-                  lft_comp_val = unknown
-                  rgt_comp_val = sb3.Known(k_comp_val)
-
-                res_val = sb3.Op("add", unwrapped,
-                  sb3.Op("mul", sb3.BoolOp(comp_op, lft_comp_val, rgt_comp_val), sb3.Known(adjustment)))
+          sum = calculateSumDiff(op, lft, rgt, instr.left.type.width, ctx, instr.is_nuw)
+          blocks.add(sum.blocks)
+          res_val = sum.value
 
         case ir.BinaryOpcode.Mul: # Multiply two values
           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
@@ -2376,10 +2389,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             sb3.Op("mul", rgt, cond))
 
         case _:
-          raise CompException(f"Unknown instruction opcode {instr} (type BinOp)")
+          raise CompException(f"Unknown binop instruction opcode {instr}")
 
-      if res_val is not False: # If the binop sets res_var itself
-        blocks.add(res_var.setValue(res_val))
+      if res_val is not False: # If the binop doesn't set res_var itself
+        blocks.add(res_var.setInferredValue(res_val))
 
     case ir.Conversion(): # Convert a value from one type to another
       value = transValue(instr.value, ctx, bctx)
@@ -2619,16 +2632,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         blocks.add(res_var.setValue(sb3.Op("add", false_val.value, offset)))
       else:
         true_blocks = true_val.blocks
+        true_blocks.add(res_var.setInferredValue(true_val.value))
+
         false_blocks = false_val.blocks
-        if isinstance(true_val, ValueAndBlocks):
-          assert isinstance(false_val, ValueAndBlocks)
-          true_blocks.add(res_var.setValue(true_val.value))
-          false_blocks.add(res_var.setValue(false_val.value))
-        else:
-          assert isinstance(true_val, IdxbleValueAndBlocks)
-          assert isinstance(false_val, IdxbleValueAndBlocks)
-          true_blocks.add(res_var.setAllValues(true_val.value))
-          false_blocks.add(res_var.setAllValues(false_val.value))
+        false_blocks.add(res_var.setInferredValue(false_val.value))
 
         blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), true_blocks, false_blocks))
 
@@ -3298,6 +3305,16 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
                 rgt,
                 pow2_shift_plus_offset_rgt
         )))))
+
+    case ir.Intrinsic.UAddWithOverflow | ir.Intrinsic.USubWithOverflow:
+      op = "add" if intrinsic == ir.Intrinsic.UAddWithOverflow else "sub"
+      lft, rgt = values
+      assert result is not None
+      ty = args[0].type
+      assert isinstance(ty, ir.IntegerTy)
+      sum, sum_blocks = flatAsTuple(calculateSumDiff(op, lft, rgt, ty.width, ctx, unsigned_overflow_flag=True))
+      blocks.add(sum_blocks)
+      blocks.add(result.setInferredValue(sum))
 
     case ir.Intrinsic.FMulAdd:
       a, b, c = values

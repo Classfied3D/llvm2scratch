@@ -387,9 +387,10 @@ class BlockList:
   blocks: list[Block]
   end: bool
 
-  def __init__(self, blocks: list[Block] | None=None, end: bool=False):
-    if blocks is None:
-      blocks = []
+  def __init__(self, blocks: Block | list[Block] | None=None, end: bool=False):
+    if blocks is None:            blocks = []
+    if isinstance(blocks, Block): blocks = [blocks]
+
     self.end = end
     for block in blocks:
       if self.end: raise ScratchCompException("List of blocks contains blocks after an ending block")
