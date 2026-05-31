@@ -3145,6 +3145,19 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       src_vararg_ptr = sb3.GetOfList("atindex", ctx.cfg.mem_var, src)
       blocks.add(sb3.EditList("replaceat", ctx.cfg.mem_var, dest, src_vararg_ptr))
 
+    case ir.Intrinsic.Abs:
+      val, _ = values
+      ty = args[0].type
+      assert isinstance(val, sb3.Value)
+      assert isinstance(ty, ir.IntegerTy)
+      assert result is not None
+
+      # Note: this method transfoms int_min into int_min as 128 * -1 mod 256 = -128 mod 256 = 128,
+      # so we can simply ignore the is_int_min_poison flag
+      is_pos = sb3.BoolOp("<", val, sb3.Known(2**(ty.width - 1)))
+      sign = sb3.Op("sub", sb3.Op("mul", is_pos, sb3.Known(2)), sb3.Known(1))
+      blocks.add(result.setValue(sb3.Op("mod", sb3.Op("mul", val, sign), sb3.Known(2**ty.width))))
+
     case ir.Intrinsic.UMin | ir.Intrinsic.UMax | ir.Intrinsic.SMin | ir.Intrinsic.SMax:
       match intrinsic:
         case ir.Intrinsic.UMin: mode = ir.ICmpCond.Ult
@@ -4423,11 +4436,11 @@ def addForeignFunctions(ctx: Context) -> Context:
     sb3.StopScript("stopall"),
   ]), ctx)
 
-  #ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
-  #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
-  #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
-  #ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
-  #ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
+  ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
+  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
+  ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
+  ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
+  ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
 
   # Increment the heap pointer by incr. Currently this does not check for out of memory
   ctx = addFunc("sbrk", ["incr"], sb3.BlockList([
@@ -4438,7 +4451,13 @@ def addForeignFunctions(ctx: Context) -> Context:
     # TODO check for out of memory, if so return -1 and set @errno
   ]), ctx)
 
-  #ctx = addFunc("write", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("write called"))]), ctx)
+  # TODO proper write implementation
+  ctx = addFunc("write", ["file", "buf", "len"], sb3.BlockList([
+    sb3.Ask(sb3.Known("write called")),
+    # Note that str2scratch doesn't handle the newline (hex 0A), instead converting it to "\0A".
+    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("buf"))]),
+    sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
+  ]), ctx)
 
   return ctx
 
