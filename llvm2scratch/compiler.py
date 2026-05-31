@@ -759,14 +759,14 @@ def bitShift(direction: Literal["left", "right"],
     if not can_shift_out: return unwrapped, ctx
     return sb3.Op("floor", unwrapped), ctx
 
-def multiplyNoWrap(width: int, left: sb3.Value, right: sb3.Value) -> sb3.Value:
+def multiplyNoWrap(left: sb3.Value, right: sb3.Value, width: int) -> sb3.Value:
   if width > VARIABLE_MAX_BITS:
-    raise CompException(f"Multipling {width} bits is not supported") # TODO FIX
+    raise CompException(f"Multipling {width} bits is not supported") # TODO
 
   return sb3.Op("mul", left, right) # Overflow is UB - we don't care if
-                                    # the number overflows and gets innacurate
+                                    # the number overflows and gets innaccurate
 
-def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) -> ValueAndBlocks:
+def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) -> ValueAndBlocks:
   # TODO OPTI: if one value is a known value, wrapping behaviour could be simpilifed and
   # known info could be propagated
   # TODO OPTI: if multipling by a power of 2, there is no risk that the mantissa cannot store
@@ -774,9 +774,9 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) ->
   if width > VARIABLE_MAX_BITS:
     raise CompException(f"Multipling {width} bits not supported")
 
-  if width <= 26: # Safe: (2**26) ** 2 < 9007199254740991
+  if width <= 26: # Safe: (2**26) ** 2 < 2**53
     return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
-  elif width <= 50: # Safe (with extra mod step): 2**25 * 2**25 + 2**25 * 2**25 < 9007199254740991
+  elif width <= 50: # Safe (with extra mod step): 2**25 * 2**25 + 2**25 * 2**25 < 2**53
     blocks = sb3.BlockList()
     left, lblocks = flatAsTuple(optimizeValueUse(left, 3, ctx))
     right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
@@ -804,8 +804,8 @@ def multiplyWrap(width: int, left: sb3.Value, right: sb3.Value, ctx: Context) ->
       ),
     )
 
-    # 34 bits or less: no mod step needed: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 9007199254740991
-    # 50 bits or less: mod step is safe:   2**25 * 2**25 + 2**25 * 2**25 < 9007199254740991
+    # 34 bits or less: no mod step needed: (2**17 * 2**17 + 2**17 * 2**17) * 2**17 + (2**17 + 2**17) < 2**53
+    # 50 bits or less: mod step is safe:   2**25 * 2**25 + 2**25 * 2**25 < 2**53
     extra_mod_step = width > 34
     if extra_mod_step:
       a0b1_plus_b0a1 = sb3.Op("mod", a0b1_plus_b0a1, sb3.Known(2 ** math.ceil(width / 2)))
@@ -2073,10 +2073,10 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers, got type {type(instr.left.type)}")
           width = instr.left.type.width
 
-          if instr.is_nsw and instr.is_nuw and ctx.cfg.compiler_opt:
-            res_val = multiplyNoWrap(width, lft, rgt)
+          if instr.is_nsw and instr.is_nuw:
+            res_val = multiplyNoWrap(lft, rgt, width)
           else:
-            blocks_and_value = multiplyWrap(width, lft, rgt, ctx)
+            blocks_and_value = multiplyWrap(lft, rgt, width, ctx)
             blocks.add(blocks_and_value.blocks)
             res_val = blocks_and_value.value
 
@@ -3309,12 +3309,23 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
     case ir.Intrinsic.UAddWithOverflow | ir.Intrinsic.USubWithOverflow:
       op = "add" if intrinsic == ir.Intrinsic.UAddWithOverflow else "sub"
       lft, rgt = values
-      assert result is not None
       ty = args[0].type
       assert isinstance(ty, ir.IntegerTy)
+      assert result is not None
       sum, sum_blocks = flatAsTuple(calculateSumDiff(op, lft, rgt, ty.width, ctx, unsigned_overflow_flag=True))
       blocks.add(sum_blocks)
       blocks.add(result.setInferredValue(sum))
+
+    case ir.Intrinsic.UMulWithOverflow:
+      lft, rgt = values
+      ty = args[0].type
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
+      assert isinstance(ty, ir.IntegerTy)
+      assert result is not None
+      mul_val, mul_blocks = flatAsTuple(multiplyWrap(lft, rgt, ty.width, ctx))
+      did_overflow = sb3.Op("bool_to_float", sb3.BoolOp(">", sb3.Op("mul", lft, rgt), sb3.Known(2**ty.width - 1)))
+      blocks.add(mul_blocks)
+      blocks.add(result.setAllValues(IdxbleValue([mul_val, did_overflow])))
 
     case ir.Intrinsic.FMulAdd:
       a, b, c = values
