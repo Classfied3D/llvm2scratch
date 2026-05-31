@@ -3299,6 +3299,13 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
                 pow2_shift_plus_offset_rgt
         )))))
 
+    case ir.Intrinsic.FMulAdd:
+      a, b, c = values
+      assert isinstance(a, sb3.Value) and isinstance(b, sb3.Value) and isinstance(c, sb3.Value)
+      assert all(isinstance(args[i].type, ir.FloatTy) for i in range(3))
+      assert result is not None
+      blocks.add(result.setValue(sb3.Op("add", sb3.Op("mul", a, b), c)))
+
     case ir.Intrinsic.PtrMask:
       ptr, mask = values
       assert isinstance(ptr, sb3.Value) and isinstance(mask, sb3.Value)

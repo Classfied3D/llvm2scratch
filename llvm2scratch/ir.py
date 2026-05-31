@@ -91,6 +91,7 @@ class Intrinsic(Enum):
   FAbs = "llvm.fabs"
   FShl = "llvm.fshl"
   FShr = "llvm.fshr"
+  FMulAdd = "llvm.fmuladd"
   LifetimeStart = "llvm.lifetime.start"
   LifetimeEnd = "llvm.lifetime.end"
   NoAliasScopeDecl = "llvm.experimental.noalias.scope.decl"
