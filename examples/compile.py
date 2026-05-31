@@ -22,7 +22,7 @@ def main():
                  cwd=os.path.join(script_dir, "input"))
 
   with open(OUTPUT_IR, "r") as file:
-    proj, _ = l2s.compile(file.read(), l2s.Config(compiler_opt=True, gen_lut_runtime=True))
+    proj = l2s.compile(file.read(), l2s.Config(compiler_opt=True, gen_lut_runtime=True))
 
   with open(OUTPUT_SCRATCHBLOCKS, "w") as file:
     file.write(proj.stringify(scratchblocks=True))

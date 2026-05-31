@@ -241,7 +241,7 @@ def main():
   )
 
   with open(args.input, "r") as file:
-    proj, _ = compiler.compile(file.read(), cfg)
+    proj = compiler.compile(file.read(), cfg)
 
   if args.debug_scratch_text is not None:
     with open(args.debug_scratch_text, "w") as file:

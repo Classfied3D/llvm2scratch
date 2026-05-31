@@ -58,7 +58,6 @@ class Config:
   gen_lut_runtime: bool = False # If AND/OR/XOR lookup tables should be generated at runtime. This reduces resultant file size
                                 # significantly at the cost of ~0.4s of time on first start spent generating them
   scratch_config: sb3.ScratchConfig = field(default_factory=sb3.ScratchConfig) # Config options for the scratch serializer
-  do_debug_branch_log: bool = False # If the times a function recurses should be logged
   # Any functions which might call a non-existent fn ptr in an unreachable branch.
   # This defaults to a few clib funcs with this property to avoid warnings
   no_warn_missing_fn_sig: set[str] = field(default_factory=lambda: {"exit", "__call_exitprocs"})
@@ -110,8 +109,6 @@ class Context:
   needs_and_lut: bool = False
   needs_or_lut: bool = False
   needs_xor_lut: bool = False
-  # Info about a scratch project which can be used in future compilations for optimization
-  debug_info: DebugInfo = field(default_factory=DebugInfo)
 
 @dataclass
 class FuncPtrSigInfo:
@@ -184,12 +181,6 @@ class BlockVarUse:
   depends_var_sizes: dict[str, int] = field(default_factory=dict)
 
 @dataclass
-class ValueAndBlocks:
-  """A value and any blocks that come before it needed to get that value"""
-  value: sb3.Value
-  blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
-
-@dataclass
 class IdxbleValue:
   """A collection of values that can be indexed over (e.g. a string)"""
   vals: list[sb3.Value] = field(default_factory=list)
@@ -197,12 +188,6 @@ class IdxbleValue:
   def stringify(self, sb: bool=False):
     """Convert to readable text. If "sb" is True then output text compatible with scratchblocks"""
     return str([v.stringify(sb) for v in self.vals])
-
-@dataclass
-class IdxbleValueAndBlocks:
-  """An indexable value and any blocks that come before it needed to get that value"""
-  value: IdxbleValue = field(default_factory=IdxbleValue)
-  blocks: sb3.BlockList = field(default_factory=sb3.BlockList)
 
 @dataclass
 class Variable:
@@ -269,13 +254,7 @@ class CompWarning(Warning):
   """Warning in the compiler"""
   pass
 
-def flatAsTuple(obj):
-  """Same as dataclasses.astuple but not recursively with dataclasses in dataclasses"""
-  if not is_dataclass(obj):
-    raise TypeError("Expected dataclass instance")
-  return tuple(getattr(obj, f.name) for f in fields(obj))
-
-def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
+def getSizeOf(ty: ir.Type, include_padding: bool=False) -> int:
   """
   Gets the size in bytes of a type. If include_padding is False, then this will return the amount of
   variables needed to store the type. If it is True, then it will return the size in memory it will take
@@ -302,10 +281,10 @@ def getByteSize(ty: ir.Type, include_padding: bool=False) -> int:
       raise CompException(f"Unknown floating point type: {ty}")
 
     case ir.ArrayTy():
-      return ty.size * getByteSize(ty.inner, include_padding)
+      return ty.size * getSizeOf(ty.inner, include_padding)
 
     case ir.StructTy():
-      return sum(getByteSize(mem, include_padding) for mem in ty.members)
+      return sum(getSizeOf(mem, include_padding) for mem in ty.members)
 
     case ir.PointerTy():
       return 1 if not include_padding else math.ceil(PTR_WIDTH_BITS / 8)
@@ -326,7 +305,7 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
         inner_type = inner_type.inner
 
       # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
-      offset_size = getByteSize(inner_type, include_padding=ctx.cfg.accurate_byte_spacing)
+      offset_size = getSizeOf(inner_type, include_padding=ctx.cfg.accurate_byte_spacing)
       if isinstance(index_val, sb3.Known):
         assert isinstance(index_val.known, (int, float)) and index_val.known.is_integer()
         # Account for negative indices
@@ -345,7 +324,7 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
       member_offset = int(index_val.known)
       for member in members[:member_offset]:
         # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
-        known_offset += getByteSize(member, include_padding=ctx.cfg.accurate_byte_spacing)
+        known_offset += getSizeOf(member, include_padding=ctx.cfg.accurate_byte_spacing)
 
       inner_type = inner_type.members[member_offset]
 
@@ -450,27 +429,26 @@ def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tu
 
   return final_val
 
-def padValue(val: ValueAndBlocks | IdxbleValueAndBlocks, size: int) -> ValueAndBlocks | IdxbleValueAndBlocks:
+def padValue(val: sb3.Value | IdxbleValue, size: int) -> sb3.Value | IdxbleValue:
   """
   Apply padding to a Value/IdxbleValue + Blocks so that it matches "size"
   """
-  originally_idxable = isinstance(val, IdxbleValueAndBlocks)
-  blocks = val.blocks
-  values = val.value.vals if isinstance(val, IdxbleValueAndBlocks) else [val.value]
+  originally_idxable = isinstance(val, IdxbleValue)
+  values = val.vals if originally_idxable else [val]
   padding_len = size - len(values)
   assert padding_len >= 0
   values.extend(sb3.Known(0) for _ in range(padding_len))
   assert len(values) == size
 
   if originally_idxable or size > 1:
-    return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
+    return IdxbleValue(values)
   else:
-    return ValueAndBlocks(values[0], blocks)
+    return values[0]
 
 def transValue(val: ir.Value,
                ctx: Context, bctx: BlockInfo | None,
                is_global_init: bool=False,
-               include_padding: bool=False) -> ValueAndBlocks | IdxbleValueAndBlocks:
+               include_padding: bool=False) -> sb3.Value | IdxbleValue:
 
   """
   Convert an IR value into a scratch value + blocks used to generate it. If is_global_init is
@@ -494,11 +472,11 @@ def transValue(val: ir.Value,
         # when optimizations are enabled we use this address directly
         res = sb3.Known(ctx.globvar_to_ptr[val.name])
 
-      size = getByteSize(val.type, include_padding)
+      size = getSizeOf(val.type, include_padding)
       if isinstance(val, (ir.LocalVarVal, ir.ArgumentVal)) and size > 1:
-        return IdxbleValueAndBlocks(var.getAllValues(size))
+        return var.getAllValues(size)
 
-      return padValue(ValueAndBlocks(res), size)
+      return padValue(res, size)
 
     case ir.KnownIntVal():
       # Calculate the two's complement version of the number
@@ -508,7 +486,7 @@ def transValue(val: ir.Value,
                       # but now the parser should handle it
 
       if val.width <= VARIABLE_MAX_BITS:
-        res = ValueAndBlocks(sb3.Known(num))
+        res = sb3.Known(num)
       else:
         # Little endian ordering of values
         values: list[sb3.Value] = []
@@ -516,40 +494,36 @@ def transValue(val: ir.Value,
           values.append(sb3.Known(num % (2 ** VARIABLE_MAX_BITS)))
           num = num // (2 ** VARIABLE_MAX_BITS)
           width -= VARIABLE_MAX_BITS
-        res = IdxbleValueAndBlocks(IdxbleValue(values))
+        res = IdxbleValue(values)
 
-      return padValue(res, getByteSize(val.type, include_padding))
+      return padValue(res, getSizeOf(val.type, include_padding))
 
     case ir.KnownFloatVal():
       return padValue(
-        ValueAndBlocks(sb3.Known(val.value)),
-        getByteSize(val.type, include_padding))
+        sb3.Known(val.value),
+        getSizeOf(val.type, include_padding))
 
     case ir.KnownArrVal() | ir.KnownStructVal():
       values: list[sb3.Value] = []
-      blocks = sb3.BlockList()
       for element in val.values:
-        el_val, el_blocks = flatAsTuple(transValue(element, ctx, bctx, is_global_init, include_padding))
+        el_val = transValue(element, ctx, bctx, is_global_init, include_padding)
         if isinstance(el_val, sb3.Value):
           values.append(el_val)
         else:
           values.extend(el_val.vals)
-        blocks.add(el_blocks)
 
       # Arrays/Structs don't need padding
-      return IdxbleValueAndBlocks(IdxbleValue(values), blocks)
+      return IdxbleValue(values)
 
     case ir.NullPtrVal():
       # Since pointers start from one anyway (because lists start from one in scratch), zero can be used for null
-      return padValue(
-        ValueAndBlocks(sb3.Known(0)),
-        getByteSize(val.type, include_padding))
+      return padValue(sb3.Known(0), getSizeOf(val.type, include_padding))
 
     case ir.FunctionVal():
       # Return a pointer corresponding to an id given to each func ptr reference
       return padValue(
-        ValueAndBlocks(sb3.Known(getFuncPtrAddr(val.name, ctx))),
-        getByteSize(val.type, include_padding))
+        sb3.Known(getFuncPtrAddr(val.name, ctx)),
+        getSizeOf(val.type, include_padding))
 
     case ir.ConstExprVal():
       expr = val.expr
@@ -569,8 +543,8 @@ def transValue(val: ir.Value,
 
           # Pointer needs padding applied
           return padValue(
-            ValueAndBlocks(sb3.Known(base_ptr + known_offset)),
-            getByteSize(val.type, include_padding))
+            sb3.Known(base_ptr + known_offset),
+            getSizeOf(val.type, include_padding))
 
         case ir.Conversion():
           match expr.opcode:
@@ -662,16 +636,16 @@ def shouldOptimiseValueUse(val: sb3.Value, times_used: float, ctx: Context) -> b
   """Returns if a value that is used multiple times should be stored"""
   return not opt.shouldElide(val, times_used, ctx.cfg.opt_target.perf)
 
-def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> ValueAndBlocks:
+def optimizeValueUse(val: sb3.Value, times_used: float, ctx: Context) -> tuple[sb3.Value, sb3.BlockList]:
   if shouldOptimiseValueUse(val, times_used, ctx):
     tmp = genTempVar(ctx)
-    return ValueAndBlocks(sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)]))
-  return ValueAndBlocks(val)
+    return sb3.GetVar(tmp), sb3.BlockList([sb3.EditVar("set", tmp, val)])
+  return val, sb3.BlockList()
 
 def chooseFastestValue(vals: list[sb3.Value], ctx: Context) -> sb3.Value:
   return min(vals, key=lambda val: opt.getValueCost(val, ctx.cfg.opt_target.perf))
 
-def scratchRuntimeError(message: str) -> sb3.BlockList:
+def transRuntimeError(message: str) -> sb3.BlockList:
   # TODO: this would be logged to stdout
   return sb3.BlockList([
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetAnswer(), sb3.Known("ignore")), sb3.BlockList([
@@ -766,7 +740,7 @@ def multiplyNoWrap(left: sb3.Value, right: sb3.Value, width: int) -> sb3.Value:
   return sb3.Op("mul", left, right) # Overflow is UB - we don't care if
                                     # the number overflows and gets innaccurate
 
-def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) -> ValueAndBlocks:
+def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) -> tuple[sb3.Value, sb3.BlockList]:
   # TODO OPTI: if one value is a known value, wrapping behaviour could be simpilifed and
   # known info could be propagated
   # TODO OPTI: if multipling by a power of 2, there is no risk that the mantissa cannot store
@@ -775,11 +749,11 @@ def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) ->
     raise CompException(f"Multipling {width} bits not supported")
 
   if width <= 26: # Safe: (2**26) ** 2 < 2**53
-    return ValueAndBlocks(sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)))
+    return sb3.Op("mod", sb3.Op("mul", left, right), sb3.Known(2 ** width)), sb3.BlockList()
   elif width <= 50: # Safe (with extra mod step): 2**25 * 2**25 + 2**25 * 2**25 < 2**53
     blocks = sb3.BlockList()
-    left, lblocks = flatAsTuple(optimizeValueUse(left, 3, ctx))
-    right, rblocks = flatAsTuple(optimizeValueUse(right, 3, ctx))
+    left, lblocks = optimizeValueUse(left, 3, ctx)
+    right, rblocks = optimizeValueUse(right, 3, ctx)
     blocks.add(lblocks)
     blocks.add(rblocks)
 
@@ -788,8 +762,8 @@ def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) ->
     a0 = sb3.Op("mod", left, sb3.Known(2 ** half_width))
     b0 = sb3.Op("mod", right, sb3.Known(2 ** half_width))
 
-    a0, a0blocks = flatAsTuple(optimizeValueUse(a0, 2, ctx))
-    b0, b0blocks = flatAsTuple(optimizeValueUse(b0, 2, ctx))
+    a0, a0blocks = optimizeValueUse(a0, 2, ctx)
+    b0, b0blocks = optimizeValueUse(b0, 2, ctx)
     blocks.add(a0blocks)
     blocks.add(b0blocks)
 
@@ -818,7 +792,7 @@ def multiplyWrap(left: sb3.Value, right: sb3.Value, width: int, ctx: Context) ->
         sb3.Op("mul", a0, b0)
       ),
       sb3.Known(2 ** width))
-    return ValueAndBlocks(value, blocks)
+    return value, blocks
   else:
     raise CompException(f"Multipling {width} bits is not supported")
 
@@ -879,7 +853,7 @@ def paritialSumDiff(op: Literal["add", "sub"], lft: sb3.Value, rgt: sb3.Value, p
 def calculateWideSumDiff(
     op: Literal["add", "sub"], lft: IdxbleValue, rgt: IdxbleValue,
     width: int, ctx: Context, unsigned_overflow_flag: bool=False
-  ) -> IdxbleValueAndBlocks:
+  ) -> tuple[IdxbleValue, sb3.BlockList]:
   """
   Calcuates the result of adding/subtracting two values with integer overflow
   unsigned_overflow_flag - return an extra value for if the operation had unsigned overflow
@@ -888,7 +862,7 @@ def calculateWideSumDiff(
   assert steps == len(rgt.vals)
   assert steps == math.ceil(width / VARIABLE_MAX_BITS)
   if steps == 0:
-    return IdxbleValueAndBlocks(IdxbleValue([sb3.Known(0)]*unsigned_overflow_flag))
+    return IdxbleValue([sb3.Known(0)]*unsigned_overflow_flag), sb3.BlockList()
 
   if unsigned_overflow_flag: steps += 1
 
@@ -966,12 +940,12 @@ def calculateWideSumDiff(
         best_blocks = blocks
         best_sum_nodes = sum_nodes
 
-  return IdxbleValueAndBlocks(IdxbleValue(best_sum_nodes), best_blocks)
+  return IdxbleValue(best_sum_nodes), best_blocks
 
 def calculateSumDiff(
     op: Literal["add", "sub"], lft: sb3.Value | IdxbleValue, rgt: sb3.Value | IdxbleValue,
     width: int, ctx: Context, is_nuw: bool=False, unsigned_overflow_flag: bool=False
-  ) -> ValueAndBlocks | IdxbleValueAndBlocks:
+  ) -> tuple[sb3.Value | IdxbleValue, sb3.BlockList]:
   """
   Calculate the result of adding of subtracting two values with integer overflow.
   unsigned_overflow_flag - If true then return an extra value for if the operation
@@ -988,9 +962,9 @@ def calculateSumDiff(
   # Cannot overflow - result is guaranteed range [0, 256) for 8 bit
   if is_nuw:
     res_val = sb3.Op(op, lft, rgt)
-    if not unsigned_overflow_flag: return ValueAndBlocks(res_val)
+    if not unsigned_overflow_flag: return res_val, sb3.BlockList()
     # Cannot overflow, flag is always zero
-    return IdxbleValueAndBlocks(IdxbleValue([res_val, sb3.Known(0)]))
+    return IdxbleValue([res_val, sb3.Known(0)]), sb3.BlockList()
 
   known, unknown, lft_is_known = (lft, rgt, True) if isinstance(lft, sb3.Known) else (rgt, lft, False)
   has_known = isinstance(known, sb3.Known)
@@ -1053,8 +1027,9 @@ def calculateSumDiff(
   else:
     res_val = sb3.Op("add", unwrapped, sb3.Op("mul", did_overflow, sb3.Known(adjustment)))
 
-  if not unsigned_overflow_flag: return ValueAndBlocks(res_val)
-  return IdxbleValueAndBlocks(IdxbleValue([res_val, did_overflow]))
+  if not unsigned_overflow_flag:
+    return res_val, sb3.BlockList()
+  return IdxbleValue([res_val, did_overflow]), sb3.BlockList()
 
 def sumValueParts(parts: list[sb3.Value], default: int | None=None) -> sb3.Value:
   if len(parts) == 0:
@@ -1518,7 +1493,7 @@ def transLoad(result: Variable, address: sb3.Value, loaded_type: ir.Type, ctx: C
 
   # Don't include padding - we don't care about loading padded bytes, they only exist to offset pointers,
   # not variables
-  var_size = getByteSize(loaded_type, include_padding=False)
+  var_size = getSizeOf(loaded_type, include_padding=False)
 
   if var_size == 1:
     blocks.add(result.setValue(sb3.GetOfList("atindex", ctx.cfg.mem_var, address)))
@@ -1578,12 +1553,12 @@ def assignParameters(params: list[Variable], param_sizes: list[int], next_var_us
   return blocks
 
 def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx: BlockInfo) -> sb3.BlockList:
-  end_assignments: list[tuple[Variable, ValueAndBlocks | IdxbleValueAndBlocks]] = []
+  end_assignments: list[tuple[Variable, sb3.Value | IdxbleValue]] = []
   to_resolve: dict[str, str] = {}
   set_by: dict[str, str] = {}
   resolved: list[tuple[str, str]] = []
   var_lookup: dict[str, Variable] = {}
-  val_lookup: dict[str, ValueAndBlocks | IdxbleValueAndBlocks] = {}
+  val_lookup: dict[str, sb3.Value | IdxbleValue] = {}
 
   for res_var, ir_val in phi_info:
     # Undef values do not need to be assigned
@@ -1637,10 +1612,10 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
         temp_name = genTempVar(ctx)
         temp_var = Variable(temp_name, "special_var", None)
         var_lookup[temp_name] = temp_var
-        if isinstance(to_make_temp_val, ValueAndBlocks):
-          temp_val = ValueAndBlocks(temp_var.getValue())
+        if isinstance(to_make_temp_val, sb3.Value):
+          temp_val = temp_var.getValue()
         else:
-          temp_val = IdxbleValueAndBlocks(temp_var.getAllValues(len(to_make_temp_val.value.vals)))
+          temp_val = temp_var.getAllValues(len(to_make_temp_val.vals))
         val_lookup[temp_name] = temp_val
 
         resolved.append((temp_name, to_make_temp))
@@ -1653,18 +1628,14 @@ def assignPhiNodes(phi_info: list[tuple[Variable, ir.Value]], ctx: Context, bctx
         if to_make_temp == deps:
           to_resolve[var] = temp_name
 
-  assignments: list[tuple[Variable, ValueAndBlocks | IdxbleValueAndBlocks]] = []
+  assignments: list[tuple[Variable, sb3.Value | IdxbleValue]] = []
   for var_name, val_name in resolved:
     assignments.append((var_lookup[var_name], val_lookup[val_name]))
   assignments.extend(end_assignments)
 
   blocks = sb3.BlockList()
   for res_var, val in assignments:
-    blocks.add(val.blocks)
-    if isinstance(val, ValueAndBlocks):
-      blocks.add(res_var.setValue(val.value))
-    else:
-      blocks.add(res_var.setAllValues(val.value))
+    blocks.add(res_var.setInferredValue(val))
 
   return blocks
 
@@ -1677,11 +1648,10 @@ def getCallArguments(
   blocks = sb3.BlockList()
   for arg in args:
     value = transValue(arg, ctx, bctx)
-    blocks.add(value.blocks)
-    if not isinstance(value, IdxbleValueAndBlocks):
-      arguments.append(value.value)
+    if not isinstance(value, IdxbleValue):
+      arguments.append(value)
     else:
-      for val in value.value.vals: arguments.append(val)
+      for val in value.vals: arguments.append(val)
 
   if vararg_ptr is not None: arguments.append(vararg_ptr)
   if ret_addr is not None:   arguments.append(sb3.Known(ret_addr))
@@ -1692,14 +1662,6 @@ def getUncheckedProcedureStart(proc_name: str, params: list[Variable], param_siz
                                ctx: Context, is_counted: bool=False) -> tuple[sb3.BlockList, Context]:
   assert len(params) == len(param_sizes)
   blocks = sb3.BlockList([sb3.ProcedureDef(proc_name, localizeSizedParameters(params, param_sizes))])
-
-  if ctx.cfg.do_debug_branch_log:
-    # Increment the branch counter in the log
-    index = sb3.Known((fn.fn_id * 2) + 2)
-    blocks.add(sb3.BlockList([
-      sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add",
-        sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
-    ))]))
 
   if is_counted:
     blocks.add(sb3.EditCounter("incr")) # The 'hacked' counter blocks are 20x faster than incrementing
@@ -1782,7 +1744,7 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
   vararg_ptr = None
   if callee.is_variadic:
     # Allocate vararg memory
-    total_alloc_size = sum(getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing) for arg in varargs)
+    total_alloc_size = sum(getSizeOf(arg.type, include_padding=ctx.cfg.accurate_byte_spacing) for arg in varargs)
     if total_alloc_size != 0:
       vararg_ptr = sb3.GetVar(ctx.cfg.stack_pointer_var)
       bctx.code.add(sb3.EditVar("change", ctx.cfg.stack_pointer_var, sb3.Known(-total_alloc_size)))
@@ -1792,10 +1754,9 @@ def transComplexCall(caller: FuncInfo, callee: FuncInfo | FuncPtrSigInfo,
     # Store varargs
     offset = 0
     for arg in varargs:
-      arg_val, arg_blocks = flatAsTuple(transValue(arg, ctx, bctx))
-      bctx.code.add(arg_blocks)
+      arg_val = transValue(arg, ctx, bctx)
       bctx.code.add(transStore(arg_val, sb3.Op("add", vararg_ptr, sb3.Known(offset)), arg.type, ctx))
-      offset += getByteSize(arg.type, include_padding=ctx.cfg.accurate_byte_spacing)
+      offset += getSizeOf(arg.type, include_padding=ctx.cfg.accurate_byte_spacing)
   else:
     assert len(varargs) == 0
 
@@ -1967,8 +1928,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
     # Unary Operations
     case ir.UnaryOp(): # Do a calculation with one value
       operand = transValue(instr.operand, ctx, bctx)
-      blocks.add(operand.blocks)
-      operand = operand.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -1984,12 +1943,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
     # Binary Operations
     case ir.BinaryOp(): # Do a calculation with two values
       lft = transValue(instr.left, ctx, bctx)
-      blocks.add(lft.blocks)
-      lft = lft.value
-
       rgt = transValue(instr.right, ctx, bctx)
-      blocks.add(rgt.blocks)
-      rgt = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2008,9 +1962,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           op = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
           assert isinstance(instr.left.type, ir.IntegerTy)
 
-          sum = calculateSumDiff(op, lft, rgt, instr.left.type.width, ctx, instr.is_nuw)
-          blocks.add(sum.blocks)
-          res_val = sum.value
+          res_val, sum_blocks = calculateSumDiff(op, lft, rgt, instr.left.type.width, ctx, instr.is_nuw)
+          blocks.add(sum_blocks)
 
         case ir.BinaryOpcode.Mul: # Multiply two values
           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
@@ -2022,9 +1975,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           if instr.is_nsw and instr.is_nuw:
             res_val = multiplyNoWrap(lft, rgt, width)
           else:
-            blocks_and_value = multiplyWrap(lft, rgt, width, ctx)
-            blocks.add(blocks_and_value.blocks)
-            res_val = blocks_and_value.value
+            res_val, mul_blocks = multiplyWrap(lft, rgt, width, ctx)
+            blocks.add(mul_blocks)
 
         case ir.BinaryOpcode.UDiv: # Divide one value by another (unsigned)
           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
@@ -2062,8 +2014,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
             res_val = twosComplement(sb3.Op("div", signed_lft, signed_rgt), width)
           else:
-            lft, lblocks = flatAsTuple(optimizeValueUse(lft, 2, ctx))
-            rgt, rblocks = flatAsTuple(optimizeValueUse(rgt, 2, ctx))
+            lft, lblocks = optimizeValueUse(lft, 2, ctx)
+            rgt, rblocks = optimizeValueUse(rgt, 2, ctx)
             blocks.add(lblocks)
             blocks.add(rblocks)
 
@@ -2136,11 +2088,9 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           # TODO: Reuse if statement to work out if a / b > 0
-          left, lblocks = flatAsTuple(optimizeValueUse(lft, 2, ctx))
+          lft, lblocks = optimizeValueUse(lft, 2, ctx)
+          rgt, rblocks = optimizeValueUse(rgt, 3, ctx)
           right_is_temp = shouldOptimiseValueUse(rgt, 3, ctx)
-          right, rblocks = flatAsTuple(optimizeValueUse(rgt, 3, ctx))
-          if right_is_temp:
-            assert isinstance(right, sb3.GetVar)
           blocks.add(lblocks)
           blocks.add(rblocks)
 
@@ -2149,53 +2099,54 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
           if not right_is_temp:
             # Undo Two's Complement
-            right_sub_change = sb3.Op("sub", right, sb3.Known(change))
+            right_sub_change = sb3.Op("sub", rgt, sb3.Known(change))
 
-            right_sub_change, pos_neg_block = flatAsTuple(optimizeValueUse(right, 2, ctx))
+            right_sub_change, pos_neg_block = optimizeValueUse(rgt, 2, ctx)
             pos_neg_block.add(sb3.BlockList([
               # If left is pos and right is neg - remainder = (l mod r) - r
               res_var.setValue(sb3.Op("sub",
                                       sb3.Op("mod",
-                                        left,
+                                        lft,
                                         right_sub_change),
                                       right_sub_change))]))
           else:
             # Re-use the generated temp var
+            assert isinstance(rgt, sb3.GetVar)
             pos_neg_block = sb3.BlockList([
-              sb3.EditVar("change", right.var_name, sb3.Known(-change)),
+              sb3.EditVar("change", rgt.var_name, sb3.Known(-change)),
               res_var.setValue(sb3.Op("sub",
                                       sb3.Op("mod",
-                                        left,
-                                        right),
-                                      right))])
+                                        lft,
+                                        rgt),
+                                      rgt))])
 
           # Undo two's complement, calculate modulo, then adjust for differences with llvm's remainder operation
           # (different when one side is negative)
           blocks.add([
-            sb3.ControlFlow("if_else", sb3.BoolOp("<", left, sb3.Known(point_of_neg)), sb3.BlockList([
-              sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+            sb3.ControlFlow("if_else", sb3.BoolOp("<", lft, sb3.Known(point_of_neg)), sb3.BlockList([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", rgt, sb3.Known(point_of_neg)), sb3.BlockList([
                   # Modulus and remainder operations do the same
-                  res_var.setValue(sb3.Op("mod", left, right)),
+                  res_var.setValue(sb3.Op("mod", lft, rgt)),
                 ]),
                 # If left is pos and right is neg - remainder = (l mod r) - r
                 pos_neg_block
               )
             ]), sb3.BlockList([
-              sb3.ControlFlow("if_else", sb3.BoolOp("<", right, sb3.Known(point_of_neg)), sb3.BlockList([
+              sb3.ControlFlow("if_else", sb3.BoolOp("<", rgt, sb3.Known(point_of_neg)), sb3.BlockList([
                 # If left is neg and right is pos - remainder = (l mod r) - r
                 res_var.setValue(sb3.Op("add",
                                        sb3.Op("sub",
                                          sb3.Op("mod",
-                                           sb3.Op("sub", left, sb3.Known(change)),
-                                           right),
-                                         right),
+                                           sb3.Op("sub", lft, sb3.Known(change)),
+                                           rgt),
+                                         rgt),
                                        sb3.Known(change))),
               ]), sb3.BlockList([
                 # If left + right are neg
                res_var.setValue(sb3.Op("add",
                                        sb3.Op("mod",
-                                         sb3.Op("sub", left, sb3.Known(change)),
-                                         sb3.Op("sub", right, sb3.Known(change))),
+                                         sb3.Op("sub", lft, sb3.Known(change)),
+                                         sb3.Op("sub", rgt, sb3.Known(change))),
                                        sb3.Known(change))),
               ]))
             ]))
@@ -2351,7 +2302,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       blocks = sb3.BlockList()
       # Include padding in allocation space to prevent bytes being overriden (i.e. with memcpy)
-      size = getByteSize(instr.allocated_type, include_padding=ctx.cfg.accurate_byte_spacing)
+      size = getSizeOf(instr.allocated_type, include_padding=ctx.cfg.accurate_byte_spacing)
 
       assert bctx.label is not None
       if bctx.fn.skip_stack_size_change:
@@ -2373,25 +2324,20 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
     case ir.Load(): # Load a value from an address on the stack
       address = transValue(instr.address, ctx, bctx)
-      blocks.add(address.blocks)
 
       var = transVar(instr.result, bctx)
+      assert var.var_type != "param"
 
-      if isinstance(address, IdxbleValueAndBlocks):
+      if isinstance(address, IdxbleValue):
         raise CompException(f"Address to load cannot be an indexable value in {instr}")
 
-      blocks.add(transLoad(var, address.value, instr.loaded_type, ctx))
+      blocks.add(transLoad(var, address, instr.loaded_type, ctx))
 
     case ir.Store(): # Copy a value to an address on the stack
-      address = transValue(instr.address, ctx, bctx)
-      blocks.add(address.blocks)
-      address = address.value
-
       # TODO: technically the store should still happen if volatile
       if not isinstance(instr.value, ir.UndefVal):
+        address = transValue(instr.address, ctx, bctx)
         value = transValue(instr.value, ctx, bctx)
-        blocks.add(value.blocks)
-        value = value.value
 
         if isinstance(address, IdxbleValue):
           raise CompException(f"Address to store cannot be an indexable value in {instr}")
@@ -2400,20 +2346,18 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
     case ir.GetElementPtr(): # Offset a pointer to get an address in an array/struct
       base_ptr = transValue(instr.base_ptr, ctx, bctx)
-      assert isinstance(base_ptr, ValueAndBlocks)
-      blocks.add(base_ptr.blocks)
+      assert isinstance(base_ptr, sb3.Value)
 
       indices: list[tuple[sb3.Value, int]] = []
       for index_val in instr.indices:
         assert isinstance(index_val.type, ir.IntegerTy)
         index = transValue(index_val, ctx, bctx)
-        assert isinstance(index, ValueAndBlocks)
-        blocks.add(index.blocks)
-        indices.append((index.value, index_val.type.width))
+        assert isinstance(index, sb3.Value)
+        indices.append((index, index_val.type.width))
 
       known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
 
-      offset_ptr = applyGepOffsets(base_ptr.value, known_offset, unknown_offsets, instr.is_nuw, ctx)
+      offset_ptr = applyGepOffsets(base_ptr, known_offset, unknown_offsets, instr.is_nuw, ctx)
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2422,8 +2366,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
     # Conversion Operations
     case ir.Conversion(): # Convert a value from one type to another
       value = transValue(instr.value, ctx, bctx)
-      blocks.add(value.blocks)
-      value = value.value
 
       from_ty, to_ty = instr.value.type, instr.res_type
 
@@ -2540,12 +2482,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
     # Other Operations
     case ir.ICmp(): # Compare two values
       lft = transValue(instr.left, ctx, bctx)
-      blocks.add(lft.blocks)
-      lft = lft.value
-
       rgt = transValue(instr.right, ctx, bctx)
-      blocks.add(rgt.blocks)
-      rgt = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2571,12 +2508,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
     case ir.FCmp(): # Compare two float values
       lft = transValue(instr.left, ctx, bctx)
-      blocks.add(lft.blocks)
-      lft = lft.value
-
       rgt = transValue(instr.right, ctx, bctx)
-      blocks.add(rgt.blocks)
-      right = rgt.value
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
@@ -2584,7 +2516,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if not isinstance(instr.left.type, ir.FloatingPointTy):
         raise CompException(f"Instruction {instr} with opcode add only supports "
                             f"floats, got type {type(instr.left.type)}")
-      assert isinstance(lft, sb3.Value) and isinstance(right, sb3.Value)
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
 
       # NaN > Infinity in scratch
       is_nan = lambda val: sb3.BoolOp(">", val, sb3.Known(float("inf")))
@@ -2597,7 +2529,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
         case ir.FCmpCond.Oeq:
           # Anything = NaN is false in scratch apart from NaN = NaN - only need to check one side
-          res_val = sb3.BoolOp("and", is_not_nan(right), sb3.BoolOp("=", lft, right))
+          res_val = sb3.BoolOp("and", is_not_nan(rgt), sb3.BoolOp("=", lft, rgt))
 
         case ir.FCmpCond.One | ir.FCmpCond.Ogt | ir.FCmpCond.Oge | ir.FCmpCond.Olt | ir.FCmpCond.Ole:
           op = "=" if instr.cond is ir.FCmpCond.One else \
@@ -2606,11 +2538,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
 
           res_val = sb3.BoolOp("and",
-            sb3.BoolOp("and", is_not_nan(lft), is_not_nan(right)),
-            invert_val_if_necessary(sb3.BoolOp(op, lft, right)))
+            sb3.BoolOp("and", is_not_nan(lft), is_not_nan(rgt)),
+            invert_val_if_necessary(sb3.BoolOp(op, lft, rgt)))
 
         case ir.FCmpCond.Uno:
-          res_val = sb3.BoolOp("and", is_not_nan(lft), is_not_nan(right))
+          res_val = sb3.BoolOp("and", is_not_nan(lft), is_not_nan(rgt))
 
         case ir.FCmpCond.Ueq | ir.FCmpCond.Une | ir.FCmpCond.Ugt | ir.FCmpCond.Uge | ir.FCmpCond.Ult | ir.FCmpCond.Ule:
           op = "=" if instr.cond in {ir.FCmpCond.Ueq, ir.FCmpCond.Une} else \
@@ -2619,11 +2551,11 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
 
           res_val = sb3.BoolOp("or",
-            sb3.BoolOp("or", is_nan(lft), is_nan(right)),
-            invert_val_if_necessary(sb3.BoolOp(op, lft, right)))
+            sb3.BoolOp("or", is_nan(lft), is_nan(rgt)),
+            invert_val_if_necessary(sb3.BoolOp(op, lft, rgt)))
 
         case ir.FCmpCond.Ord:
-          res_val = sb3.BoolOp("or", is_nan(lft), is_nan(right))
+          res_val = sb3.BoolOp("or", is_nan(lft), is_nan(rgt))
 
         case _:
           raise CompException(f"fcmp does not support comparsion mode {instr.cond}")
@@ -2640,31 +2572,23 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
       assert isinstance(instr.cond.type, ir.IntegerTy)
       assert instr.cond.type.width == 1
-      assert isinstance(cond.value, sb3.Value)
+      assert isinstance(cond, sb3.Value)
 
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
-      blocks.add(cond.blocks)
-
-      if isinstance(true_val, ValueAndBlocks) and isinstance(true_val.value, sb3.Known) and \
-         isinstance(false_val.value, sb3.Known) and isinstance(true_val.value.known, float) and \
-         isinstance(false_val.value.known, float):
+      if isinstance(true_val, sb3.Known) and isinstance(false_val, sb3.Known) and \
+         isinstance(true_val.known, float) and isinstance(false_val.known, float):
         # TODO: Support multi-width vars for this, if it is faster than the if method
-        assert len(true_val.blocks) == 0 and len(false_val.blocks) == 0
-
         # Result = false_value + (true_value - false_value) * cond
-        diff = true_val.value.known - false_val.value.known
-        offset = cond.value if diff == 1 else sb3.Op("mul", cond.value, sb3.Known(diff))
-        blocks.add(res_var.setValue(sb3.Op("add", false_val.value, offset)))
+        diff = true_val.known - false_val.known
+        offset = cond if diff == 1 else sb3.Op("mul", cond, sb3.Known(diff))
+        blocks.add(res_var.setValue(sb3.Op("add", false_val, offset)))
       else:
-        true_blocks = true_val.blocks
-        true_blocks.add(res_var.setInferredValue(true_val.value))
+        true_blocks = res_var.setInferredValue(true_val)
+        false_blocks = res_var.setInferredValue(false_val)
 
-        false_blocks = false_val.blocks
-        false_blocks.add(res_var.setInferredValue(false_val.value))
-
-        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), true_blocks, false_blocks))
+        blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond, sb3.Known(1)), true_blocks, false_blocks))
 
     case ir.Phi(): # Choose a value based on which block control came from
       pass # Phi assignments are dealt with in the brancher function
@@ -2673,8 +2597,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       # Essentially a no-op, but for some types (e.g. integers)
       # poison can exist in invalid states e.g. -3 or 1.2 or NaN
       value = transValue(instr.value, ctx, bctx)
-      blocks.add(value.blocks)
-      value = value.value
       assert isinstance(value, sb3.Value)
 
       res_var = transVar(instr.result, bctx)
@@ -2704,8 +2626,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
     case ir.VaArg(): # Load an argument in a va_list and point the va_list to the next argument
       arglist = transValue(instr.arglist, ctx, bctx)
-      blocks.add(arglist.blocks)
-      arglist = arglist.value
 
       res_var = transVar(instr.result, bctx)
 
@@ -2713,8 +2633,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       assert isinstance(arglist, sb3.Value)
 
       arg_ptr = sb3.GetOfList("atindex", ctx.cfg.mem_var, arglist)
-      arg_ptr, opt_blocks = flatAsTuple(optimizeValueUse(arg_ptr, 2, ctx))
-      arg_size = sb3.Known(getByteSize(instr.argty, include_padding=ctx.cfg.accurate_byte_spacing))
+      arg_ptr, opt_blocks = optimizeValueUse(arg_ptr, 2, ctx)
+      arg_size = sb3.Known(getSizeOf(instr.argty, include_padding=ctx.cfg.accurate_byte_spacing))
 
       blocks.add(opt_blocks)
       blocks.add(transLoad(res_var, arg_ptr, instr.argty, ctx))
@@ -2805,7 +2725,7 @@ def getInstrVarUse(instr: ir.Instr,
     match val:
       case ir.ArgumentVal() | ir.LocalVarVal():
         depends.add(val.name)
-        depends_var_sizes[val.name] = getByteSize(val.type)
+        depends_var_sizes[val.name] = getSizeOf(val.type)
       case ir.KnownVal():
         pass
       case _:
@@ -2980,22 +2900,17 @@ def transTerminatorInstr(instr: ir.Instr,
   match instr:
     case ir.Unreachable(): # Never reached if not UB
       # TODO config to disable these errors
-      blocks.add(scratchRuntimeError("Reached unreachable branch"))
+      blocks.add(transRuntimeError("Reached unreachable branch"))
       blocks.end = True
 
     case ir.Ret(): # Return from a func
       if instr.value is not None:
         value = transValue(instr.value, ctx, bctx)
-        blocks.add(value.blocks)
-
         return_var = Variable(ctx.cfg.return_var, "special_var", None)
-        if isinstance(value.value, sb3.Value):
-          blocks.add(return_var.setValue(value.value))
-        else:
-          blocks.add(return_var.setAllValues(value.value))
+        blocks.add(return_var.setInferredValue(value))
 
         # Indicate to the optimizer that more numbered return values have been used which should not be optimized away
-        return_size = getByteSize(instr.value.type)
+        return_size = getSizeOf(instr.value.type)
         ctx.highest_return_size = return_size if ctx.highest_return_size is None else \
                                   max(ctx.highest_return_size, return_size)
 
@@ -3045,16 +2960,15 @@ def transTerminatorInstr(instr: ir.Instr,
       blocks.add(assignParameters(bctx.available_params, bctx.available_param_sizes, poss_depends, ctx))
 
       cond = transValue(instr.cond, ctx, bctx)
-      if isinstance(cond.value, IdxbleValue):
+      if isinstance(cond, IdxbleValue):
         raise CompException(f"Indexable value not supported for branch condition {instr}")
-      blocks.add(cond.blocks)
 
       label_true, label_false = instr.branch_true.label, instr.branch_false.label
       phi_blocks_true = assignPhiNodes(phi_info[label_true], ctx, bctx)
       phi_blocks_false = assignPhiNodes(phi_info[label_false], ctx, bctx)
       true_proc_name, false_proc_name = localizeLabel(label_true, bctx.fn.name), localizeLabel(label_false, bctx.fn.name)
 
-      blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond.value, sb3.Known(1)), sb3.BlockList(
+      blocks.add(sb3.ControlFlow("if_else", sb3.BoolOp("=", cond, sb3.Known(1)), sb3.BlockList(
         phi_blocks_true.blocks + [sb3.ProcedureCall(true_proc_name, [])]
       ), sb3.BlockList(
         phi_blocks_false.blocks + [sb3.ProcedureCall(false_proc_name, [])]
@@ -3066,27 +2980,25 @@ def transTerminatorInstr(instr: ir.Instr,
 
       assert isinstance(instr.cond.type, ir.IntegerTy)
       width = instr.cond.type.width
-      if getByteSize(instr.cond.type) > 1:
+      if getSizeOf(instr.cond.type) > 1:
         raise CompException(f"Cannot currently switch with an integer more "
                             f"than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
 
-      val, val_blocks = flatAsTuple(transValue(instr.cond, ctx, bctx))
-      blocks.add(val_blocks)
+      cond = transValue(instr.cond, ctx, bctx)
+      assert isinstance(cond, sb3.Value)
       if len(instr.branch_table) > 1:
-        val, opti_val_blocks = flatAsTuple(optimizeValueUse(val, math.log2(len(instr.branch_table)), ctx))
+        val, opti_val_blocks = optimizeValueUse(cond, math.log2(len(instr.branch_table)), ctx)
         blocks.add(opti_val_blocks)
 
       case_vs_label: dict[int, sb3.BlockList] = {}
       for case, label in instr.branch_table:
         case_val = transValue(case, ctx, bctx)
         # Switch cases should be constant and unique
-        assert isinstance(case_val, ValueAndBlocks)
-        assert len(case_val.blocks.blocks) == 0
-        assert isinstance(case_val.value, sb3.Known)
-        assert isinstance(case_val.value.known, float)
-        assert case_val.value.known.is_integer()
-        assert int(case_val.value.known) not in case_vs_label
-        case_val = int(case_val.value.known)
+        assert isinstance(case_val, sb3.Known)
+        assert isinstance(case_val.known, float)
+        assert case_val.known.is_integer()
+        assert int(case_val.known) not in case_vs_label
+        case_val = int(case_val.known)
 
         label_name = label.label
         label_proc_name = localizeLabel(label_name, bctx.fn.name)
@@ -3108,7 +3020,7 @@ def transTerminatorInstr(instr: ir.Instr,
       highest_poss = (2 ** width) - 1 # FUTURE OPTI: if the value called from was zero-extended (e.g. from an i8)
                                       # then could set this value to the max of the type before
 
-      blocks.add(binarySearch(val, case_vs_label, default_label_call, lowest_poss, highest_poss))
+      blocks.add(binarySearch(cond, case_vs_label, default_label_call, lowest_poss, highest_poss))
 
     case _:
       raise CompException(f"Unsupported terminator instruction opcode {instr} (type {type(instr)})")
@@ -3132,9 +3044,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
   for arg in args:
     if not isinstance(arg, ir.MetadataVal):
       val = transValue(arg, ctx, bctx)
-      assert isinstance(val, ValueAndBlocks)
-      blocks.add(val.blocks)
-      values.append(val.value)
+      assert isinstance(val, sb3.Value)
+      values.append(val)
     else:
       metadata.append(arg)
 
@@ -3211,8 +3122,8 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
         uses = 40 # Reasonable default for unknown lengths
         if isinstance(length, sb3.Known) and isinstance(length.known, (int, float)):
           uses = int(length.known)
-        src, src_blocks = flatAsTuple(optimizeValueUse(src, uses, ctx))
-        dest, dest_blocks = flatAsTuple(optimizeValueUse(dest, uses, ctx))
+        src, src_blocks = optimizeValueUse(src, uses, ctx)
+        dest, dest_blocks = optimizeValueUse(dest, uses, ctx)
 
         ptr_offset = genTempVar(ctx)
 
@@ -3282,7 +3193,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
         # or divide by 2^n here
 
         # Shift length is referenced twice, store if faster
-        shift, shift_blocks = flatAsTuple(optimizeValueUse(shift, 2, ctx))
+        shift, shift_blocks = optimizeValueUse(shift, 2, ctx)
         blocks.add(shift_blocks)
 
         if intrinsic == ir.Intrinsic.FShl:
@@ -3318,7 +3229,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       ty = args[0].type
       assert isinstance(ty, ir.IntegerTy)
       assert result is not None
-      sum, sum_blocks = flatAsTuple(calculateSumDiff(op, lft, rgt, ty.width, ctx, unsigned_overflow_flag=True))
+      sum, sum_blocks = calculateSumDiff(op, lft, rgt, ty.width, ctx, unsigned_overflow_flag=True)
       blocks.add(sum_blocks)
       blocks.add(result.setInferredValue(sum))
 
@@ -3328,7 +3239,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
       assert isinstance(ty, ir.IntegerTy)
       assert result is not None
-      mul_val, mul_blocks = flatAsTuple(multiplyWrap(lft, rgt, ty.width, ctx))
+      mul_val, mul_blocks = multiplyWrap(lft, rgt, ty.width, ctx)
       did_overflow = sb3.Op("bool_to_float", sb3.BoolOp(">", sb3.Op("mul", lft, rgt), sb3.Known(2**ty.width - 1)))
       blocks.add(mul_blocks)
       blocks.add(result.setAllValues(IdxbleValue([mul_val, did_overflow])))
@@ -3428,7 +3339,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
             call_id += 1
 
           case ir.Alloca():
-            branch_alloca_size[fn.name][block.label] += getByteSize(instr.allocated_type,
+            branch_alloca_size[fn.name][block.label] += getSizeOf(instr.allocated_type,
                                                           include_padding=ctx.cfg.accurate_byte_spacing)
 
           case ir.Phi():
@@ -3558,7 +3469,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     param_sizes = []
     for arg in fn.params:
       param_names.append(arg.name)
-      param_sizes.append(getByteSize(arg.type))
+      param_sizes.append(getSizeOf(arg.type))
 
     if fn.variadic:
       param_names.append(ctx.cfg.vararg_ptr_local)
@@ -3592,7 +3503,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
 
     arg_count = 0
     for arg in signature.params:
-      arg_count += getByteSize(arg)
+      arg_count += getSizeOf(arg)
     arguments = [f"%{n}" for n in range(arg_count)]
 
     return_address = Variable(ctx.cfg.return_address_local, "param", sig_name)
@@ -3702,14 +3613,6 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params, localized_param_sizes,
                                                          next_var_use_depends, block.label, info, ctx)
 
-      if is_first_block and ctx.cfg.do_debug_branch_log:
-        # Increment the function counter in the log
-        index = sb3.Known((info.fn_id * 2) + 1)
-        starting_fn_code.add(sb3.BlockList([
-          sb3.EditList("replaceat", ctx.cfg.debug_branch_log_var, index, sb3.Op("add",
-            sb3.Known(1), sb3.GetOfList("atindex", ctx.cfg.debug_branch_log_var, index)
-        ))]))
-
       # Store the previous stack size if necessary
       if is_first_block and info.total_alloca_size is None and not info.skip_stack_size_change:
         starting_fn_code.add(
@@ -3776,7 +3679,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           callee_info = None
           args = instr.args
           result = None if instr.result is None else transVar(instr.result, bctx)
-          result_size = None if instr.result is None else getByteSize(instr.return_type)
+          result_size = None if instr.result is None else getSizeOf(instr.return_type)
           following_instrs = block.instrs[instr_index + 1:]
 
           if not isinstance(instr.func, ir.FunctionVal):
@@ -3786,7 +3689,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
             if sig_info is None:
               # TODO config to disable these errors
-              bctx.code.add(scratchRuntimeError("Unmatched function signature"))
+              bctx.code.add(transRuntimeError("Unmatched function signature"))
               bctx.next_call_id += 1
               continue
 
@@ -3882,7 +3785,7 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
 
   # Get sizes of global variables
   # Include padding as this is accessed as part of memory
-  sizes = [getByteSize(glob.type, include_padding=ctx.cfg.accurate_byte_spacing) for glob in mod.global_vars.values()]
+  sizes = [getSizeOf(glob.type, include_padding=ctx.cfg.accurate_byte_spacing) for glob in mod.global_vars.values()]
   total_size = sum(sizes)
 
   # Memory layout
@@ -3916,9 +3819,8 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
       blocks.add(globvar.setValue(sb3.Known(ptr)))
 
     if glob.init is not None:
-      blocks_and_value = transValue(glob.init, ctx, None, is_global_init=True, include_padding=ctx.cfg.accurate_byte_spacing)
-      unknown = len(blocks_and_value.blocks) > 0
-      value = blocks_and_value.value
+      value = transValue(glob.init, ctx, None, is_global_init=True, include_padding=ctx.cfg.accurate_byte_spacing)
+      unknown = False
 
       if isinstance(value, IdxbleValue):
         unknown |= not all([isinstance(val, sb3.Known) for val in value.vals])
@@ -4509,8 +4411,8 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   return ctx
 
-def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Project, DebugInfo]:
-  """Compile LLVM IR to a scratch project. Returns a project and any debug info generated."""
+def compile(llvm: str | ir.Module, cfg: Config | None = None) -> sb3.Project:
+  """Compile LLVM IR to a scratch project."""
   if cfg is None: cfg = Config()
 
   ctx = Context(sb3.Project(cfg.scratch_config), cfg)
@@ -4534,18 +4436,6 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   init_blocks.add(init_mem)
   init_blocks.add(initLocalStack(ctx))
 
-  # Reset debug info on initialization
-  if cfg.do_debug_branch_log:
-    init_blocks.add(sb3.EditList("deleteall", cfg.debug_branch_log_var, None, None))
-
-    debug_branch_list_length = (ctx.next_fn_id * 2) + 10 # Adding 10 for safety + bc it doesn't really matter
-    if debug_branch_list_length > SCRATCH_LIST_LIMIT:
-      raise CompException("Too many functions; could not add them all to the recursive branch debug list")
-
-    init_blocks.add(sb3.ControlFlow("reptimes", sb3.Known(debug_branch_list_length), sb3.BlockList([
-      sb3.EditList("addto", cfg.debug_branch_log_var, None, sb3.Known(0))
-    ])))
-
   # Translate functions
   ctx = transFuncs(mod, ctx)
 
@@ -4567,13 +4457,4 @@ def compile(llvm: str | ir.Module, cfg: Config | None = None) -> tuple[sb3.Proje
   ctx, did_transform = postOptTransform(mod, ctx)
   if did_transform: ctx = optimize(ctx)
 
-  # Export debug info
-  if cfg.do_debug_branch_log:
-    branch_debug_info: list[tuple[int, str]] = []
-    for info in ctx.fn_info.values():
-      branch_debug_info.append((info.fn_id, info.name))
-    branch_debug_info.sort(key=lambda info: info[0])
-
-    ctx.debug_info.debug_branch_func_map = "\n".join([info[1] for info in branch_debug_info])
-
-  return ctx.proj, ctx.debug_info
+  return ctx.proj

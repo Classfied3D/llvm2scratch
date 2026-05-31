@@ -82,7 +82,7 @@ def main():
     Say(GetVar("c")),
   ]))
 
-  proj = l2s.optimizer.optimize(proj, l2s.getTarget("scratch3"))
+  proj = l2s.optimizer.optimize(proj, l2s.getTarget("scratch3").perf)
   proj.export("output/out.sprite3", Format.Sprite3)
 
 if __name__ == "__main__":
