@@ -314,7 +314,7 @@ class ExtractElement(Instr, HasResult):
   index: Value
 
 @dataclass
-class InsertElement(Instr):
+class InsertElement(Instr, HasResult):
   agg: Value
   item: Value
   index: Value
@@ -328,13 +328,13 @@ class ShuffleVector(Instr, HasResult):
 @dataclass
 class ExtractValue(Instr, HasResult):
   agg: Value
-  indices: list[Value]
+  indices: list[int]
 
 @dataclass
-class InsertValue(Instr):
+class InsertValue(Instr, HasResult):
   agg: Value
   element: Value
-  indices: list[Value]
+  indices: list[int]
 
 @dataclass
 class Alloca(Instr, HasResult):

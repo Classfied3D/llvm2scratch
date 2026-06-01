@@ -1,7 +1,7 @@
 """LLVM -> Scratch Compiler"""
 
 from __future__ import annotations
-from dataclasses import dataclass, is_dataclass, field, fields
+from dataclasses import dataclass, field
 from collections import defaultdict
 from ordered_set import OrderedSet
 from typing import Literal, cast
@@ -254,7 +254,7 @@ class CompWarning(Warning):
   """Warning in the compiler"""
   pass
 
-def getSizeOf(ty: ir.Type, include_padding: bool=False) -> int:
+def getSizeOf(ty: ir.Type, include_padding: bool) -> int:
   """
   Gets the size in bytes of a type. If include_padding is False, then this will return the amount of
   variables needed to store the type. If it is True, then it will return the size in memory it will take
@@ -291,7 +291,23 @@ def getSizeOf(ty: ir.Type, include_padding: bool=False) -> int:
 
   raise CompException(f"Unknown type: {ty}")
 
-def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], ctx: Context) -> tuple[int, list[tuple[sb3.Value, int, int]]]:
+def getGepOffsets(
+    base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]],
+    ctx: Context, include_padding: bool | None = None
+  ) -> tuple[int, list[tuple[sb3.Value, int, int]], ir.Type]:
+  """
+  base_ptr_type: the type of the pointed to object
+  indices: a list of the index values and their widths
+  include_padding: if the extra spacing between types in memory should
+  be considered. Defaults to accurate_byte_spacing in Config
+
+  returns (known_offset, unknown_offsets, type), where type is the type
+  of the pointed to object of the resultant pointer
+  """
+
+  if include_padding is None:
+    include_padding = ctx.cfg.accurate_byte_spacing
+
   known_offset: int = 0
   unknown_offsets: list[tuple[sb3.Value, int, int]] = []
 
@@ -305,7 +321,7 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
         inner_type = inner_type.inner
 
       # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
-      offset_size = getSizeOf(inner_type, include_padding=ctx.cfg.accurate_byte_spacing)
+      offset_size = getSizeOf(inner_type, include_padding)
       if isinstance(index_val, sb3.Known):
         assert isinstance(index_val.known, (int, float)) and index_val.known.is_integer()
         # Account for negative indices
@@ -324,13 +340,13 @@ def getGepOffsets(base_ptr_type: ir.Type, indices: list[tuple[sb3.Value, int]], 
       member_offset = int(index_val.known)
       for member in members[:member_offset]:
         # Since GEP interfaces with pointers to memory, it will need to include any padding that is enabled
-        known_offset += getSizeOf(member, include_padding=ctx.cfg.accurate_byte_spacing)
+        known_offset += getSizeOf(member, include_padding)
 
       inner_type = inner_type.members[member_offset]
 
     is_arr_offset = isinstance(inner_type, ir.ArrayTy)
 
-  return known_offset, unknown_offsets
+  return known_offset, unknown_offsets, inner_type
 
 def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tuple[sb3.Value, int, int]], is_nuw: bool, ctx: Context) -> sb3.Value:
   """
@@ -429,6 +445,23 @@ def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tu
 
   return final_val
 
+def getAggOffset(agg: ir.Type, indices: list[int], ctx: Context) -> tuple[int, int]:
+  """
+  Returns (offset, size), where offset is the index of the element selected in the aggregate,
+  and size is the size of the element type without padding
+  """
+
+  # The first GEP index offsets the whole type, but extract value doesn't
+  # have this, so add a zero index to behave correctly
+  # Give each index a 'width' of 32, extract value indices don't have a type
+  gep_indices: list[tuple[sb3.Value, int]] = [(sb3.Known(x), 32) for x in [0, *indices]]
+
+  offset, unknown_offsets, res_ty = getGepOffsets(agg, gep_indices, ctx, include_padding=False)
+  assert len(unknown_offsets) == 0
+  size = getSizeOf(res_ty, False)
+
+  return offset, size
+
 def padValue(val: sb3.Value | IdxbleValue, size: int) -> sb3.Value | IdxbleValue:
   """
   Apply padding to a Value/IdxbleValue + Blocks so that it matches "size"
@@ -448,7 +481,8 @@ def padValue(val: sb3.Value | IdxbleValue, size: int) -> sb3.Value | IdxbleValue
 def transValue(val: ir.Value,
                ctx: Context, bctx: BlockInfo | None,
                is_global_init: bool=False,
-               include_padding: bool=False) -> sb3.Value | IdxbleValue:
+               include_padding: bool=False,
+               ignore_poison: bool=False) -> sb3.Value | IdxbleValue:
 
   """
   Convert an IR value into a scratch value + blocks used to generate it. If is_global_init is
@@ -506,14 +540,14 @@ def transValue(val: ir.Value,
     case ir.KnownArrVal() | ir.KnownStructVal():
       values: list[sb3.Value] = []
       for element in val.values:
-        el_val = transValue(element, ctx, bctx, is_global_init, include_padding)
+        el_val = transValue(element, ctx, bctx, is_global_init, include_padding, ignore_poison)
         if isinstance(el_val, sb3.Value):
           values.append(el_val)
         else:
           values.extend(el_val.vals)
 
-      # Arrays/Structs don't need padding
-      return IdxbleValue(values)
+      # Arrays/Structs don't need padding, as the elements already have it considered for
+      return values[0] if len(values) == 0 else IdxbleValue(values)
 
     case ir.NullPtrVal():
       # Since pointers start from one anyway (because lists start from one in scratch), zero can be used for null
@@ -536,7 +570,7 @@ def transValue(val: ir.Value,
             assert isinstance(index_val, ir.KnownIntVal)
             indices.append((sb3.Known(index_val.value), index_val.width))
 
-          known_offset, unknown_offsets = getGepOffsets(expr.base_ptr_type, indices, ctx)
+          known_offset, unknown_offsets, _ = getGepOffsets(expr.base_ptr_type, indices, ctx)
           assert len(unknown_offsets) == 0
 
           base_ptr = ctx.globvar_to_ptr[expr.base_ptr.name]
@@ -556,7 +590,7 @@ def transValue(val: ir.Value,
               assert int_ty.width == PTR_WIDTH_BITS
 
               # No-op
-              return transValue(expr.value, ctx, bctx, is_global_init, include_padding)
+              return transValue(expr.value, ctx, bctx, is_global_init, include_padding, ignore_poison)
 
             case ir.ConvOpcode.BitCast | ir.ConvOpcode.AddrSpaceCast:
               raise CompException(f"Unsupported constexpr conv opcode {expr.opcode}")
@@ -566,6 +600,18 @@ def transValue(val: ir.Value,
 
         case _:
           raise CompException(f"Unsupported constant expression type: {expr}")
+
+    case ir.UndefVal():
+      if not ignore_poison:
+        raise CompException(
+          f"Got undef/poison value of type {val.type}. As ignore_poison is not enabled, "
+          f"this poison is not likely handled correctly."
+        )
+
+      size = getSizeOf(val.type, include_padding)
+
+      # Give a generic value 0, this should not be used as poison is never read
+      return sb3.Known(0) if size == 1 else IdxbleValue([sb3.Known(0)] * size)
 
     case _:
       raise CompException(f"Unknown Value {val}")
@@ -2292,6 +2338,35 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       if res_val is not False: # If the binop doesn't set res_var itself
         blocks.add(res_var.setInferredValue(res_val))
 
+    # Aggregate Operations
+    case ir.ExtractValue(): # Extract a value in an aggregate type
+      result = transVar(instr.result, bctx)
+      assert result.var_type != "param"
+
+      agg = transValue(instr.agg, ctx, bctx)
+      agg_vals = [agg] if isinstance(agg, sb3.Value) else agg.vals
+
+      offset, size = getAggOffset(instr.agg.type, instr.indices, ctx)
+
+      res_vals = [agg_vals[offset + i] for i in range(size)]
+      blocks.add(result.setInferredValue(res_vals[0] if len(res_vals) == 1 else IdxbleValue(res_vals)))
+
+    case ir.InsertValue(): # Insert a value in an aggregate type
+      result = transVar(instr.result, bctx)
+      assert result.var_type != "param"
+
+      el = transValue(instr.element, ctx, bctx)
+      el_vals = [el] if isinstance(el, sb3.Value) else el.vals
+
+      agg = transValue(instr.agg, ctx, bctx, ignore_poison=True)
+      agg_vals = [agg] if isinstance(agg, sb3.Value) else agg.vals
+
+      start, size = getAggOffset(instr.agg.type, instr.indices, ctx)
+      end = start + size
+
+      res_vals = agg_vals[:start] + el_vals + agg_vals[end:]
+      blocks.add(result.setInferredValue(res_vals[0] if len(res_vals) == 1 else IdxbleValue(res_vals)))
+
     # Memory Access and Addressing Operations
     case ir.Alloca(): # Allocate space on the stack and return ptr
       assert isinstance(instr.num_elements, ir.KnownIntVal)
@@ -2355,7 +2430,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         assert isinstance(index, sb3.Value)
         indices.append((index, index_val.type.width))
 
-      known_offset, unknown_offsets = getGepOffsets(instr.base_ptr_type, indices, ctx)
+      known_offset, unknown_offsets, _ = getGepOffsets(instr.base_ptr_type, indices, ctx)
 
       offset_ptr = applyGepOffsets(base_ptr, known_offset, unknown_offsets, instr.is_nuw, ctx)
 
@@ -2409,15 +2484,18 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
         case ir.ConvOpcode.BitCast:
+          if isinstance(instr.value.type, ir.FloatingPointTy) or isinstance(instr.res_type, ir.FloatingPointTy):
+            # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
+            # representation in bits
+            raise CompException(f"Bitcast involving floating point type not yet supported")
+
           if isinstance(instr.value.type, ir.IntegerTy):
             assert isinstance(instr.res_type, ir.IntegerTy)
             if instr.value.type.width > VARIABLE_MAX_BITS:
-              raise CompException(f"Instruction icmp currently supports "
+              raise CompException(f"Instruction {instr} currently supports "
                                   f"integers with <= {VARIABLE_MAX_BITS} bits")
           elif isinstance(instr.value.type, ir.PointerTy):
             assert isinstance(instr.res_type, ir.PointerTy)
-          # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
-          # representation in bits
 
         case _: pass
 
@@ -2691,9 +2769,9 @@ def getInstrValues(instr: ir.Instr, include_called_funcs: bool=True) -> list[ir.
     case ir.GetElementPtr():
       return [instr.base_ptr, *instr.indices]
     case ir.ExtractValue():
-      return [instr.agg, *instr.indices]
+      return [instr.agg]
     case ir.InsertValue():
-      return [instr.agg, instr.element, *instr.indices]
+      return [instr.agg, instr.element]
     case ir.VaArg():
       return [instr.arglist]
     case _:
@@ -2725,7 +2803,7 @@ def getInstrVarUse(instr: ir.Instr,
     match val:
       case ir.ArgumentVal() | ir.LocalVarVal():
         depends.add(val.name)
-        depends_var_sizes[val.name] = getSizeOf(val.type)
+        depends_var_sizes[val.name] = getSizeOf(val.type, False)
       case ir.KnownVal():
         pass
       case _:
@@ -2910,7 +2988,7 @@ def transTerminatorInstr(instr: ir.Instr,
         blocks.add(return_var.setInferredValue(value))
 
         # Indicate to the optimizer that more numbered return values have been used which should not be optimized away
-        return_size = getSizeOf(instr.value.type)
+        return_size = getSizeOf(instr.value.type, False)
         ctx.highest_return_size = return_size if ctx.highest_return_size is None else \
                                   max(ctx.highest_return_size, return_size)
 
@@ -2980,7 +3058,7 @@ def transTerminatorInstr(instr: ir.Instr,
 
       assert isinstance(instr.cond.type, ir.IntegerTy)
       width = instr.cond.type.width
-      if getSizeOf(instr.cond.type) > 1:
+      if getSizeOf(instr.cond.type, False) > 1:
         raise CompException(f"Cannot currently switch with an integer more "
                             f"than {VARIABLE_MAX_BITS} bits (would take multiple vars to store)")
 
@@ -3469,7 +3547,7 @@ def getFnInfo(mod: ir.Module, ctx: Context) -> Context:
     param_sizes = []
     for arg in fn.params:
       param_names.append(arg.name)
-      param_sizes.append(getSizeOf(arg.type))
+      param_sizes.append(getSizeOf(arg.type, False))
 
     if fn.variadic:
       param_names.append(ctx.cfg.vararg_ptr_local)
@@ -3503,7 +3581,7 @@ def transFuncPtrSigs(ctx: Context) -> Context:
 
     arg_count = 0
     for arg in signature.params:
-      arg_count += getSizeOf(arg)
+      arg_count += getSizeOf(arg, False)
     arguments = [f"%{n}" for n in range(arg_count)]
 
     return_address = Variable(ctx.cfg.return_address_local, "param", sig_name)
@@ -3679,7 +3757,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
           callee_info = None
           args = instr.args
           result = None if instr.result is None else transVar(instr.result, bctx)
-          result_size = None if instr.result is None else getSizeOf(instr.return_type)
+          result_size = None if instr.result is None else getSizeOf(instr.return_type, False)
           following_instrs = block.instrs[instr_index + 1:]
 
           if not isinstance(instr.func, ir.FunctionVal):

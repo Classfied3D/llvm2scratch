@@ -208,8 +208,9 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
       return ExtractElement(result, decodeValue(vec, structs, func_names), decodeValue(index, structs, func_names))
 
     case "insertelement":
+      assert result is not None
       vec, item, index, *_ = instr.operands
-      return InsertElement(decodeValue(vec, structs, func_names), decodeValue(item, structs, func_names), decodeValue(index, structs, func_names))
+      return InsertElement(result, decodeValue(vec, structs, func_names), decodeValue(item, structs, func_names), decodeValue(index, structs, func_names))
 
     case "shufflevector":
       assert result is not None
@@ -222,16 +223,19 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
 
       return ShuffleVector(result, decodeValue(vec1, structs, func_names), decodeValue(vec2, structs, func_names), mask_val)
 
-    case "insertvalue":
-      agg, element, *indices = [decodeValue(val, structs, func_names) for val in instr.operands]
-
-      return InsertValue(agg, element, indices)
-
     case "extractvalue":
       assert result is not None
-      agg, *indices = [decodeValue(val, structs, func_names) for val in instr.operands]
+      agg = decodeValue(next(instr.operands), structs, func_names)
+      indices = [int(x[0]) for x in parseCommaSeperated(raw_instr_no_res)[1:]]
 
       return ExtractValue(result, agg, indices)
+
+    case "insertvalue":
+      assert result is not None
+      agg, element = [decodeValue(val, structs, func_names) for val in instr.operands]
+      indices = [int(x[0]) for x in parseCommaSeperated(raw_instr_no_res)[2:]]
+
+      return InsertValue(result, agg, element, indices)
 
     case "alloca":
       assert result is not None
