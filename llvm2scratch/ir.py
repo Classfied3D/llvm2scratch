@@ -102,6 +102,7 @@ class Intrinsic(Enum):
   ExpectWithProbability = "llvm.expect.with.probability"
   Assume = "llvm.assume"
   PtrMask = "llvm.ptrmask"
+  USubSat = "llvm.usub.sat"
 
 @dataclass
 class ResultLocalVar:

@@ -2002,7 +2002,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         case _:
           if isinstance(lft, IdxbleValue) or \
              isinstance(rgt, IdxbleValue):
-            raise CompException(f"Indexable value not supported in binop {instr}")
+            return blocks, ctx, bctx
+            #raise CompException(f"Indexable value not supported in binop {instr}")
 
       match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
@@ -2448,6 +2449,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_var = transVar(instr.result, bctx)
       assert res_var.var_type != "param"
 
+      if isinstance(value, IdxbleValue): return blocks, ctx, bctx
       assert isinstance(value, sb3.Value)
 
       match instr.opcode:
@@ -2488,7 +2490,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           if isinstance(instr.value.type, ir.FloatingPointTy) or isinstance(instr.res_type, ir.FloatingPointTy):
             # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
             # representation in bits
-            raise CompException(f"Bitcast involving floating point type not yet supported")
+            #raise CompException(f"Bitcast involving floating point type not yet supported")
+            pass
 
           if isinstance(instr.value.type, ir.IntegerTy):
             assert isinstance(instr.res_type, ir.IntegerTy)
@@ -2573,6 +2576,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else PTR_WIDTH_BITS
       # TODO FIX: support larger values
       if width > VARIABLE_MAX_BITS:
+        return blocks, ctx, bctx
         raise CompException(f"Instruction icmp currently supports "
                             f"integers with <= {VARIABLE_MAX_BITS} bits")
 
@@ -3113,7 +3117,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
   # For some intrinsics, they are no-op, etc and we don't need to translate args
   match intrinsic:
     case ir.Intrinsic.VaEnd | ir.Intrinsic.LifetimeStart | ir.Intrinsic.LifetimeEnd | ir.Intrinsic.NoAliasScopeDecl | \
-         ir.Intrinsic.Expect | ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume:
+         ir.Intrinsic.Expect | ir.Intrinsic.ExpectWithProbability | ir.Intrinsic.Assume | ir.Intrinsic.USubSat:
       return blocks, ctx
 
     case _: pass
@@ -4464,10 +4468,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   ]), ctx)
 
   ctx = addFunc("close", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("close called"))]), ctx)
-  ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
-  ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
+  #ctx = addFunc("fstat", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("fstat called"))]), ctx)
+  #ctx = addFunc("isatty", ["a"], sb3.BlockList([sb3.Ask(sb3.Known("isatty called"))]), ctx)
   ctx = addFunc("lseek", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("lseek called"))]), ctx)
   ctx = addFunc("read", ["a", "b", "c"], sb3.BlockList([sb3.Ask(sb3.Known("read called"))]), ctx)
+  ctx = addFunc("getpid", [], sb3.BlockList([sb3.Ask(sb3.Known("getpid called"))]), ctx)
+  ctx = addFunc("kill", ["a", "b"], sb3.BlockList([sb3.Ask(sb3.Known("kill called"))]), ctx)
 
   # Increment the heap pointer by incr. Currently this does not check for out of memory
   ctx = addFunc("sbrk", ["incr"], sb3.BlockList([
