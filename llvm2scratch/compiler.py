@@ -1693,7 +1693,8 @@ def getCallArguments(
   arguments: list[sb3.Value] = []
   blocks = sb3.BlockList()
   for arg in args:
-    value = transValue(arg, ctx, bctx)
+    # Since we have to pass the correct amount of arguments anyway, we can ignore poison
+    value = transValue(arg, ctx, bctx, ignore_poison=True)
     if not isinstance(value, IdxbleValue):
       arguments.append(value)
     else:
