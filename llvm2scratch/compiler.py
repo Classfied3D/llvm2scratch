@@ -3326,7 +3326,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
     case ir.Intrinsic.FMulAdd:
       a, b, c = values
       assert isinstance(a, sb3.Value) and isinstance(b, sb3.Value) and isinstance(c, sb3.Value)
-      assert all(isinstance(args[i].type, ir.FloatTy) for i in range(3))
+      assert all(isinstance(args[i].type, ir.FloatingPointTy) for i in range(3))
       assert result is not None
       blocks.add(result.setValue(sb3.Op("add", sb3.Op("mul", a, b), c)))
 
