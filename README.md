@@ -51,7 +51,7 @@ usage: llvm2scratch [-h] [-o OUTPUT] [-f {infer,project3,sprite3}] [-T TARGET [T
                     [--hide-blocks]
                     input
 
-Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)
+Compile an LLVM 19 IR (.ll) file into a scratch project or sprite
 
 positional arguments:
   input                 Path to the input LLVM 19 IR (.ll) file

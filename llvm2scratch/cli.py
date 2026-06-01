@@ -58,7 +58,7 @@ def main():
   default_opt_target = defaults.opt_target.id
 
   parser = argparse.ArgumentParser(
-    description="Compile an LLVM 19 IR (.ll) file into a scratch sprite (.sprite3)",
+    description="Compile an LLVM 19 IR (.ll) file into a scratch project or sprite",
     formatter_class=CustomFormatter
   )
   parser.add_argument("input", type=Path, help="Path to the input LLVM 19 IR (.ll) file")
