@@ -4195,8 +4195,6 @@ def postOptTransform(mod: ir.Module, ctx: Context) -> tuple[Context, bool]:
     # If the function doesn't make any branches we should
     # remove the 'stop this script' and not replace anything
     if len(needs_call_replacement) == 0:
-      last = ctx.proj.code[procs[fn.name]].blocks.pop()
-      assert isinstance(last, sb3.StopScript) and last.op == "stopthis"
       continue
 
     branch_id_var = Variable(ctx.cfg.branch_jump_table_addr_local, "var", fn.name)
