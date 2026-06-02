@@ -2660,9 +2660,16 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
          isinstance(true_val.known, float) and isinstance(false_val.known, float):
         # TODO: Support multi-width vars for this, if it is faster than the if method
         # Result = false_value + (true_value - false_value) * cond
+
+        # Swap if negative to avoid multiping by -1
         diff = true_val.known - false_val.known
+        op = "add"
+        if diff < 0:
+          diff *= -1
+          op = "sub"
+
         offset = cond if diff == 1 else sb3.Op("mul", cond, sb3.Known(diff))
-        blocks.add(res_var.setValue(sb3.Op("add", false_val, offset)))
+        blocks.add(res_var.setValue(sb3.Op(op, false_val, offset)))
       else:
         true_blocks = res_var.setInferredValue(true_val)
         false_blocks = res_var.setInferredValue(false_val)

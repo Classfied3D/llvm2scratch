@@ -40,7 +40,5 @@ int main(void) {
   void (*wait_fn)(double) = type[0] == 'y' ? SB3_wait : SB3_wait_no_render;
   wait_fn(dur);
 
-
-
   return 0;
 }
