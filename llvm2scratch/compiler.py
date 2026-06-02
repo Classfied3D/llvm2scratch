@@ -3119,11 +3119,10 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
     case _: pass
 
   metadata: list[ir.MetadataVal] = []
-  values: list[sb3.Value] = []
+  values: list[sb3.Value | IdxbleValue] = []
   for arg in args:
     if not isinstance(arg, ir.MetadataVal):
       val = transValue(arg, ctx, bctx)
-      assert isinstance(val, sb3.Value)
       values.append(val)
     else:
       metadata.append(arg)
@@ -3181,6 +3180,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
 
     case ir.Intrinsic.MemCpy:
       dest, src, length, _volatile = values
+      assert isinstance(dest, sb3.Value) and isinstance(src, sb3.Value) and isinstance(length, sb3.Value)
 
       # If the length is unknown and large, we'll use a loop like when it is known
       known_length = isinstance(length, sb3.Known) and \
