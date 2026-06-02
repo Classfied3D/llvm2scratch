@@ -1,13 +1,22 @@
 import llvm2scratch as l2s
+from pathlib import Path
 import subprocess
+import argparse
 import os
 
-INPUT = "demo.c"
+INPUT_FOLDER = "input"
 OUTPUT_IR = "output/out.ll"
 OUTPUT_PROJ = "output/out.sb3"
 OUTPUT_SCRATCHBLOCKS = "output/blocks.txt"
 
 def main():
+  parser = argparse.ArgumentParser(
+    description="Compile a C file into a scratch project or sprite",
+  )
+  parser.add_argument("input", type=Path, help="C file to compile", nargs="?", default=Path("demo.c"))
+  parser.add_argument("--optlevel", "-O", type=str, help="C optimization level", default="1")
+  args = parser.parse_args()
+
   llvm_prefix = os.environ.get("LLVM_PREFIX", "")
   llvm_suffix = os.environ.get("LLVM_SUFFIX", "")
   cc = os.environ.get("CC", f"{llvm_prefix}clang{llvm_suffix}")
@@ -18,7 +27,7 @@ def main():
   if not os.path.exists("./output"):
     os.mkdir("output")
 
-  subprocess.run([cc, "-S", "-m32", "-O1", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", INPUT, "-o", os.path.join(script_dir, OUTPUT_IR)],
+  subprocess.run([cc, "-S", "-m32", f"-O{args.optlevel}", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", args.input, "-o", os.path.join(script_dir, OUTPUT_IR)],
                  cwd=os.path.join(script_dir, "input"))
 
   with open(OUTPUT_IR, "r") as file:

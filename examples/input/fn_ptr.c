@@ -31,6 +31,16 @@ int main(void) {
 
   number = add_one(fn_ptr(number));
   SB3_say_dbl(number);
+  SB3_wait(2.0);
+
+  double dur;
+  char type[2];
+  SB3_ask_dbl(&dur, "Enter a duration");
+  SB3_ask_str(type, "Render during your wait? (y/n)", 2);
+  void (*wait_fn)(double) = type[0] == 'y' ? SB3_wait : SB3_wait_no_render;
+  wait_fn(dur);
+
+
 
   return 0;
 }
