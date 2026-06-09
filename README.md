@@ -1,6 +1,6 @@
 ![Scratch Cat Wyvern](assets/title.svg)
 
-An LLVM backend to convert LLVM IR to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
+An LLVM backend to convert [LLVM IR](https://llvm.org/docs/LangRef.html) to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
 
 ## Progress
 
