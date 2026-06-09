@@ -34,7 +34,7 @@ class Config:
   """Config options to pass to the compiler"""
   targets: list[target.Target] = field(default_factory=lambda: [target.getTarget(t) for t in target.DEFAULT_TARGETS])
 
-  compiler_opt: bool = True # If compiler should be applied
+  compiler_opt: bool = True # If compiler specific optimizations should be applied
   compiler_minify: bool = True # If the compiler should minify expressions (e.g. sub 1 instead of adding 2^N-1)
   opt_passes: set[opt.Optimization] = field(default_factory=lambda: opt.ALL_OPTIMIZATIONS) # Set of opt passes to apply
   opt_target: target.Target = field(default_factory=lambda: target.getTarget(target.DEFAULT_OPT_TARGET))
@@ -2479,10 +2479,8 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                                 f"integers with <= {VARIABLE_MAX_BITS} bits")
 
         case ir.ConvOpcode.BitCast:
-          if isinstance(instr.value.type, ir.FloatingPointTy) or isinstance(instr.res_type, ir.FloatingPointTy):
-            # FUTURE FIX: float -> int and vice versa bitcasts, would require the IEEE
-            # representation in bits
-            raise CompException(f"Bitcast involving floating point type not yet supported")
+          if isinstance(instr.value.type, ir.IntegerTy) and isinstance(instr.res_type, ir.FloatingPointTy):
+            raise CompException(f"Bitcast int -> float not yet supported")
 
           if isinstance(instr.value.type, ir.IntegerTy):
             assert isinstance(instr.res_type, ir.IntegerTy)
@@ -2541,8 +2539,65 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           # No-op
           res_val = value
 
+        case ir.ConvOpcode.BitCast:
+          if isinstance(instr.value.type, ir.FloatingPointTy):
+            # Floating point values are stored as scratch's floating point numbers,
+            # not as their IEEE bit representation. Therefore we need to figure out
+            # the bit representation in order to calculate this
+            assert isinstance(instr.res_type, ir.IntegerTy)
+
+            # IEEE 754 binary formats. See https://en.wikipedia.org/wiki/IEEE_754
+            match instr.value.type:
+              case ir.HalfTy:
+                # binary16
+                exp_bits = 5
+                mant_bits = 10
+              case ir.FloatTy:
+                # binary32
+                exp_bits = 8
+                mant_bits = 23
+              case ir.DoubleTy:
+                # binary64
+                exp_bits = 11
+                mant_bits = 52
+              case _:
+                # TODO: binary128 may also work with the current function but is untested
+                raise CompException(f"Unsupported floating point type for bitcast, {instr.value.type}")
+
+            # Accepts "float", "exp_bits", "max_exp", "2^mant_bits", where "max_exp" = 2^(exp_bits-1)-1
+            blocks.add(sb3.ProcedureCall("!helper_IEEE_754", [
+              value, sb3.Known(exp_bits), sb3.Known(2**(exp_bits-1)-1), sb3.Known(2**mant_bits)
+            ]))
+
+            ieee_components = Variable(ctx.cfg.return_var, "special_var", None)
+            sign, exp, mant = ieee_components.getAllValues(3).vals
+
+            match instr.value.type:
+              case ir.DoubleTy:
+                assert VARIABLE_MAX_BITS <= mant_bits
+                snd_mant_bits = mant_bits - VARIABLE_MAX_BITS
+                res_val = IdxbleValue([
+                  # Little endian - least significant mantissa bits come first
+                  sb3.Op("mod", mant, sb3.Known(2**VARIABLE_MAX_BITS)),
+                  sumValueParts([
+                    sb3.Op("mul", sign, sb3.Known(2**(snd_mant_bits + exp_bits))),
+                    sb3.Op("mul", exp,  sb3.Known(2**snd_mant_bits)),
+                    sb3.Op("floor", sb3.Op("div", mant, sb3.Known(2**VARIABLE_MAX_BITS)))
+                  ]),
+                ])
+              case _:
+                assert 1 + exp_bits + mant_bits <= VARIABLE_MAX_BITS
+                res_val = sumValueParts([
+                  sb3.Op("mul", sign, sb3.Known(2**(mant_bits + exp_bits))),
+                  sb3.Op("mul", sign, sb3.Known(2**mant_bits)),
+                  mant,
+                ])
+          else:
+            # No-op
+            res_val = value
+
         case ir.ConvOpcode.ZExt | ir.ConvOpcode.FPTrunc | ir.ConvOpcode.FPExt | \
-             ir.ConvOpcode.UIToFP | ir.ConvOpcode.BitCast:
+             ir.ConvOpcode.UIToFP:
           # No-op
           res_val = value
 
@@ -2550,7 +2605,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
           raise CompException(f"Unknown instruction opcode {instr} (type Conversion)")
 
       assert res_val is not None
-      blocks.add(res_var.setValue(res_val))
+      blocks.add(res_var.setInferredValue(res_val))
 
     # Other Operations
     case ir.ICmp(): # Compare two values
@@ -4302,7 +4357,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Calculates the components of IEEE 754 of a scratch number with custom float, exp bits and mant bits
   # see https://scratch.mit.edu/projects/1328281339/ for original implementation
-  # "max_exp" = 2^(exp_bits)-1
+  # "max_exp" = 2^(exp_bits-1)-1
   # returns sign bit, exp bits, mant bits
   ctx = addFunc("!helper_IEEE_754", ["float", "exp_bits", "max_exp", "2^mant_bits"], sb3.BlockList([
     sb3.ControlFlow("if_else", sb3.BoolOp("<", sb3.Op("abs", get_param("float")), sb3.Known(math.inf)), sb3.BlockList([
