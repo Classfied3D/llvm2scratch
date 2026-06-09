@@ -4137,19 +4137,19 @@ def tableLookup(table_name: str, index_val: sb3.Known, ctx: Context) -> sb3.Know
     power = index - getPow2Offset()
     return sb3.Known(2 ** power)
 
-def getDontElide(ctx: Context) -> set[str]:
-  """Returns a list of names of variables which should not be elided"""
-  # Jump table ids should not be elided as in future jump ids may be depended upon after optimization in future
-  res = {ctx.cfg.jump_table_id_var, ctx.cfg.return_var}
-  if ctx.highest_return_size is not None:
-    res |= {Variable(ctx.cfg.return_var, "special_var", None).getRawVarName(i) for i in range(ctx.highest_return_size)}
-  return res
-
 def optimize(ctx: Context) -> Context:
+  # Jump table ids should not be elided as in future jump ids may be depended upon after optimization in future
+  dont_elide = {ctx.cfg.jump_table_id_var, ctx.cfg.return_var}
+  if ctx.highest_return_size is not None:
+    dont_elide |= {
+      Variable(ctx.cfg.return_var, "special_var", None).getRawVarName(i)
+      for i in range(ctx.highest_return_size)
+    }
+
   ctx.proj = opt.optimize(ctx.proj,
     perf = ctx.cfg.opt_target.perf,
     all_opti = ctx.cfg.opt_passes,
-    dont_remove = getDontElide(ctx),
+    dont_remove = dont_elide,
     ignore_external_change = {ctx.cfg.stack_pointer_var},
     lookup_func = lambda n, i: tableLookup(n, i, ctx))
 
@@ -4269,19 +4269,139 @@ def addForeignFunctions(ctx: Context) -> Context:
       ascii_lookup.append(sb3.Known(char))
   ctx.proj.lists[ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix] = ascii_lookup
 
+  return_var = Variable(ctx.cfg.return_var, "special_var", None)
+  get_param = lambda name: sb3.GetParam(localizeParam(name))
+
+  # Calculates 2^x where x is an integer exactly for floating point
+  # See "exact 2^n proof" in README
+  ctx = addFunc("!helper_exact_pow2i", ["exp", "exp_bits"], sb3.BlockList([
+    sb3.EditVar("set", "remaining", sb3.Op("abs", get_param("exp"))),
+    sb3.EditVar("set", "current_multiplier", sb3.Known(2)),
+    sb3.EditVar("set", ctx.cfg.return_var, sb3.Known(1)),
+
+    # For each bit of exponent
+    sb3.ControlFlow("reptimes", get_param("exp_bits"), sb3.BlockList([
+      # If current bit == 1 then multiply return value by current multiplier
+      sb3.ControlFlow("if", sb3.BoolOp("=",
+          sb3.Op("mod", sb3.GetVar("remaining"), sb3.Known(2)),
+          sb3.Known(1)), sb3.BlockList([
+        sb3.EditVar("set", ctx.cfg.return_var,
+          sb3.Op("mul", sb3.GetVar(ctx.cfg.return_var), sb3.GetVar("current_multiplier")))
+      ])),
+
+      # remaining >>= 1
+      sb3.EditVar("set", "remaining", sb3.Op("floor",
+        sb3.Op("div", sb3.GetVar("remaining"), sb3.Known(2))
+      )),
+
+      # current_multiplier **= 2
+      sb3.EditVar("set", "current_multiplier", sb3.Op("mul",
+        sb3.GetVar("current_multiplier"),
+        sb3.GetVar("current_multiplier")))
+    ])),
+
+    # 2 ^ -x = 1 / (2 ^ x)
+    sb3.ControlFlow("if", sb3.BoolOp("<", get_param("exp"), sb3.Known(0)), sb3.BlockList([
+      sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("div", sb3.Known(1), sb3.GetVar(ctx.cfg.return_var))),
+    ])),
+  ]), ctx)
+
+  # Calculates the components of IEEE 754 of a scratch number with custom float, exp bits and mant bits
+  # see https://scratch.mit.edu/projects/1328281339/ for original implementation
+  # "max_exp" = 2^(exp_bits)-1
+  # returns sign bit, exp bits, mant bits
+  ctx = addFunc("!helper_IEEE_754", ["float", "exp_bits", "max_exp", "2^mant_bits"], sb3.BlockList([
+    sb3.ControlFlow("if_else", sb3.BoolOp("<", sb3.Op("abs", get_param("float")), sb3.Known(math.inf)), sb3.BlockList([
+      # If finite or NaN
+      # Get sign bit
+      # This can get the sign of -0 as
+      # 1 / 0 = Infinity > 0
+      # 1 / -0 = -Infinity < 0
+      # Also works for other finite values and NaN
+      return_var.setValue(sb3.Op("bool_to_float",
+        sb3.BoolOp("<", sb3.Op("div", sb3.Known(1), get_param("float")), sb3.Known(0))), index=0),
+
+      sb3.ControlFlow("if_else", sb3.BoolOp("=", get_param("float"), sb3.Known(math.nan)), sb3.BlockList([
+        # If NaN
+        # Exponent is one more than the max for finite values
+        sb3.EditVar("set", "exponent", sb3.Op("add", get_param("max_exp"), sb3.Known(1))),
+        # MSB of mantissa is one
+        return_var.setValue(sb3.Op("div", get_param("2^mant_bits"), sb3.Known(2)), index=2),
+      ]), sb3.BlockList([
+        # If finite
+        sb3.ControlFlow("if_else", sb3.BoolOp("=", get_param("float"), sb3.Known(0)), sb3.BlockList([
+          # If zero
+          # Bits of exponent = 0b00000...
+          sb3.EditVar("set", "exponent", sb3.Op("sub", sb3.Known(0), get_param("max_exp"))),
+          # Mantissa is zero
+          return_var.setValue(sb3.Known(0), index=2),
+        ]), sb3.BlockList([
+          # If finite and non-zero
+          # Make an estimate for the exponent using log2 x ~= ln x / ln 2
+          # This is approximate due to floating point error
+          # Subtracting 0.5 before flooring that the result is equal to or one less than
+          # the actual exponent (underestimate)
+          sb3.EditVar("set", "exponent", sb3.Op("floor", sb3.Op("sub",
+            sb3.Op("div", sb3.Op("ln", sb3.Op("abs", get_param("float"))), sb3.Known(math.log(2))),
+            sb3.Known(0.5)))),
+          sb3.ProcedureCall("!helper_exact_pow2i", [
+            sb3.Op("add", sb3.GetVar("exponent"), sb3.Known(1)),
+            get_param("exp_bits")
+          ]),
+
+          # Calculate 2^(our estimate + 1) and compare it to the value
+          sb3.ControlFlow("if_else",
+              sb3.BoolOp("<", sb3.Op("abs", get_param("float")), return_var.getValue()), sb3.BlockList([
+            # If our estimate was correct
+            sb3.EditVar("set", "2^exponent", sb3.Op("div", return_var.getValue(), sb3.Known(2))),
+          ]), sb3.BlockList([
+            # If our estimate was incorrect, exponent must be our estimate + 1
+            sb3.EditVar("change", "exponent", sb3.Known(1)),
+            sb3.EditVar("set", "2^exponent", return_var.getValue()),
+          ])),
+
+          return_var.setValue(
+            # Mantissa bits = round ((mantissa - 1) * 2^mant bits)
+            sb3.Op("round",
+              sb3.Op("mul",
+                sb3.Op("sub",
+                  # Mantissa = value / 2 ^ (floor log2 value)
+                  sb3.Op("div", sb3.Op("abs", get_param("float")), sb3.GetVar("2^exponent")),
+                  sb3.Known(1),
+                ),
+              get_param("2^mant_bits"),
+            )
+          ), index=2),
+        ]))
+      ])),
+    ]), sb3.BlockList([
+      # If infinite
+      # Get sign of infinity
+      # Seperate to other sign bit calculation as does not work with infinities as 1/(+/-)Infinity = (+/-)0
+      return_var.setValue(sb3.Op("bool_to_float", sb3.BoolOp("<", get_param("float"), sb3.Known(0))), index=0),
+      # Exponent is one more than the max for finite values
+      sb3.EditVar("set", "exponent", sb3.Op("add", get_param("max_exp"), sb3.Known(1))),
+      # Mantissa is zero
+      return_var.setValue(sb3.Known(0), index=2),
+    ])),
+
+    # Apply offset between actual exponent and what is stored in exponent bits
+    return_var.setValue(sb3.Op("add", sb3.GetVar("exponent"), get_param("max_exp")), index=1),
+  ]), ctx)
+
   # Checks if an ASCII alphabet character is uppercase or not
   # The caller is responsible for setting the costume back to the original
   ctx = addFunc("!helper_is_lowercase", ["char", "alphabet_pos"], sb3.BlockList([
     sb3.EditVar("set", "original",
-      sb3.GetOfList("atindex", ctx.cfg.lowercase_var, sb3.GetParam(localizeParam("alphabet_pos"))),
+      sb3.GetOfList("atindex", ctx.cfg.lowercase_var, get_param("alphabet_pos")),
     ),
     sb3.EditList("replaceat", ctx.cfg.lowercase_var,
-      sb3.GetParam(localizeParam("alphabet_pos")),
-      sb3.GetParam(localizeParam("char"))),
+      get_param("alphabet_pos"),
+      get_param("char")),
     sb3.SwitchCostume(sb3.Known(uppercase_costume_name)),
     sb3.SwitchCostume(sb3.GetList(ctx.cfg.lowercase_var)),
     sb3.EditList("replaceat", ctx.cfg.lowercase_var,
-      sb3.GetParam(localizeParam("alphabet_pos")),
+      get_param("alphabet_pos"),
       sb3.GetVar("original")),
     sb3.EditVar("set", ctx.cfg.return_var,
       sb3.Op("bool_to_float", sb3.BoolOp("=",
@@ -4294,7 +4414,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_str2scratch", ["input"], sb3.BlockList([
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Known("")),
-    sb3.EditVar("set", "ptr", sb3.GetParam(localizeParam("input"))),
+    sb3.EditVar("set", "ptr", get_param("input")),
     sb3.EditVar("set", "char", sb3.GetOfList("atindex", ctx.cfg.mem_var, sb3.GetVar("ptr"))),
     sb3.ControlFlow("until", sb3.BoolOp("=", sb3.GetVar("char"), sb3.Known(0)), sb3.BlockList([
       sb3.EditVar("set", ctx.cfg.return_var,
@@ -4310,14 +4430,14 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # True if the limit is high enough.
   enough_space = sb3.BoolOp("<",
-    sb3.Op("length_of", sb3.GetParam(localizeParam("input"))),
-    sb3.GetParam(localizeParam("count")))
+    sb3.Op("length_of", get_param("input")),
+    get_param("count"))
 
   # Converts a Scratch string to a C string.
   # Not meant to be used in C as it doesn't support Scratch strings.
   ctx = addFunc("!helper_scratch2str", ["input", "str", "count"], sb3.BlockList([
     # Subtract one here so that i can be one indexed (which letter_of is)
-    sb3.EditVar("set", "ptr", sb3.Op("sub", sb3.GetParam(localizeParam("str")), sb3.Known(1))),
+    sb3.EditVar("set", "ptr", sb3.Op("sub", get_param("str"), sb3.Known(1))),
     sb3.EditVar("set", "i", sb3.Known(1)),
     # TODO should use cost variable no idea why not setting
     sb3.EditVar("set", "cost", sb3.CostumeInfo("number")),
@@ -4329,21 +4449,21 @@ def addForeignFunctions(ctx: Context) -> Context:
       # Re-using the "char" variable for counting how many letters should be copied.
       # I think it makes sense, right?
       # Also, according to @Classified3D and the README, calculating the length twice is the fastest option.
-      sb3.EditVar("set", "char", sb3.Op("length_of", sb3.GetParam(localizeParam("input")))),
+      sb3.EditVar("set", "char", sb3.Op("length_of", get_param("input"))),
     ]),
     # Else
     sb3.BlockList([
       # The limit is lower than the inputted string.
       # Return False and reduce the letter count.
       # Doing -1 to account for the NULL at the end.
-      sb3.EditVar("set", "char", sb3.Op("sub", sb3.GetParam(localizeParam("count")), sb3.Known(1))),
+      sb3.EditVar("set", "char", sb3.Op("sub", get_param("count"), sb3.Known(1))),
     ])),
 
     sb3.ControlFlow("reptimes", sb3.GetVar("char"), sb3.BlockList([
       sb3.EditVar("set", "ascii",
         sb3.GetOfList("indexof",
           (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-          sb3.Op("letter_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))))),
+          sb3.Op("letter_of", sb3.GetVar("i"), get_param("input")))),
       sb3.ControlFlow("if",
         sb3.BoolOp("and",
           sb3.BoolOp(">", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1)),
@@ -4352,7 +4472,7 @@ def addForeignFunctions(ctx: Context) -> Context:
         sb3.BlockList([
           # TODO set costume back to original in after helper_scratch2str finishes
           sb3.ProcedureCall("!helper_is_lowercase", [
-            sb3.Op("letter_of", sb3.GetVar("i"), sb3.GetParam(localizeParam("input"))),
+            sb3.Op("letter_of", sb3.GetVar("i"), get_param("input")),
             sb3.Op("sub", sb3.GetVar("ascii"), sb3.Known(ord("A") - 1))
           ]),
           sb3.ControlFlow("if", sb3.BoolOp("=", sb3.GetVar(ctx.cfg.return_var), sb3.Known(1)), sb3.BlockList([
@@ -4380,18 +4500,18 @@ def addForeignFunctions(ctx: Context) -> Context:
   ]), ctx)
 
   ctx = addFunc("SB3_say_str", ["input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [get_param("input")]),
     sb3.Say(sb3.GetVar(ctx.cfg.return_var)),
   ]), ctx)
 
   ctx = addFunc("SB3_say_char", ["input"], sb3.BlockList([
     sb3.Say(sb3.GetOfList("atindex",
       (ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix),
-      sb3.GetParam(localizeParam("input")))),
+      get_param("input"))),
   ]), ctx)
 
   ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
-    sb3.Say(sb3.GetParam(localizeParam("input"))),
+    sb3.Say(get_param("input")),
   ]), ctx)
 
   # Wait at least duration seconds while rendering
@@ -4402,7 +4522,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("SB3_wait", ["duration"], sb3.BlockList([
     sb3.EditVar("set", "end", sb3.Op("add",
       sb3.DaysSince2000(),
-      sb3.Op("div", sb3.GetParam(localizeParam("duration")), sb3.Known(24*60*60)))),
+      sb3.Op("div", get_param("duration"), sb3.Known(24*60*60)))),
     # Always wait a frame, even for negative values, just like the wait block in scratch
     sb3.ProcedureCall("SB3_render", []),
     sb3.ControlFlow("until", sb3.BoolOp(">", sb3.DaysSince2000(), sb3.GetVar("end")), sb3.BlockList([
@@ -4412,20 +4532,20 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Wait at least duration seconds without rendering
   ctx = addFunc("SB3_wait_no_render", ["duration"], sb3.BlockList([
-    sb3.Wait(sb3.GetParam(localizeParam("duration"))),
+    sb3.Wait(get_param("duration")),
   ]), ctx)
 
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
   # count  (int): The maximum length of the string.
   ctx = addFunc("SB3_ask_str", ["output", "input", "count"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [get_param("input")]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.ProcedureCall("!helper_scratch2str", [
       sb3.GetAnswer(),
-      sb3.GetParam(localizeParam("output")),
-      sb3.GetParam(localizeParam("count"))
+      get_param("output"),
+      get_param("count")
     ]),
     # Return value is set by scratch2str.
   ]), ctx)
@@ -4433,12 +4553,12 @@ def addForeignFunctions(ctx: Context) -> Context:
   # output (str): The answer the user provided.
   # input  (str): The question to display in the text bubble.
   ctx = addFunc("SB3_ask_str_unsafe", ["output", "input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [get_param("input")]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.ProcedureCall("!helper_scratch2str", [
       sb3.GetAnswer(),
-      sb3.GetParam(localizeParam("output")),
+      get_param("output"),
       sb3.Known("Infinity"),
     ]),
     # Return value is set by scratch2str. It's always going to be 1.
@@ -4446,11 +4566,11 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   # Same as SB3_ask_str, but it outputs a double.
   ctx = addFunc("SB3_ask_dbl", ["output", "input"], sb3.BlockList([
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("input"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [get_param("input")]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
 
     sb3.EditVar("set", "char", sb3.Op("str_to_float", sb3.GetAnswer())), # (answer + 0); casts strings to floats.
-    sb3.EditList("replaceat", ctx.cfg.mem_var, sb3.GetParam(localizeParam("output")), sb3.GetVar("char")),
+    sb3.EditList("replaceat", ctx.cfg.mem_var, get_param("output"), sb3.GetVar("char")),
 
     # Return 1 if successful (casted value == original value), else 0
     sb3.EditVar("set", ctx.cfg.return_var, sb3.Op("bool_to_float", sb3.BoolOp("=", sb3.GetAnswer(), sb3.GetVar("char")))),
@@ -4466,7 +4586,7 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   ctx = addFunc("_exit", ["status"], sb3.BlockList([
     # TODO: this would be logged to stdout
-    sb3.Ask(sb3.Op("join", sb3.Known("exit called with status "), sb3.GetParam(localizeParam("status")))),
+    sb3.Ask(sb3.Op("join", sb3.Known("exit called with status "), get_param("status"))),
     sb3.StopScript("stopall"),
   ]), ctx)
 
@@ -4481,7 +4601,7 @@ def addForeignFunctions(ctx: Context) -> Context:
     # Return the old pointer
     sb3.EditVar("set", ctx.cfg.return_var, sb3.GetVar(ctx.cfg.heap_pointer_var)),
     # Increment the heap pointer
-    sb3.EditVar("change", ctx.cfg.heap_pointer_var, sb3.GetParam(localizeParam("incr"))),
+    sb3.EditVar("change", ctx.cfg.heap_pointer_var, get_param("incr")),
     # TODO check for out of memory, if so return -1 and set @errno
   ]), ctx)
 
@@ -4489,7 +4609,7 @@ def addForeignFunctions(ctx: Context) -> Context:
   ctx = addFunc("write", ["file", "buf", "len"], sb3.BlockList([
     sb3.Ask(sb3.Known("write called")),
     # Note that str2scratch doesn't handle the newline (hex 0A), instead converting it to "\0A".
-    sb3.ProcedureCall("!helper_str2scratch", [sb3.GetParam(localizeParam("buf"))]),
+    sb3.ProcedureCall("!helper_str2scratch", [get_param("buf")]),
     sb3.Ask(sb3.GetVar(ctx.cfg.return_var)),
   ]), ctx)
 
