@@ -18,7 +18,7 @@ from . import target
 from . import parser
 from . import ir
 
-INTERMEDIATE_MAX_BITS = 53   # Max bits scratch's doubles can store
+INTERMEDIATE_MAX_BITS = 53   # Max bits able to be stored precisely as an integer by scratch's doubles
 VARIABLE_MAX_BITS = 48       # Maximum amount of bits to store in a fp variable. Maximum is 48 because while scratch's doubles support
                              # up to 53 bits, some operations require extra precision. This should be more than the regular byte size (8)
                              # and more than PTR_SIZE_BITS (currently 32, see below)
@@ -28,12 +28,6 @@ BINOP_LOOKUP_BITS = 8        # Amount of bits to use for AND/OR/XOR tables, crea
 EXIT_CALL_ID = 0             # Jump table call ID of corresponding to exit
 ENTRY_CALL_ID = 1            # Jump table call ID of corresponding to entry
 START_STACK_RESET_ID = 2     # Starting jump table call ID of stack reset
-
-@dataclass
-class DebugInfo:
-  """Info about a scratch project which can be used in future compilations for optimization"""
-  debug_branch_func_map: str | None = None
-  debug_branch_log: str | None = None
 
 @dataclass
 class Config:
