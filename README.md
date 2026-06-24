@@ -143,12 +143,6 @@ minify options:
 
 See [data/targets](llvm2scratch/data/targets).
 
-## Planning
-
-- Opt: remove Repeat(Known(1))
-- Opt: `set a (a + n)` -> `change a by n`
-- Opt: `set a (a * 2)` -> `change a by a`
-
 ## Proofs
 
 ### Multiplication
