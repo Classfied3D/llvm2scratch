@@ -2548,15 +2548,15 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
             # IEEE 754 binary formats. See https://en.wikipedia.org/wiki/IEEE_754
             match instr.value.type:
-              case ir.HalfTy:
+              case ir.HalfTy():
                 # binary16
                 exp_bits = 5
                 mant_bits = 10
-              case ir.FloatTy:
+              case ir.FloatTy():
                 # binary32
                 exp_bits = 8
                 mant_bits = 23
-              case ir.DoubleTy:
+              case ir.DoubleTy():
                 # binary64
                 exp_bits = 11
                 mant_bits = 52
@@ -2573,7 +2573,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             sign, exp, mant = ieee_components.getAllValues(3).vals
 
             match instr.value.type:
-              case ir.DoubleTy:
+              case ir.DoubleTy():
                 assert VARIABLE_MAX_BITS <= mant_bits
                 snd_mant_bits = mant_bits - VARIABLE_MAX_BITS
                 res_val = IdxbleValue([
