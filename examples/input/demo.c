@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 static int a = 7;
-static long long ll_a = 149876583280495765;
+static unsigned long long ll_a = 149876583280495765;
 static char *message = "loldefault";
 
 typedef struct SensorData {
@@ -12,7 +12,11 @@ typedef struct SensorData {
 
 int add_one(int num) { return num + 1; }
 
-long long add_one_ll(long long num) { return num + 1; }
+unsigned long long add_one_ll(unsigned long long num) {
+  if (num == 66) SB3_say_str("really?");
+  if (num > 100) SB3_say_str("scary number omg");
+  return num + 1;
+}
 
 void do_nothing(void) {}
 

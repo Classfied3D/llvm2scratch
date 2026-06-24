@@ -1460,11 +1460,11 @@ def binOp(op: Literal["and", "or", "xor"], lft: sb3.Value, rgt: sb3.Value,
     ctx.needs_xor_lut |= op == "xor"
     return binOpWithUnknownViaLookupTable(op, lft, rgt, width, ctx), ctx
 
-def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond, cfg: Config) -> sb3.BooleanValue:
-  special_signed_handling = cfg.compiler_opt and \
+def intCompare(lft: sb3.Value, rgt: sb3.Value, width: int, mode: ir.ICmpCond, ctx: Context) -> sb3.BooleanValue:
+  special_signed_handling = ctx.cfg.compiler_opt and \
                             mode in {ir.ICmpCond.Sge, ir.ICmpCond.Sle} and \
-                            not isinstance(left, sb3.Known) and \
-                            not isinstance(right, sb3.Known)
+                            not isinstance(lft, sb3.Known) and \
+                            not isinstance(rgt, sb3.Known)
 
   modulus = -(2 ** width)
 
@@ -1479,41 +1479,90 @@ def intCompare(left: sb3.Value, right: sb3.Value, width: int, mode: ir.ICmpCond,
 
   if not special_signed_handling:
     if mode in {ir.ICmpCond.Sgt, ir.ICmpCond.Sge, ir.ICmpCond.Slt, ir.ICmpCond.Sle}:
-      left = reverse_twos_complement(left)
-      right = reverse_twos_complement(right)
+      lft = reverse_twos_complement(lft)
+      rgt = reverse_twos_complement(rgt)
 
     match mode:
       case ir.ICmpCond.Eq:
-        return sb3.BoolOp("=", left, right)
+        return sb3.BoolOp("=", lft, rgt)
       case ir.ICmpCond.Ne:
-        return sb3.BoolOp("not", sb3.BoolOp("=", left, right))
+        return sb3.BoolOp("not", sb3.BoolOp("=", lft, rgt))
       case ir.ICmpCond.Ugt | ir.ICmpCond.Sgt:
-        return sb3.BoolOp(">", left, right)
+        return sb3.BoolOp(">", lft, rgt)
       case ir.ICmpCond.Ult | ir.ICmpCond.Slt:
-        return sb3.BoolOp("<", left, right)
+        return sb3.BoolOp("<", lft, rgt)
       case ir.ICmpCond.Uge | ir.ICmpCond.Sge:
-        if isinstance(left, sb3.Known):
-          return sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(left) + 1), right)
-        elif isinstance(right, sb3.Known):
-          return sb3.BoolOp(">", left, sb3.Known(sb3.scratchCastToNum(right) - 1))
+        if isinstance(lft, sb3.Known):
+          return sb3.BoolOp(">", sb3.Known(sb3.scratchCastToNum(lft) + 1), rgt)
+        elif isinstance(rgt, sb3.Known):
+          return sb3.BoolOp(">", lft, sb3.Known(sb3.scratchCastToNum(rgt) - 1))
         else:
-          return sb3.BoolOp("not", sb3.BoolOp("<", left, right))
+          return sb3.BoolOp("not", sb3.BoolOp("<", lft, rgt))
       case ir.ICmpCond.Ule | ir.ICmpCond.Sle:
-        if isinstance(left, sb3.Known):
-          return sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(left) - 1), right)
-        elif isinstance(right, sb3.Known):
-          return sb3.BoolOp("<", left, sb3.Known(sb3.scratchCastToNum(right) + 1))
+        if isinstance(lft, sb3.Known):
+          return sb3.BoolOp("<", sb3.Known(sb3.scratchCastToNum(lft) - 1), rgt)
+        elif isinstance(rgt, sb3.Known):
+          return sb3.BoolOp("<", lft, sb3.Known(sb3.scratchCastToNum(rgt) + 1))
         else:
-          return sb3.BoolOp("not", sb3.BoolOp(">", left, right))
+          return sb3.BoolOp("not", sb3.BoolOp(">", lft, rgt))
       case _:
         raise CompException(f"icmp does not support comparsion mode {mode}")
   else:
     # We can skip adding a number for greater equal/less equal by adjusting the values
     # of the two's complement reversal
     if mode is ir.ICmpCond.Sge:
-      return sb3.BoolOp(">", reverse_twos_complement(left), reverse_twos_complement_and_sub_half(right))
+      return sb3.BoolOp(">", reverse_twos_complement(lft), reverse_twos_complement_and_sub_half(rgt))
     else:
-      return sb3.BoolOp("<", reverse_twos_complement_and_sub_half(left), reverse_twos_complement(right))
+      return sb3.BoolOp("<", reverse_twos_complement_and_sub_half(lft), reverse_twos_complement(rgt))
+
+def largeIntCompare(
+  lft: IdxbleValue, rgt: IdxbleValue, mode: ir.ICmpCond, ctx: Context, res_var: Variable | None = None,
+) -> tuple[sb3.BooleanValue | None, sb3.BlockList]:
+  """
+  If res_var is provided, then the function may store the resultant boolean as 0 or 1 in res_var, which can save
+  a set var. If this happens, then None will be returned for the resultant value.
+  """
+
+  var = res_var if res_var is not None else Variable(genTempVar(ctx), "special_var", None)
+
+  match mode:
+    case ir.ICmpCond.Eq:
+      # Make sure to compare the more volatile LSB first with AND short circuiting on TW
+      # LSB is stored at the front as we use little endian byte order
+      current = sb3.BoolOp("=", lft.vals[-1], rgt.vals[-1])
+      for l, r in reversed(list(zip(lft.vals[:-1], rgt.vals[:-1]))):
+        current = sb3.BoolOp("and", sb3.BoolOp("=", l, r), current)
+      return current, sb3.BlockList()
+
+    case ir.ICmpCond.Ne:
+      # TODO OPT: would also be possible to use better short circuiting using OR but this would
+      # require an extra NOT per branch (only optimal on TW)
+      is_eq, blocks = largeIntCompare(lft, rgt, ir.ICmpCond.Eq, ctx)
+      assert is_eq is not None
+      return sb3.BoolOp("not", is_eq), blocks
+
+    case ir.ICmpCond.Ugt | ir.ICmpCond.Ult:
+      # If the 1st values are equal, compare the 2nd values, etc
+      comp = ">" if mode == ir.ICmpCond.Ugt else "<"
+      compare_at_idx = lambda i: sb3.BlockList(
+        var.setValue(sb3.Op("bool_to_float", sb3.BoolOp(comp, lft.vals[i], rgt.vals[i])))
+      )
+      # LSB is stored at the front as we use little endian byte order
+      if_branch = compare_at_idx(0)
+
+      # Iterate over everything except the LSB
+      for i in range(1, len(lft.vals)):
+        if_branch = sb3.BlockList(
+          sb3.ControlFlow("if_else", sb3.BoolOp("=", lft.vals[i], rgt.vals[i]),
+            if_branch, compare_at_idx(i))
+        )
+
+      if res_var is None:
+        return sb3.BoolOp("=", var.getValue(), sb3.Known(1)), if_branch
+      return None, if_branch
+
+    case _:
+      raise CompException(f"icmp does not support comparsion mode {mode} for idxble values")
 
 def offsetStackSize(stack_size_var: str, offset: int) -> sb3.Value:
   ptr = sb3.GetVar(stack_size_var)
@@ -2620,19 +2669,18 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
                             f"integers or pointers, got type {type(instr.left.type)}")
 
       width = instr.left.type.width if isinstance(instr.left.type, ir.IntegerTy) else PTR_WIDTH_BITS
-      # TODO FIX: support larger values
-      if width > VARIABLE_MAX_BITS:
-        raise CompException(f"Instruction icmp currently supports "
-                            f"integers with <= {VARIABLE_MAX_BITS} bits")
 
-      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
+      if isinstance(lft, sb3.Value):
+        assert isinstance(rgt, sb3.Value)
+        result = intCompare(lft, rgt, width, instr.cond, ctx)
+      else:
+        assert isinstance(rgt, IdxbleValue)
+        result, blocks = largeIntCompare(lft, rgt, instr.cond, ctx, res_var)
 
-      result = intCompare(lft, rgt, width, instr.cond, ctx.cfg)
-
-      # Bool to float will cast to an int if needed (so the bool is treated as 1 instead of 'true')
-      casted_result = sb3.Op("bool_to_float", result)
-
-      blocks.add(res_var.setValue(casted_result))
+      if result is not None:
+        # Bool to float will cast to an int if needed (so the bool is treated as 1 instead of 'true')
+        casted_result = sb3.Op("bool_to_float", result)
+        blocks.add(res_var.setValue(casted_result))
 
     case ir.FCmp(): # Compare two float values
       lft = transValue(instr.left, ctx, bctx)
@@ -3229,7 +3277,7 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       assert isinstance(ty, ir.IntegerTy)
       assert result is not None
 
-      cond = intCompare(lft, rgt, ty.width, mode, ctx.cfg)
+      cond = intCompare(lft, rgt, ty.width, mode, ctx)
       blocks.add(sb3.BlockList([
         sb3.ControlFlow("if_else", cond, sb3.BlockList([result.setValue(lft)]), sb3.BlockList([result.setValue(rgt)]))
       ]))
