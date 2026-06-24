@@ -614,7 +614,7 @@ def parseTypeConstantTokens(tokens: list[str], structs: dict[str, StructTy], fun
 
   elif tokens[0] == "insertelement":
     agg, el, idx = getConstExprBracketValues(tokens[1], 3, structs, func_names)
-    return ConstExprVal(ty, InsertElement(agg, el, idx)), tokens[2:]
+    return ConstExprVal(ty, InsertElement(ResultLocalVar(""), agg, el, idx)), tokens[2:]
 
   elif tokens[0] == "shufflevector":
     fst_vector, snd_vector, mask_vector = getConstExprBracketValues(tokens[1], 3, structs, func_names)
