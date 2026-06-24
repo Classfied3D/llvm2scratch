@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 from enum import Enum
 
+import warnings
 import zipfile
 import hashlib
 import random
@@ -189,8 +190,8 @@ class ScratchContext:
       assert curr_id is not None
 
       if last_id is not None and block.isStart():
-        raise ScratchCompException(f"Starting block {type(block)} has blocks before it")
-      if end: raise ScratchCompException(f"Reached ending block {type(block)} but more blocks are left")
+        raise ScratchException(f"Starting block {type(block)} has blocks before it")
+      if end: raise ScratchException(f"Reached ending block {type(block)} but more blocks are left")
 
       end = block.isEnd()
       meta = BlockMeta(last_id, next_id)
@@ -231,13 +232,13 @@ class ScratchContext:
     else:
       id = self.lists[list_name][0]
       if len(default_val) > 0:
-        if len(self.lists[list_name][1]) > 0: raise ScratchCompException(f"List {list_name} given default value twice")
+        if len(self.lists[list_name][1]) > 0: raise ScratchException(f"List {list_name} given default value twice")
         self.lists[list_name] = (id, default_val)
     return id
 
   def addFunc(self, func_name: str, param_ids: list[Id], run_without_refresh: bool) -> None:
     if func_name in self.funcs:
-      raise ScratchCompException(f"Function {func_name} registered twice")
+      raise ScratchException(f"Function {func_name} registered twice")
     self.funcs[func_name] = (param_ids, run_without_refresh)
 
   def addBroadcast(self, name: str) -> Id:
@@ -320,7 +321,7 @@ class ScratchCast(Enum):
 @dataclass
 class Block():
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
+    raise ScratchException("Cannot export for generic type 'Block'; must be a derived class")
 
   def isStart(self) -> bool:
     return False
@@ -330,7 +331,7 @@ class Block():
 
   def stringify(self, sb: bool=False) -> str:
     """Convert to readable text. If "sb" is True then output text compatible with scratchblocks"""
-    raise ScratchCompException("Cannot export for generic type 'Block'; must be a derived class")
+    raise ScratchException("Cannot export for generic type 'Block'; must be a derived class")
 
 @dataclass
 class StartBlock(Block):
@@ -346,10 +347,10 @@ class EndBlock(Block):
 class LateBlock(Block):
   """A block which requires info about the whole program to be added e.g. the id of function parameters which might not yet be defined"""
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raise ScratchCompException("Cannot call getRaw on a LateBlock because it evaluates after other blocks, call getRawLate")
+    raise ScratchException("Cannot call getRaw on a LateBlock because it evaluates after other blocks, call getRawLate")
 
   def getRawLate(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
-    raise ScratchCompException("Cannot export for generic type 'LateBlock'; must be a derived class")
+    raise ScratchException("Cannot export for generic type 'LateBlock'; must be a derived class")
 
 @dataclass
 class BlockMeta:
@@ -393,7 +394,7 @@ class BlockList:
 
     self.end = end
     for block in blocks:
-      if self.end: raise ScratchCompException("List of blocks contains blocks after an ending block")
+      if self.end: raise ScratchException("List of blocks contains blocks after an ending block")
       self.end |= block.isEnd()
     self.blocks = blocks
 
@@ -404,9 +405,9 @@ class BlockList:
 
     if self.end:
       if isinstance(blocks, Block):
-        raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks}")
+        raise ScratchException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks}")
       elif len(blocks.blocks) > 0:
-        raise ScratchCompException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks.blocks[0]}")
+        raise ScratchException(f"Reached ending block {self.blocks[-1]}, attempted to add {blocks.blocks[0]}")
 
     if isinstance(blocks, Block):
       self.blocks.append(blocks)
@@ -433,17 +434,17 @@ class Value:
   """Something that can be in a blocks input e.g. x in Say(x)"""
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     """Gets the json that can be put in the "inputs" field of a block"""
-    raise ScratchCompException("Cannot export for generic type 'Value'; must be a derived class")
+    raise ScratchException("Cannot export for generic type 'Value'; must be a derived class")
 
   def stringify(self, sb: bool=False) -> str:
     """Convert to readable text. If "sb" is True than output text compatible with scratchblocks"""
-    raise ScratchCompException("Cannot stringify for generic type 'Value'; must be a derived class")
+    raise ScratchException("Cannot stringify for generic type 'Value'; must be a derived class")
 
 @dataclass
 class BooleanValue(Value):
   """A boolean value (a diamond shaped block)"""
   def getRawBoolValue(self, parent: str, ctx: ScratchContext) -> tuple[list | None, ScratchContext]:
-    raise ScratchCompException("Cannot export for generic type 'BooleanValue'; must be a derived class")
+    raise ScratchException("Cannot export for generic type 'BooleanValue'; must be a derived class")
 
 @dataclass
 class Known(Value):
@@ -451,6 +452,7 @@ class Known(Value):
   known: str | float | bool
 
   def __post_init__(self):
+    assert not isinstance(self.known, bool)
     if isinstance(self.known, int):
       self.known = float(self.known)
 
@@ -458,7 +460,7 @@ class Known(Value):
     return self.known.__repr__()
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
-    raw = self.getRawVarInit(preserve_booleans=False)
+    raw = self.getRawVarInit(preserve_booleans=False, allow_negative_zero=True)
     if ctx.cfg.use_hex_if_smaller and cast == ScratchCast.TO_NUM and isinstance(raw, int) and raw > 0:
       base10_digits = math.ceil(math.log10(raw + 1))
       # Including 0x prefix
@@ -470,18 +472,26 @@ class Known(Value):
 
     return [1, val], ctx
 
-  def getRawVarInit(self, preserve_booleans: bool=True) -> str | float | bool:
+  def getRawVarInit(self, preserve_booleans: bool=True, allow_negative_zero: bool=False) -> str | float | bool:
     """
     Get the raw value to set a var to when it starts with this value
     preserve_booleans - if enabled store booleans as strings, otherwise
     cast to int
+    allow_negative_zero - if enabled then do not throw an error when -0.0
+    is passed to the function. Blocks can hold -0.0 but scratch's variables
+    cannot.
     """
     if preserve_booleans and isinstance(self.known, bool):
       return "true" if self.known else "false"
 
     raw = self.known
     if not isinstance(self.known, str):
-      if math.isfinite(float(raw)) and int(raw) == float(raw):
+      if str(float(raw)) == "-0.0":
+        if not allow_negative_zero:
+          warnings.warn("Variable initializers, etc cannot store negative "
+                        "zero without side effects of storing as a string", ScratchWarning)
+        raw = "-0"
+      elif math.isfinite(float(raw)) and int(raw) == float(raw):
         raw = int(raw)
       else:
         raw = float(raw)
@@ -514,7 +524,7 @@ class KnownBool(Known, BooleanValue):
       return None, ctx # If false
     return BoolOp("not", KnownBool(False)).getRawBoolValue(parent, ctx)
 
-  def getRawVarInit(self, preserve_booleans=True) -> str:
+  def getRawVarInit(self, preserve_booleans=True, allow_negative_zero: bool=False) -> str:
     """Get the raw value to set a var to when it starts with this value"""
     return "true" if self.known else "false"
 
@@ -694,18 +704,18 @@ class ControlFlow(Block):
 
   def __post_init__(self):
     if self.op == "forever" and self.value is not None:
-      raise ScratchCompException("Forever cannot accept a value")
+      raise ScratchException("Forever cannot accept a value")
     elif self.op != "forever" and self.value is None:
-      raise ScratchCompException(f"{self.op} requires a value!")
+      raise ScratchException(f"{self.op} requires a value!")
 
     if self.op in {"if", "if_else", "until", "while"} and not isinstance(self.value, BooleanValue):
-      raise ScratchCompException("A regular value cannot be placed in a boolean accepting block")
+      raise ScratchException("A regular value cannot be placed in a boolean accepting block")
 
     if self.op == "if_else" and self.else_blocks is None:
-      raise ScratchCompException("An if-else statement must contain blocks in the else case")
+      raise ScratchException("An if-else statement must contain blocks in the else case")
 
     if self.op == "for_each" and self.var is None:
-      raise ScratchCompException("A for-each block requires a variable input")
+      raise ScratchException("A for-each block requires a variable input")
 
   def getRaw(self, my_id: Id, ctx: ScratchContext) -> tuple[dict, ScratchContext]:
     op, val = self.op, self.value
@@ -947,7 +957,7 @@ class Op(Value):
     given_one_op = self.right is None
 
     if takes_one_op != given_one_op:
-      raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
+      raise ScratchException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
   def getRawValue(self, parent: Id, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     # We don't need to round the number if it gets casted to int anyway
@@ -1039,12 +1049,12 @@ class BoolOp(BooleanValue):
   def __post_init__(self):
     if (not isinstance(self.left, BooleanValue) and self.op in ["not", "and", "or"]) or \
        (not isinstance(self.right, BooleanValue) and self.op in ["and", "or"]):
-      raise ScratchCompException(f"BoolOp {self.op} only accepts booleans")
+      raise ScratchException(f"BoolOp {self.op} only accepts booleans")
 
     given_one_op = self.right is None
     takes_one_op = self.op == "not"
     if takes_one_op != given_one_op:
-      raise ScratchCompException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
+      raise ScratchException(f"{self.op} takes {1 if takes_one_op else 2} operands, given {1 if given_one_op else 2}")
 
   def getRawValue(self, parent: str, ctx: ScratchContext, cast: ScratchCast) -> tuple[list, ScratchContext]:
     id = ctx.genId()
@@ -1233,14 +1243,14 @@ class EditList(Block):
 
     if self.index is not None:
       if self.op in ["addto", "deleteall"]:
-        raise ScratchCompException(f"{self.op} does not support an index value")
+        raise ScratchException(f"{self.op} does not support an index value")
       raw_index, ctx = self.index.getRawValue(my_id, ctx, ScratchCast.TO_NUM)
       inputs.update({"INDEX": raw_index})
 
     if self.item is not None:
       raw_item, ctx = self.item.getRawValue(my_id, ctx, ScratchCast.TO_STR)
       if self.op in ["deleteat", "deleteall"]:
-        raise ScratchCompException(f"{self.op} does not support an item")
+        raise ScratchException(f"{self.op} does not support an item")
       inputs.update({"ITEM": raw_item})
 
     return {
@@ -1385,8 +1395,12 @@ class GetParam(Value):
       return f"({name}::custom)"
 
 
-class ScratchCompException(Exception):
-  """Exception when compiling to scratch"""
+class ScratchException(Exception):
+  """Exception when serializing to scratch"""
+  pass
+
+class ScratchWarning(Warning):
+  """Warning when serializing to scratch"""
   pass
 
 def sanitizeProcName(name: str, is_param: bool) -> str:

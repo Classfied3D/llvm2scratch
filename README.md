@@ -209,8 +209,7 @@ implies that
 f(0) = 2
 f(n + 1) = f(n)^2
 
-because f(0) = 2^(2^0) = 2^1 = 2
-=> true for n = 0
+f(0) = 2^(2^0) = 2^1 = 2
 
 assume true for x = k => f(k) = 2^(2^k)
 f(k + 1) = 2^(2^(k+1))
@@ -218,7 +217,5 @@ f(k + 1) = 2^(2^k * 2)
 f(k + 1) = (2^(2^k))^2
 f(k + 1) = f(k)^2
 => if true for n = k, then true for n = k + 1
-
-as true for n = 0, true for n = 1, n = 2, etc, so true for all n ∈ Z+0
 ```
 - Multipling by a power of 2 never results in floating point error as *2 = +1 to the exponent

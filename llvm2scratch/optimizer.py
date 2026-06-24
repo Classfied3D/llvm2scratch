@@ -231,9 +231,21 @@ def partialSimplifyValue(value: sb3.Value, lookup_func: LookupFunc) -> tuple[sb3
           case "mul":
             value = sb3.Known(left * right)
           case "div":
-            value = sb3.Known(left / right)
+            if right != 0:
+              value = sb3.Known(left / right)
+            elif left == 0:
+              # 0 / 0 = nan
+              value = sb3.Known(float("nan"))
+            else:
+              # Detect negative zero, etc
+              get_sign = lambda x: (-1, 1)[str(float(x))[0] == "-"]
+              # 1 / 0 = inf, -1 / 0 = -inf, 1 / -0 = -inf, etc
+              value = sb3.Known(float("inf") * get_sign(left) * get_sign(right))
           case "mod":
-            value = sb3.Known(left % right)
+            if right != 0:
+              value = sb3.Known(left % right)
+            else:
+              value = sb3.Known(float("nan"))
           case "bool_to_float" | "str_to_float":
             value = sb3.Known(left)
           case "abs":

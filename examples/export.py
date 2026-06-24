@@ -10,7 +10,7 @@ def main():
     ProcedureDef("main", ["%1", "%2"]),
     EditList("deleteall", "hello2", None, None),
     EditList("insertat", "hello2", Known(5), Op("div", GetVar("hello3"), Known(30))),
-    EditVar("set", "hello2", Op("add", Known(2), Known("0x245"))),
+    EditVar("set", "hello2", Op("add", Known(float("-0")), Known("0x245"))),
     ControlFlow("while", BoolOp("=", Op("div", GetVar("hello3"), Known(30)), Known(0)), BlockList([
       EditVar("set", "hello2", Known(10)),
     ])),
