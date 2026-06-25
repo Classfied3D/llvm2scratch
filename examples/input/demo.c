@@ -14,7 +14,7 @@ int add_one(int num) { return num + 1; }
 
 unsigned long long add_one_ll(unsigned long long num) {
   if (num == 66) SB3_say_str("really?");
-  if (num > 100) SB3_say_str("scary number omg");
+  if (num >= 100) SB3_say_str("scary number omg");
   return num + 1;
 }
 

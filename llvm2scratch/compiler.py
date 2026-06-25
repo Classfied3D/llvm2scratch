@@ -1516,7 +1516,7 @@ def intCompare(lft: sb3.Value, rgt: sb3.Value, width: int, mode: ir.ICmpCond, ct
       return sb3.BoolOp("<", reverse_twos_complement_and_sub_half(lft), reverse_twos_complement(rgt))
 
 def largeIntCompare(
-  lft: IdxbleValue, rgt: IdxbleValue, mode: ir.ICmpCond, ctx: Context, res_var: Variable | None = None,
+  lft: IdxbleValue, rgt: IdxbleValue, width: int, mode: ir.ICmpCond, ctx: Context, res_var: Variable | None = None,
 ) -> tuple[sb3.BooleanValue | None, sb3.BlockList]:
   """
   If res_var is provided, then the function may store the resultant boolean as 0 or 1 in res_var, which can save
@@ -1537,25 +1537,26 @@ def largeIntCompare(
     case ir.ICmpCond.Ne:
       # TODO OPT: would also be possible to use better short circuiting using OR but this would
       # require an extra NOT per branch (only optimal on TW)
-      is_eq, blocks = largeIntCompare(lft, rgt, ir.ICmpCond.Eq, ctx)
+      is_eq, blocks = largeIntCompare(lft, rgt, width, ir.ICmpCond.Eq, ctx)
       assert is_eq is not None
       return sb3.BoolOp("not", is_eq), blocks
 
-    case ir.ICmpCond.Ugt | ir.ICmpCond.Ult:
+    case ir.ICmpCond.Ugt | ir.ICmpCond.Ult | ir.ICmpCond.Uge | ir.ICmpCond.Ule:
       # If the 1st values are equal, compare the 2nd values, etc
-      comp = ">" if mode == ir.ICmpCond.Ugt else "<"
-      compare_at_idx = lambda i: sb3.BlockList(
-        var.setValue(sb3.Op("bool_to_float", sb3.BoolOp(comp, lft.vals[i], rgt.vals[i])))
-      )
+      comp = ">" if mode in {ir.ICmpCond.Ugt, ir.ICmpCond.Ule} else "<"
       # LSB is stored at the front as we use little endian byte order
-      if_branch = compare_at_idx(0)
+      # For the final check we will also return true if the words are equal (in uge/ule mode),
+      # as they have been equal so far
+      if_branch = sb3.BlockList(
+        var.setValue(sb3.Op("bool_to_float", intCompare(lft.vals[0], rgt.vals[0], min(width, VARIABLE_MAX_BITS), mode, ctx))))
 
       # Iterate over everything except the LSB
       for i in range(1, len(lft.vals)):
         if_branch = sb3.BlockList(
           sb3.ControlFlow("if_else", sb3.BoolOp("=", lft.vals[i], rgt.vals[i]),
-            if_branch, compare_at_idx(i))
-        )
+            if_branch, sb3.BlockList(
+              var.setValue(sb3.Op("bool_to_float", sb3.BoolOp(comp, lft.vals[i], rgt.vals[i])))
+        )))
 
       if res_var is None:
         return sb3.BoolOp("=", var.getValue(), sb3.Known(1)), if_branch
@@ -2675,7 +2676,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
         result = intCompare(lft, rgt, width, instr.cond, ctx)
       else:
         assert isinstance(rgt, IdxbleValue)
-        result, blocks = largeIntCompare(lft, rgt, instr.cond, ctx, res_var)
+        result, blocks = largeIntCompare(lft, rgt, width, instr.cond, ctx, res_var)
 
       if result is not None:
         # Bool to float will cast to an int if needed (so the bool is treated as 1 instead of 'true')
