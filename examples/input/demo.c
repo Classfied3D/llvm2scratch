@@ -2,7 +2,8 @@
 #include <stdint.h>
 
 static int a = 7;
-static unsigned long long ll_a = 149876583280495765;
+static unsigned long long ull_a = 149876583280495765;
+static long long ll_a = -149876583280495765;
 static char *message = "loldefault";
 
 typedef struct SensorData {
@@ -12,9 +13,15 @@ typedef struct SensorData {
 
 int add_one(int num) { return num + 1; }
 
-unsigned long long add_one_ll(unsigned long long num) {
-  if (num == 66) SB3_say_str("really?");
-  if (num >= 100) SB3_say_str("scary number omg");
+unsigned long long add_one_ull(unsigned long long num) {
+  if (num == 66) SB3_ask_str(0, "really?", 0);
+  if (num >= 100) SB3_ask_str(0, "scary number omg", 0);
+  return num + 1;
+}
+
+long long add_one_ll(long long num) {
+  if (num <= -100) SB3_ask_str(0, "very negative of you", 0);
+  if (num > 100) SB3_ask_str(0, "scary number omg", 0);
   return num + 1;
 }
 
@@ -22,7 +29,6 @@ void do_nothing(void) {}
 
 int test_branch(int num) {
   do_nothing();
-  ll_a = add_one_ll(ll_a);
 
   int a = 3;
 
@@ -71,6 +77,9 @@ void numberize(char *str) {
 }
 
 int main(void) {
+  ull_a = add_one_ull(ull_a);
+  ll_a = add_one_ll(ll_a);
+
   a -= 4;
   a *= 2;
   a /= -3;
@@ -149,7 +158,7 @@ int main(void) {
   o += 2;
   o -= 5;
 
-  ll_a += 55;
+  ull_a += 55;
 
   // SB3_ask_dbl works a bit like scanf
   double answer_dbl;

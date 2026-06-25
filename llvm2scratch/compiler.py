@@ -1524,6 +1524,7 @@ def largeIntCompare(
   """
 
   var = res_var if res_var is not None else Variable(genTempVar(ctx), "special_var", None)
+  set_var = lambda val: sb3.BlockList(var.setValue(sb3.Op("bool_to_float", val)))
 
   match mode:
     case ir.ICmpCond.Eq:
@@ -1547,20 +1548,46 @@ def largeIntCompare(
       # LSB is stored at the front as we use little endian byte order
       # For the final check we will also return true if the words are equal (in uge/ule mode),
       # as they have been equal so far
-      if_branch = sb3.BlockList(
-        var.setValue(sb3.Op("bool_to_float", intCompare(lft.vals[0], rgt.vals[0], min(width, VARIABLE_MAX_BITS), mode, ctx))))
+      if_branch = set_var(intCompare(lft.vals[0], rgt.vals[0], min(width, VARIABLE_MAX_BITS), mode, ctx))
 
       # Iterate over everything except the LSB
       for i in range(1, len(lft.vals)):
         if_branch = sb3.BlockList(
           sb3.ControlFlow("if_else", sb3.BoolOp("=", lft.vals[i], rgt.vals[i]),
-            if_branch, sb3.BlockList(
-              var.setValue(sb3.Op("bool_to_float", sb3.BoolOp(comp, lft.vals[i], rgt.vals[i])))
+            if_branch, set_var(sb3.BoolOp(comp, lft.vals[i], rgt.vals[i])
         )))
 
       if res_var is None:
         return sb3.BoolOp("=", var.getValue(), sb3.Known(1)), if_branch
       return None, if_branch
+
+    case ir.ICmpCond.Sgt | ir.ICmpCond.Slt | ir.ICmpCond.Sge | ir.ICmpCond.Sle:
+      assert len(lft.vals) > 1
+
+      # Perform a signed comparison on the first word
+      # We've already checked for equality at this point so we'll use the correponding comparison without equality
+      signed_mode = ir.ICmpCond.Sgt if mode in {ir.ICmpCond.Sgt, ir.ICmpCond.Sge} else ir.ICmpCond.Slt
+      signed_comp = set_var(intCompare(lft.vals[-1], rgt.vals[-1], width % VARIABLE_MAX_BITS, signed_mode, ctx))
+
+      # If the first words are equal then the two numbers must be of the same sign
+      # For either possible sign if the remaining words of a is greater than the remaining words of b, then a > b
+      # Therefore we can use an unsigned comparison on the remaining words
+      unsigned_mode = {
+        ir.ICmpCond.Sgt: ir.ICmpCond.Ugt, ir.ICmpCond.Slt: ir.ICmpCond.Ult,
+        ir.ICmpCond.Sge: ir.ICmpCond.Uge, ir.ICmpCond.Sle: ir.ICmpCond.Ule,
+      }[mode]
+
+      _, unsigned_comp = largeIntCompare(
+        IdxbleValue(lft.vals[:-1]), IdxbleValue(rgt.vals[:-1]),
+        (len(lft.vals) - 1) * VARIABLE_MAX_BITS,
+        unsigned_mode, ctx, var
+      )
+
+      blocks = sb3.BlockList(sb3.ControlFlow("if_else", sb3.BoolOp("=", lft.vals[-1], rgt.vals[-1]), unsigned_comp, signed_comp))
+
+      if res_var is None:
+        return sb3.BoolOp("=", var.getValue(), sb3.Known(1)), blocks
+      return None, blocks
 
     case _:
       raise CompException(f"icmp does not support comparsion mode {mode} for idxble values")
