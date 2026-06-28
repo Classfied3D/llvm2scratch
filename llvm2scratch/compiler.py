@@ -758,18 +758,47 @@ def intPow2(val: sb3.Value, ctx: Context, manual_offset: int=0) -> tuple[sb3.Val
     return sb3.GetOfList("atindex", lookup, sb3.Op("add", val, sb3.Known(offset + manual_offset))), ctx
 
 def bitShift(direction: Literal["left", "right"],
-             width: int, left: sb3.Value, right: sb3.Value,
-             ctx: Context, can_shift_out=True) -> tuple[sb3.Value, Context]:
-  right_mul, ctx = intPow2(right, ctx)
+             width: int, val: sb3.Value | IdxbleValue, shift: sb3.Value | IdxbleValue,
+             ctx: Context, can_shift_out=True) -> tuple[sb3.Value | IdxbleValue, Context]:
+
+  # In LLVM IR, a shift of magnitude greater than width is poison. Therefore we can assume that
+  # the upper bits equal zero (unless the integer is VERY wide). This means we only care about the
+  # last word of the shift
+  assert width < 2 ** VARIABLE_MAX_BITS
+  if isinstance(shift, IdxbleValue): shift = shift.vals[0]
+  multiplier, ctx = intPow2(shift, ctx)
+
+  if isinstance(val, IdxbleValue):
+    assert len(val.vals) == 2 # >64 bit support is more complex and not as common
+
+    # If we shift to the right, the left part can be shifted out into the right part even if can_shift_out is False and v.v.
+    lft_part, ctx = bitShift(direction, width % VARIABLE_MAX_BITS, val.vals[1], shift, ctx, can_shift_out or direction == "right")
+    rgt_part, ctx = bitShift(direction, VARIABLE_MAX_BITS, val.vals[0], shift, ctx, can_shift_out or direction == "left")
+    assert isinstance(lft_part, sb3.Value)
+    assert isinstance(rgt_part, sb3.Value)
+
+    remainder_shift = opt.simplifyValue(sb3.Op("sub", sb3.Known(VARIABLE_MAX_BITS), shift))
+    # e.g. with nibbles (a, b) << 3 = a << 3 + b >> 1, b << 3
+    #                   (a, b) >> 3 = a >> 3, a << 1 + b >> 3
+    if direction == "left":
+      remainder, ctx = bitShift("right", VARIABLE_MAX_BITS, val.vals[0], remainder_shift, ctx)
+      assert isinstance(remainder, sb3.Value)
+      lft_part = sb3.Op("add", lft_part, remainder)
+    else:
+      remainder, ctx = bitShift("left", VARIABLE_MAX_BITS, val.vals[1], remainder_shift, ctx)
+      assert isinstance(remainder, sb3.Value)
+      rgt_part = sb3.Op("add", rgt_part, remainder)
+
+    return IdxbleValue([rgt_part, lft_part]), ctx
 
   if direction == "left":
     # Multipling by a power of two is safe because the internal double value scratch uses doesn't lose accuracy
     # when only the exponent part changes
-    unwrapped = sb3.Op("mul", left, right_mul)
+    unwrapped = sb3.Op("mul", val, multiplier)
     if not can_shift_out: return unwrapped, ctx
     return sb3.Op("mod", unwrapped, sb3.Known(2 ** width)), ctx
   else:
-    unwrapped = sb3.Op("div", left, right_mul)
+    unwrapped = sb3.Op("div", val, multiplier)
     if not can_shift_out: return unwrapped, ctx
     return sb3.Op("floor", unwrapped), ctx
 
@@ -2068,14 +2097,6 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
       res_val = None
 
       match instr.opcode:
-        case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub | ir.BinaryOpcode.And | ir.BinaryOpcode.Or | ir.BinaryOpcode.Xor:
-          pass
-        case _:
-          if isinstance(lft, IdxbleValue) or \
-             isinstance(rgt, IdxbleValue):
-            raise CompException(f"Indexable value not supported in binop {instr}")
-
-      match instr.opcode:
         case ir.BinaryOpcode.Add | ir.BinaryOpcode.Sub: # Add/Sub two values
           op = "add" if instr.opcode == ir.BinaryOpcode.Add else "sub"
           assert isinstance(instr.left.type, ir.IntegerTy)
@@ -2274,34 +2295,20 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
 
         # Bitwise Binary Operations
         case ir.BinaryOpcode.Shl: # Calculate left shift
-          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
-
-          width = instr.left.type.width
-          # TODO FIX: support larger values
-          if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports "
-                                f"integers with <= {VARIABLE_MAX_BITS} bits")
 
           can_shift_out = not (instr.is_nsw and instr.is_nuw)
-          res_val, ctx = bitShift("left", width, lft, rgt, ctx, can_shift_out)
+          res_val, ctx = bitShift("left", instr.left.type.width, lft, rgt, ctx, can_shift_out)
 
         case ir.BinaryOpcode.LShr: # Calculate right shift (unsigned)
-          assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
           if not isinstance(instr.left.type, ir.IntegerTy):
             raise CompException(f"Instruction {instr} with opcode add only supports "
                                 f"integers, got type {type(instr.left.type)}")
 
-          width = instr.left.type.width
-          # TODO FIX: support larger values
-          if width > VARIABLE_MAX_BITS:
-            raise CompException(f"Instruction {instr} currently supports "
-                                f"integers with <= {VARIABLE_MAX_BITS} bits")
-
           can_shift_out = not instr.is_exact
-          res_val, ctx = bitShift("right", width, lft, rgt, ctx, can_shift_out)
+          res_val, ctx = bitShift("right", instr.left.type.width, lft, rgt, ctx, can_shift_out)
 
         case ir.BinaryOpcode.AShr: # Calculate right shift (signed)
           assert not (isinstance(lft, IdxbleValue) or isinstance(rgt, IdxbleValue))
@@ -3069,7 +3076,8 @@ def getFuncPtrSignatureInfo(signature: ir.FuncTy, caller_name: str, ctx: Context
 
   # TODO config to disable these warnings
   if warn_no_matching and caller_name not in ctx.cfg.no_warn_missing_fn_sig:
-    warnings.warn(f"Could not find function signature for {signature} in {caller_name}", CompWarning)
+    warnings.warn(f"Could not find function signature for {signature} in {caller_name}. Add this "
+                  f"to cfg.no_warn_missing_fn_sig to ignore this warning", CompWarning)
   return None
 
 def transReturnAddr(return_address: sb3.Value, info: FuncInfo | FuncPtrSigInfo, ctx: Context) -> sb3.BlockList:

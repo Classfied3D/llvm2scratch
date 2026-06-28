@@ -25,6 +25,15 @@ long long add_one_ll(long long num) {
   return num + 1;
 }
 
+unsigned long long rshift_ull(unsigned long long x, long long s) {
+  if (s < 0) {
+    x <<= -s;
+  } else {
+    x >>= s;
+  }
+  return x;
+}
+
 void do_nothing(void) {}
 
 int test_branch(int num) {
@@ -79,6 +88,7 @@ void numberize(char *str) {
 int main(void) {
   ull_a = add_one_ull(ull_a);
   ll_a = add_one_ll(ll_a);
+  ll_a = rshift_ull(ll_a, -2);
 
   a -= 4;
   a *= 2;
